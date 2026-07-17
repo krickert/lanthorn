@@ -28,10 +28,21 @@ pub enum Tile {
     Wall { kind: WallKind },
     Floor { room: RoomId },
     Corridor { conn: u16 },
+    /// A 45° diagonal corridor step (vector projection); renders as `╱`/`╲`.
+    CorridorDiag { conn: u16, slope: DiagSlope },
     Door { conn: u16, kind: DoorKind },
     /// A perpendicular corridor crossing: `over` runs continuous, `under` breaks.
     Bridge { over: u16, under: u16 },
     Feature { room: RoomId, kind: FeatureKind },
+}
+
+/// The slope of a [`Tile::CorridorDiag`] step, named for its glyph shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagSlope {
+    /// `╲` — descending left-to-right (SE/NW travel).
+    Down,
+    /// `╱` — ascending left-to-right (NE/SW travel).
+    Up,
 }
 
 /// What a wall tile belongs to, so the rasterizer can style room outlines and
@@ -818,16 +829,25 @@ fn stamp_features(g: &mut Grid, sub: &MapGraph, boxes: &BTreeMap<RoomId, RoomBox
     }
 }
 
-/// Paint pass: every Void 8-adjacent to corridor floor (or a bridge) becomes a
-/// `Path` wall, so corridors read as walkable outlined passages. Only Void is
-/// claimed — room walls, floors, and doors are never overwritten, and a
-/// corridor running beside a room simply shares that room's wall on that side.
-/// Two passages one tile apart share a single painted wall between them.
-fn paint_walls(g: &mut Grid) {
+/// Paint pass: every Void 8-adjacent to corridor floor (orthogonal or diagonal,
+/// or a bridge) becomes a `Path` wall, so corridors read as walkable outlined
+/// passages. Only Void is claimed — room walls, floors, and doors are never
+/// overwritten, and a corridor running beside a room simply shares that room's
+/// wall on that side. Two passages one tile apart share a single painted wall
+/// between them. Shared by `realize_layer` and `project::project` (row-major
+/// `w*h` tile slice).
+pub(crate) fn paint_path_walls(w: i32, h: i32, tiles: &mut [Tile]) {
+    let get = |tiles: &[Tile], x: i32, y: i32| -> Tile {
+        if x >= 0 && x < w && y >= 0 && y < h {
+            tiles[(y * w + x) as usize]
+        } else {
+            Tile::Void
+        }
+    };
     let mut to_wall: Vec<(i32, i32)> = Vec::new();
-    for y in 0..g.h {
-        for x in 0..g.w {
-            if !matches!(g.get(x, y), Tile::Void) {
+    for y in 0..h {
+        for x in 0..w {
+            if !matches!(get(tiles, x, y), Tile::Void) {
                 continue;
             }
             'probe: for dy in -1..=1 {
@@ -835,8 +855,10 @@ fn paint_walls(g: &mut Grid) {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
-                    if matches!(g.get(x + dx, y + dy), Tile::Corridor { .. } | Tile::Bridge { .. })
-                    {
+                    if matches!(
+                        get(tiles, x + dx, y + dy),
+                        Tile::Corridor { .. } | Tile::CorridorDiag { .. } | Tile::Bridge { .. }
+                    ) {
                         to_wall.push((x, y));
                         break 'probe;
                     }
@@ -845,8 +867,13 @@ fn paint_walls(g: &mut Grid) {
         }
     }
     for (x, y) in to_wall {
-        g.set(x, y, Tile::Wall { kind: WallKind::Path });
+        tiles[(y * w + x) as usize] = Tile::Wall { kind: WallKind::Path };
     }
+}
+
+/// [`paint_path_walls`] over the working grid.
+fn paint_walls(g: &mut Grid) {
+    paint_path_walls(g.w, g.h, &mut g.tiles);
 }
 
 /// Realize one layer's sub-graph as a tile grid (stages S1–S5; see module docs).

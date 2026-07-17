@@ -128,6 +128,10 @@ pub struct TileGlyphs {
     pub dash_h: char,
     /// Dashed passage-floor trail for a distorted connection, vertical run.
     pub dash_v: char,
+    /// 45° diagonal corridor, ascending left-to-right (`Tile::CorridorDiag` Up).
+    pub diag_up: char,
+    /// 45° diagonal corridor, descending left-to-right (`Tile::CorridorDiag` Down).
+    pub diag_down: char,
     /// Perpendicular corridor crossing, over-corridor horizontal.
     pub bridge: char,
     /// Perpendicular corridor crossing, over-corridor vertical.
@@ -243,6 +247,8 @@ impl Default for SymbolSet {
                 door_stub: '?',
                 dash_h: '╌',
                 dash_v: '╎',
+                diag_up: '╱',
+                diag_down: '╲',
                 bridge: '╪',
                 bridge_v: '╫',
                 stairs_up: '<',
@@ -652,6 +658,8 @@ fn apply_override(s: &mut SymbolSet, key: &str, ch: char) {
         "tile.door_stub"   => s.tiles.door_stub = ch,
         "tile.dash_h"      => s.tiles.dash_h = ch,
         "tile.dash_v"      => s.tiles.dash_v = ch,
+        "tile.diag_up"     => s.tiles.diag_up = ch,
+        "tile.diag_down"   => s.tiles.diag_down = ch,
         "tile.bridge"      => s.tiles.bridge = ch,
         "tile.bridge_v"    => s.tiles.bridge_v = ch,
         "tile.stairs_up"   => s.tiles.stairs_up = ch,
@@ -683,6 +691,17 @@ mod tests {
         let r = SymbolSet::resolve(&cfg);
         assert_eq!(r.meta_gutter, '|');
         assert_eq!(r.warning_gutter, '*');
+    }
+
+    #[test]
+    fn tile_diag_defaults_and_selector_overrides() {
+        let s = SymbolSet::default();
+        assert_eq!((s.tiles.diag_up, s.tiles.diag_down), ('╱', '╲'));
+        let mut cfg = crate::config::SymbolConfig::default();
+        cfg.overrides.insert("tile.diag_up".into(), "/".into());
+        cfg.overrides.insert("tile.diag_down".into(), "\\".into());
+        let r = SymbolSet::resolve(&cfg);
+        assert_eq!((r.tiles.diag_up, r.tiles.diag_down), ('/', '\\'));
     }
 
     #[test]

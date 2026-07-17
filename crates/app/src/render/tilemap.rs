@@ -4,7 +4,7 @@
 //! nothing here is hard-coded, matching the classic renderer's theming rules.
 
 use mapper::graph::{MapGraph, RoomId};
-use mapper::tiles::{DoorKind, FeatureKind, Tile, TilePlan, WallKind, MIN_TRACK};
+use mapper::tiles::{DiagSlope, DoorKind, FeatureKind, Tile, TilePlan, WallKind, MIN_TRACK};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -68,7 +68,7 @@ fn passage_interior(plan: &TilePlan, x: i32, y: i32) -> bool {
         && (y as usize) < plan.h
         && matches!(
             plan.get(x as usize, y as usize),
-            Tile::Corridor { .. } | Tile::Bridge { .. } | Tile::Door { .. }
+            Tile::Corridor { .. } | Tile::CorridorDiag { .. } | Tile::Bridge { .. } | Tile::Door { .. }
         )
 }
 
@@ -247,6 +247,13 @@ pub fn render_tile_map(
                         }
                     } else {
                         g.floor
+                    };
+                    (ch, cs.tile_corridor)
+                }
+                Tile::CorridorDiag { slope, .. } => {
+                    let ch = match slope {
+                        DiagSlope::Up => g.diag_up,
+                        DiagSlope::Down => g.diag_down,
                     };
                     (ch, cs.tile_corridor)
                 }
@@ -478,6 +485,40 @@ mod tests {
             let (_, b) = base.iter().find(|(bid, _)| bid == id).expect("room visible in both");
             assert_eq!((r.x, r.y), (b.x + 1, b.y + 1), "room {id} shifted with the drag pan");
         }
+    }
+
+    #[test]
+    fn corridor_diag_tiles_render_with_the_diag_glyphs() {
+        // Synthetic plan: a ╱ step at (1,1) and a ╲ step at (3,1), plus a plain
+        // corridor tile so the shared corridor styling path is exercised too.
+        let mut tiles = vec![Tile::Void; 5 * 3];
+        tiles[5 + 1] = Tile::CorridorDiag { conn: 0, slope: DiagSlope::Up }; // (1,1)
+        tiles[5 + 3] = Tile::CorridorDiag { conn: 0, slope: DiagSlope::Down }; // (3,1)
+        tiles[5 + 2] = Tile::Corridor { conn: 0 }; // (2,1)
+        let plan = TilePlan {
+            w: 5,
+            h: 3,
+            tiles,
+            rooms: Vec::new(),
+            conns: vec![mapper::tiles::TileConn {
+                origin: 1,
+                dest: 2,
+                dir: Direction::SE,
+                reciprocal: true,
+                distorted: false,
+            }],
+            col_x: Vec::new(),
+            row_y: Vec::new(),
+        };
+        let g = MapGraph::new();
+        let state = AppState::default();
+        let area = Rect::new(0, 0, 5, 3);
+        let mut buf = Buffer::empty(area);
+        render_tile_map(&plan, &g, &state, area, &mut buf);
+        assert_eq!(buf.cell((1, 1)).unwrap().symbol(), "╱");
+        assert_eq!(buf.cell((3, 1)).unwrap().symbol(), "╲");
+        // Diagonals use the corridor style slot.
+        assert_eq!(buf.cell((1, 1)).unwrap().style(), buf.cell((2, 1)).unwrap().style());
     }
 
     #[test]

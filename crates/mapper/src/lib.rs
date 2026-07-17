@@ -6,6 +6,7 @@ pub mod layout;
 pub mod mapper;
 pub mod model;
 pub mod persist;
+pub mod project;
 pub mod render;
 pub mod route;
 pub mod router;
