@@ -1,0 +1,1167 @@
+//! Tile-grid geometry realization (tile map spike, stage S1–S5): rooms become
+//! variable-size walled floor areas, adjacent connected rooms share a wall with a
+//! punched door, distant connections become walled corridors routed through the
+//! lane channels, and perpendicular corridor crossings become explicit bridges.
+//!
+//! `realize_layer` sits ON TOP of the existing cell layout + lane router: room
+//! cells come from `Room::pos` and corridor channel/lane assignment is reused
+//! from `route_lanes` (S2's gutters are sized from its per-channel lane counts).
+//! The output `TilePlan` is a semantic grid; rasterizing tiles into themed
+//! glyphs is the app's job. Deterministic by construction: the only "random"
+//! input is an FNV-1a hash of stable room ids (size jitter).
+
+use std::collections::BTreeMap;
+
+use crate::direction::{grid_offset, is_diagonal, opposite, Direction};
+use crate::graph::{MapGraph, RoomId};
+use crate::layer::LayerId;
+use crate::route::{exit_point, route_lanes, Channel, RoutedConnector};
+use crate::router::Side;
+
+/// One semantic map tile. `Corridor`/`Door` carry an index into [`TilePlan::conns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tile {
+    Void,
+    Wall,
+    Floor { room: RoomId },
+    Corridor { conn: u16 },
+    Door { conn: u16, kind: DoorKind },
+    /// A perpendicular corridor crossing: `over` runs continuous, `under` breaks.
+    Bridge { over: u16, under: u16 },
+    Feature { room: RoomId, kind: FeatureKind },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorKind {
+    TwoWay,
+    OneWay(Direction),
+    /// Dead-end stub door for an edge with no drawable route (distorted fallback
+    /// or a multi-edge merge); the direction is where the passage continues.
+    Stub(Direction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureKind {
+    StairsUp,
+    StairsDown,
+    PortalIn,
+    PortalOut,
+}
+
+/// Tile-space rectangle spanning `x..x+w` × `y..y+h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Rect {
+    pub fn right(&self) -> usize {
+        self.x + self.w - 1
+    }
+    pub fn bottom(&self) -> usize {
+        self.y + self.h - 1
+    }
+}
+
+/// A realized room: its tile-space box (walls included) and interior floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileRoom {
+    pub id: RoomId,
+    pub bounds: Rect,
+    pub floor: Rect,
+}
+
+/// One realized connection — the index space `Tile::Corridor`/`Tile::Door` point into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileConn {
+    pub origin: RoomId,
+    pub dest: RoomId,
+    pub dir: Direction,
+    pub reciprocal: bool,
+    pub distorted: bool,
+}
+
+/// The realized tile grid for one layer (row-major, `w*h` tiles).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TilePlan {
+    pub w: usize,
+    pub h: usize,
+    pub tiles: Vec<Tile>,
+    pub rooms: Vec<TileRoom>,
+    pub conns: Vec<TileConn>,
+}
+
+impl TilePlan {
+    pub fn get(&self, x: usize, y: usize) -> Tile {
+        self.tiles[y * self.w + x]
+    }
+}
+
+// ── internals ────────────────────────────────────────────────────────────────
+
+/// Void margin around the track region so stubs and the wall-paint pass never
+/// need to write outside the grid.
+const MARGIN: i32 = 2;
+/// Width/height of a track with no room in it (corridors pass through its centre).
+const MIN_TRACK: i32 = 5;
+
+/// Working grid: tiles plus the corridor travel axis per tile (0 none, 1
+/// horizontal, 2 vertical) so a perpendicular re-stamp can detect a crossing.
+struct Grid {
+    w: i32,
+    h: i32,
+    tiles: Vec<Tile>,
+    axes: Vec<u8>,
+}
+
+impl Grid {
+    fn new(w: i32, h: i32) -> Self {
+        let n = (w * h) as usize;
+        Grid { w, h, tiles: vec![Tile::Void; n], axes: vec![0; n] }
+    }
+    fn idx(&self, x: i32, y: i32) -> Option<usize> {
+        (x >= 0 && x < self.w && y >= 0 && y < self.h).then(|| (y * self.w + x) as usize)
+    }
+    fn get(&self, x: i32, y: i32) -> Tile {
+        self.idx(x, y).map_or(Tile::Void, |i| self.tiles[i])
+    }
+    fn set(&mut self, x: i32, y: i32, t: Tile) {
+        if let Some(i) = self.idx(x, y) {
+            self.tiles[i] = t;
+        }
+    }
+}
+
+/// FNV-1a over a room id — the deterministic jitter source (no RNG, no deps).
+fn fnv1a(id: RoomId) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.to_le_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// The origin-room wall side(s) a departing connection occupies. Cardinals match
+/// the router's `side_for`; a diagonal is corner-attached and counts toward both
+/// of its corner's sides. The arrival sides of a one-way edge are
+/// `departure_sides(opposite(dir))` — the same rule `oneway_entry_side` encodes
+/// (a cardinal enters the side opposite its travel; a diagonal arrives on the
+/// corner facing its origin).
+fn departure_sides(dir: Direction) -> &'static [Side] {
+    match dir {
+        Direction::N => &[Side::Top],
+        Direction::S => &[Side::Bottom],
+        Direction::E => &[Side::Right],
+        Direction::W => &[Side::Left],
+        Direction::NE => &[Side::Top, Side::Right],
+        Direction::NW => &[Side::Top, Side::Left],
+        Direction::SE => &[Side::Bottom, Side::Right],
+        Direction::SW => &[Side::Bottom, Side::Left],
+        _ => &[],
+    }
+}
+
+/// S1: per-room floor size `(floor_w, floor_h)` from door-count minimums plus
+/// id-hash jitter. Every term is odd, so sizes stay odd and boxes centre exactly
+/// in their (odd-sized) tracks.
+fn floor_sizes(sub: &MapGraph) -> BTreeMap<RoomId, (i32, i32)> {
+    let mut doors: BTreeMap<(RoomId, Side), i32> = BTreeMap::new();
+    for c in sub.connections() {
+        if grid_offset(c.dir).is_none() {
+            continue;
+        }
+        for &s in departure_sides(c.dir) {
+            *doors.entry((c.origin, s)).or_default() += 1;
+        }
+        // A one-way edge also lands a door at its destination; a reciprocal's far
+        // door is already counted by the reverse edge's own departure.
+        let has_reverse =
+            sub.connections().iter().any(|r| r.origin == c.dest && r.dest == c.origin);
+        if !has_reverse {
+            for &s in departure_sides(opposite(c.dir)) {
+                *doors.entry((c.dest, s)).or_default() += 1;
+            }
+        }
+    }
+    sub.rooms()
+        .map(|r| {
+            let d = |s: Side| doors.get(&(r.id, s)).copied().unwrap_or(0);
+            let h = fnv1a(r.id);
+            let jw = ((h & 1) * 2) as i32;
+            let jh = (((h >> 1) & 1) * 2) as i32;
+            // Top/bottom doors spread along the width; left/right along the height.
+            let fw = (5 + jw).max(2 * d(Side::Top) + 1).max(2 * d(Side::Bottom) + 1).clamp(5, 11);
+            let fh = (3 + jh).max(2 * d(Side::Left) + 1).max(2 * d(Side::Right) + 1).clamp(3, 7);
+            (r.id, (fw, fh))
+        })
+        .collect()
+}
+
+/// S2 track tables for one axis: tile position + size per track, tile position
+/// per non-empty gutter, and the total extent.
+type AxisTables = (BTreeMap<i32, i32>, BTreeMap<i32, i32>, BTreeMap<i32, i32>, i32);
+
+/// Accumulate track origins along one axis. A channel with `k` corridor lanes gets
+/// a `2k+1`-wide gutter (lane floors at odd offsets); a channel with none gets NO
+/// gutter and the neighbouring tracks overlap by one tile — the shared wall.
+fn build_axis(
+    room_lo: i32,
+    room_hi: i32,
+    sizes: &BTreeMap<i32, i32>,
+    lanes: &BTreeMap<i32, u16>,
+) -> AxisTables {
+    let (mut lo, mut hi) = (room_lo, room_hi);
+    for &c in lanes.keys() {
+        // channel c is the gutter after track c: keep c within [lo-1, hi]
+        lo = lo.min(c + 1);
+        hi = hi.max(c);
+    }
+    let gutter_w = |c: i32| lanes.get(&c).map_or(0, |&k| 2 * i32::from(k) + 1);
+    let mut track = BTreeMap::new();
+    let mut size = BTreeMap::new();
+    let mut gutter = BTreeMap::new();
+    let mut pos = MARGIN;
+    let lead = gutter_w(lo - 1);
+    if lead > 0 {
+        gutter.insert(lo - 1, pos);
+        pos += lead;
+    }
+    for c in lo..=hi {
+        let w = sizes.get(&c).copied().unwrap_or(MIN_TRACK);
+        track.insert(c, pos);
+        size.insert(c, w);
+        pos += w;
+        let gw = gutter_w(c);
+        if gw > 0 {
+            gutter.insert(c, pos);
+            pos += gw;
+        } else if c < hi {
+            pos -= 1; // zero-gutter neighbours overlap by one tile: the shared wall
+        }
+    }
+    (track, size, gutter, pos + MARGIN)
+}
+
+struct Tracks {
+    x_track: BTreeMap<i32, i32>,
+    col_w: BTreeMap<i32, i32>,
+    gutter_x: BTreeMap<i32, i32>,
+    y_track: BTreeMap<i32, i32>,
+    row_h: BTreeMap<i32, i32>,
+    gutter_y: BTreeMap<i32, i32>,
+}
+
+/// A room's mutable tile-space box during placement (walls included).
+#[derive(Debug, Clone, Copy)]
+struct RoomBox {
+    id: RoomId,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+/// The side of `a` facing `b` when the cells are cardinally adjacent.
+fn facing_side(a: (i32, i32), b: (i32, i32)) -> Option<Side> {
+    match (b.0 - a.0, b.1 - a.1) {
+        (1, 0) => Some(Side::Right),
+        (-1, 0) => Some(Side::Left),
+        (0, 1) => Some(Side::Bottom),
+        (0, -1) => Some(Side::Top),
+        _ => None,
+    }
+}
+
+/// S3: is this connector realized as a punched door in a shared wall? Yes when the
+/// rooms are cardinally adjacent, the route actually passes straight through the
+/// shared doorway (a 3-point polyline through the exit stub), and the channel
+/// between the two tracks carries no corridor lanes (zero gutter — the boxes can
+/// abut). Returns the origin's facing side.
+fn shared_wall_side(
+    c: &RoutedConnector,
+    cells: &BTreeMap<RoomId, (i32, i32)>,
+    tracks: &Tracks,
+) -> Option<Side> {
+    if c.merge || c.distorted {
+        return None;
+    }
+    let a = cells.get(&c.origin).copied()?;
+    let b = cells.get(&c.dest).copied()?;
+    let side = facing_side(a, b)?;
+    if c.points.len() != 3 || c.points[1] != exit_point(a, side) {
+        return None;
+    }
+    let open = match side {
+        Side::Right => tracks.gutter_x.contains_key(&a.0),
+        Side::Left => tracks.gutter_x.contains_key(&b.0),
+        Side::Bottom => tracks.gutter_y.contains_key(&a.1),
+        Side::Top => tracks.gutter_y.contains_key(&b.1),
+    };
+    (!open).then_some(side)
+}
+
+/// Slot index → signed offset along a wall: 0, +1, −1, +2, −2, … (matches the
+/// classic renderer's `slot_offset` ordering).
+fn slot_shift(slot: u16) -> i32 {
+    let step = (i32::from(slot) + 1) / 2;
+    if slot % 2 == 1 {
+        step
+    } else {
+        -step
+    }
+}
+
+/// The wall tile a connector endpoint wants, plus the outward step off it: the box
+/// corner for a diagonal (corner-attached), else the side wall at the floor
+/// midpoint shifted by the endpoint's slot.
+fn door_want(
+    bx: &RoomBox,
+    corner: Option<Direction>,
+    side: Side,
+    slot: u16,
+) -> ((i32, i32), (i32, i32)) {
+    if let Some(d) = corner {
+        let (dx, dy) = grid_offset(d).unwrap_or((0, 0));
+        let x = if dx > 0 { bx.x1 } else { bx.x0 };
+        let y = if dy > 0 { bx.y1 } else { bx.y0 };
+        return ((x, y), (dx, dy));
+    }
+    let cx = (bx.x0 + 1 + bx.x1 - 1) / 2;
+    let cy = (bx.y0 + 1 + bx.y1 - 1) / 2;
+    match side {
+        Side::Right => ((bx.x1, (cy + slot_shift(slot)).clamp(bx.y0 + 1, bx.y1 - 1)), (1, 0)),
+        Side::Left => ((bx.x0, (cy + slot_shift(slot)).clamp(bx.y0 + 1, bx.y1 - 1)), (-1, 0)),
+        Side::Bottom => (((cx + slot_shift(slot)).clamp(bx.x0 + 1, bx.x1 - 1), bx.y1), (0, 1)),
+        Side::Top => (((cx + slot_shift(slot)).clamp(bx.x0 + 1, bx.x1 - 1), bx.y0), (0, -1)),
+    }
+}
+
+/// Place `door` on the first candidate that is still a plain wall; failing that,
+/// the first that is not already someone else's door; last resort, the first
+/// candidate outright. Returns where it landed.
+fn place_first(g: &mut Grid, cands: &[(i32, i32)], door: Tile) -> (i32, i32) {
+    for &p in cands {
+        if matches!(g.get(p.0, p.1), Tile::Wall) {
+            g.set(p.0, p.1, door);
+            return p;
+        }
+    }
+    for &p in cands {
+        if !matches!(g.get(p.0, p.1), Tile::Door { .. }) {
+            g.set(p.0, p.1, door);
+            return p;
+        }
+    }
+    let p = cands[0];
+    g.set(p.0, p.1, door);
+    p
+}
+
+/// Punch `door` at `want`, probing 0, +1, −1, … along the wall (x when `horiz`)
+/// within `span` when the spot is taken.
+fn punch_door_along(
+    g: &mut Grid,
+    want: (i32, i32),
+    horiz: bool,
+    span: (i32, i32),
+    door: Tile,
+) -> (i32, i32) {
+    let mut cands: Vec<(i32, i32)> = Vec::new();
+    for s in 0..2 * (span.1 - span.0 + 1).max(1) {
+        let off = slot_shift(s as u16);
+        let p = if horiz { (want.0 + off, want.1) } else { (want.0, want.1 + off) };
+        let v = if horiz { p.0 } else { p.1 };
+        if (span.0..=span.1).contains(&v) {
+            cands.push(p);
+        }
+    }
+    if cands.is_empty() {
+        cands.push(want);
+    }
+    place_first(g, &cands, door)
+}
+
+/// Punch a corner-attached door: the corner itself, falling back to the two wall
+/// tiles beside it.
+fn punch_corner_door(g: &mut Grid, bx: &RoomBox, want: (i32, i32), door: Tile) -> (i32, i32) {
+    let ix = if want.0 == bx.x0 { want.0 + 1 } else { want.0 - 1 };
+    let iy = if want.1 == bx.y0 { want.1 + 1 } else { want.1 - 1 };
+    place_first(g, &[want, (want.0, iy), (ix, want.1)], door)
+}
+
+/// Punch one connector endpoint's door (corner or slotted side wall).
+fn punch_endpoint(
+    g: &mut Grid,
+    bx: &RoomBox,
+    corner: Option<Direction>,
+    side: Side,
+    slot: u16,
+    door: Tile,
+) -> (i32, i32) {
+    let (want, _) = door_want(bx, corner, side, slot);
+    if corner.is_some() {
+        punch_corner_door(g, bx, want, door)
+    } else {
+        let horiz = matches!(side, Side::Top | Side::Bottom);
+        let span = if horiz { (bx.x0 + 1, bx.x1 - 1) } else { (bx.y0 + 1, bx.y1 - 1) };
+        punch_door_along(g, want, horiz, span, door)
+    }
+}
+
+/// Stamp one corridor floor tile. Only Void is claimed; landing on a DIFFERENT
+/// connection's corridor travelling the PERPENDICULAR axis writes a bridge
+/// (deterministic over/under: the lower connection index goes over). Everything
+/// else — rooms, doors, an existing bridge, a parallel corridor — is left alone.
+fn stamp_corridor(g: &mut Grid, p: (i32, i32), conn: u16, horiz: bool) {
+    let Some(i) = g.idx(p.0, p.1) else { return };
+    let axis = if horiz { 1 } else { 2 };
+    match g.tiles[i] {
+        Tile::Void => {
+            g.tiles[i] = Tile::Corridor { conn };
+            g.axes[i] = axis;
+        }
+        Tile::Corridor { conn: other } if other != conn && g.axes[i] != axis => {
+            g.tiles[i] = Tile::Bridge { over: other.min(conn), under: other.max(conn) };
+        }
+        _ => {}
+    }
+}
+
+/// A dead-end stub: a `Stub` door plus a single corridor tile fading outward.
+fn realize_stub(
+    g: &mut Grid,
+    bx: &RoomBox,
+    corner: Option<Direction>,
+    side: Side,
+    slot: u16,
+    conn: u16,
+    dir: Direction,
+) {
+    let door = Tile::Door { conn, kind: DoorKind::Stub(dir) };
+    let (_, out) = door_want(bx, corner, side, slot);
+    let p = punch_endpoint(g, bx, corner, side, slot, door);
+    stamp_corridor(g, (p.0 + out.0, p.1 + out.1), conn, out.1 == 0);
+}
+
+/// S3: punch a door through the shared wall of two abutting rooms, at the midpoint
+/// of the floors' overlap span shifted by the connector's slot (the fan for
+/// multiple doors between one pair).
+fn realize_shared_door(
+    g: &mut Grid,
+    c: &RoutedConnector,
+    conn: u16,
+    side: Side,
+    ba: &RoomBox,
+    bb: &RoomBox,
+) {
+    let kind = if c.reciprocal { DoorKind::TwoWay } else { DoorKind::OneWay(c.exit_dir) };
+    let door = Tile::Door { conn, kind };
+    match side {
+        Side::Right | Side::Left => {
+            let x = if side == Side::Right { ba.x1 } else { ba.x0 };
+            let lo = (ba.y0 + 1).max(bb.y0 + 1);
+            let hi = (ba.y1 - 1).min(bb.y1 - 1);
+            if lo > hi {
+                return; // floors never overlap in y — no straight doorway exists
+            }
+            let want = (x, ((lo + hi) / 2 + slot_shift(c.exit_slot)).clamp(lo, hi));
+            punch_door_along(g, want, false, (lo, hi), door);
+        }
+        Side::Top | Side::Bottom => {
+            let y = if side == Side::Bottom { ba.y1 } else { ba.y0 };
+            let lo = (ba.x0 + 1).max(bb.x0 + 1);
+            let hi = (ba.x1 - 1).min(bb.x1 - 1);
+            if lo > hi {
+                return;
+            }
+            let want = (((lo + hi) / 2 + slot_shift(c.exit_slot)).clamp(lo, hi), y);
+            punch_door_along(g, want, true, (lo, hi), door);
+        }
+    }
+}
+
+/// Map a doubled-coordinate vertical line (`x = k`) to its tile column: a room
+/// column's track centre for even `k`; for odd `k` (channel `V((k-1)/2)`) the
+/// connector's lane column inside that channel's gutter.
+fn map_x(k: i32, c: &RoutedConnector, t: &Tracks) -> i32 {
+    if k.rem_euclid(2) == 0 {
+        let col = k / 2;
+        let x = t.x_track.get(&col).copied().unwrap_or(MARGIN);
+        x + t.col_w.get(&col).copied().unwrap_or(MIN_TRACK) / 2
+    } else {
+        let ch = (k - 1).div_euclid(2);
+        let lane =
+            c.segs.iter().find(|s| s.channel == Channel::V(ch)).map_or(0, |s| i32::from(s.lane));
+        match t.gutter_x.get(&ch) {
+            Some(&gx) => gx + 2 * lane + 1,
+            // No gutter for a routed run should not happen; ride the boundary column.
+            None => t.x_track.get(&(ch + 1)).copied().unwrap_or(MARGIN),
+        }
+    }
+}
+
+/// Horizontal counterpart of [`map_x`] (`y = k`, channel `H((k-1)/2)`).
+fn map_y(k: i32, c: &RoutedConnector, t: &Tracks) -> i32 {
+    if k.rem_euclid(2) == 0 {
+        let row = k / 2;
+        let y = t.y_track.get(&row).copied().unwrap_or(MARGIN);
+        y + t.row_h.get(&row).copied().unwrap_or(MIN_TRACK) / 2
+    } else {
+        let ch = (k - 1).div_euclid(2);
+        let lane =
+            c.segs.iter().find(|s| s.channel == Channel::H(ch)).map_or(0, |s| i32::from(s.lane));
+        match t.gutter_y.get(&ch) {
+            Some(&gy) => gy + 2 * lane + 1,
+            None => t.y_track.get(&(ch + 1)).copied().unwrap_or(MARGIN),
+        }
+    }
+}
+
+/// S4: realize one routed connector as door → corridor → door. The connector's
+/// doubled-coord polyline supplies the shape (diagonal steps become an
+/// L-corridor, horizontal leg first); each straight run maps to a tile line —
+/// track centres for room lines, gutter lane columns/rows for channels — and the
+/// first/last run carries its door's cross coordinate so the corridor leaves the
+/// wall exactly at the punched door.
+fn realize_corridor(
+    g: &mut Grid,
+    c: &RoutedConnector,
+    conn: u16,
+    ba: &RoomBox,
+    bb: &RoomBox,
+    tracks: &Tracks,
+) {
+    let kind = if c.reciprocal { DoorKind::TwoWay } else { DoorKind::OneWay(c.exit_dir) };
+    let door = Tile::Door { conn, kind };
+    let exit_corner = is_diagonal(c.exit_dir).then_some(c.exit_dir);
+    let (want_a, _) = door_want(ba, exit_corner, c.exit, c.exit_slot);
+    let (want_b, _) = door_want(bb, c.entry_corner, c.entry, c.entry_slot);
+    if want_a == want_b {
+        // Diagonally-abutting boxes share the corner tile: the door IS the connection.
+        punch_endpoint(g, ba, exit_corner, c.exit, c.exit_slot, door);
+        return;
+    }
+    let da = punch_endpoint(g, ba, exit_corner, c.exit, c.exit_slot, door);
+    let db = punch_endpoint(g, bb, c.entry_corner, c.entry, c.entry_slot, door);
+
+    // Split diagonal steps into an L (horizontal leg first — corner-attached
+    // L-corridors), then collapse the polyline into maximal straight runs.
+    let mut pts: Vec<(i32, i32)> = Vec::new();
+    for &p in &c.points {
+        match pts.last().copied() {
+            None => pts.push(p),
+            Some(q) if q == p => {}
+            Some(q) => {
+                if q.0 != p.0 && q.1 != p.1 {
+                    pts.push((p.0, q.1));
+                }
+                pts.push(p);
+            }
+        }
+    }
+    let mut segs: Vec<(bool, i32)> = Vec::new(); // (horizontal?, doubled line coord)
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let s = if a.1 == b.1 { (true, a.1) } else { (false, a.0) };
+        if segs.last() != Some(&s) {
+            segs.push(s);
+        }
+    }
+    if segs.is_empty() {
+        return;
+    }
+    let n = segs.len();
+    let lines: Vec<i32> = segs
+        .iter()
+        .enumerate()
+        .map(|(i, &(horiz, line))| {
+            if i == 0 {
+                if horiz { da.1 } else { da.0 }
+            } else if i == n - 1 {
+                if horiz { db.1 } else { db.0 }
+            } else if horiz {
+                map_y(line, c, tracks)
+            } else {
+                map_x(line, c, tracks)
+            }
+        })
+        .collect();
+    let mut wps: Vec<(i32, i32)> = vec![da];
+    if n == 1 {
+        // One straight run door-to-door; jog at the midpoint when the two doors'
+        // cross coordinates differ (different slots or box sizes).
+        let (horiz, _) = segs[0];
+        if horiz && da.1 != db.1 {
+            let mx = (da.0 + db.0) / 2;
+            wps.push((mx, da.1));
+            wps.push((mx, db.1));
+        } else if !horiz && da.0 != db.0 {
+            let my = (da.1 + db.1) / 2;
+            wps.push((da.0, my));
+            wps.push((db.0, my));
+        }
+    } else {
+        for i in 1..n {
+            let (h_prev, _) = segs[i - 1];
+            wps.push(if h_prev { (lines[i], lines[i - 1]) } else { (lines[i - 1], lines[i]) });
+        }
+    }
+    wps.push(db);
+    for w in wps.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a.0 != b.0 && a.1 != b.1 {
+            continue; // paranoia: never stamp a non-orthogonal hop
+        }
+        let horiz = a.1 == b.1;
+        let (dx, dy) = ((b.0 - a.0).signum(), (b.1 - a.1).signum());
+        let mut p = a;
+        loop {
+            if p != da && p != db {
+                stamp_corridor(g, p, conn, horiz);
+            }
+            if p == b {
+                break;
+            }
+            p = (p.0 + dx, p.1 + dy);
+        }
+    }
+}
+
+/// S5: Up/Down land on the floor tile nearest the room's top-right/bottom-right
+/// interior corner (probing left past occupied tiles; several Up exits share one
+/// stair).
+fn stamp_stairs(g: &mut Grid, bx: &RoomBox, kind: FeatureKind) {
+    let y = if kind == FeatureKind::StairsUp { bx.y0 + 1 } else { bx.y1 - 1 };
+    let feat = Tile::Feature { room: bx.id, kind };
+    let mut x = bx.x1 - 1;
+    while x > bx.x0 {
+        let t = g.get(x, y);
+        if t == feat {
+            return;
+        }
+        if matches!(t, Tile::Floor { .. }) {
+            g.set(x, y, feat);
+            return;
+        }
+        x -= 1;
+    }
+}
+
+/// S5: In/Out replace a mid-right wall tile (the classic renderer's mid-slot),
+/// probing up/down the wall when the midpoint is taken.
+fn stamp_portal(g: &mut Grid, bx: &RoomBox, kind: FeatureKind) {
+    let x = bx.x1;
+    let cy = (bx.y0 + 1 + bx.y1 - 1) / 2;
+    let feat = Tile::Feature { room: bx.id, kind };
+    for s in 0..2 * (bx.y1 - bx.y0).max(1) {
+        let y = cy + slot_shift(s as u16);
+        if y <= bx.y0 || y >= bx.y1 {
+            continue;
+        }
+        let t = g.get(x, y);
+        if t == feat {
+            return;
+        }
+        if t == Tile::Wall {
+            g.set(x, y, feat);
+            return;
+        }
+    }
+}
+
+/// S5 dispatch over the layer's non-planar edges (Unknown is skipped, matching
+/// the classic renderer).
+fn stamp_features(g: &mut Grid, sub: &MapGraph, boxes: &BTreeMap<RoomId, RoomBox>) {
+    for c in sub.connections() {
+        let kind = match c.dir {
+            Direction::Up => FeatureKind::StairsUp,
+            Direction::Down => FeatureKind::StairsDown,
+            Direction::In => FeatureKind::PortalIn,
+            Direction::Out => FeatureKind::PortalOut,
+            _ => continue,
+        };
+        let Some(bx) = boxes.get(&c.origin) else { continue };
+        match kind {
+            FeatureKind::StairsUp | FeatureKind::StairsDown => stamp_stairs(g, bx, kind),
+            FeatureKind::PortalIn | FeatureKind::PortalOut => stamp_portal(g, bx, kind),
+        }
+    }
+}
+
+/// S4 paint pass: every Void 8-adjacent to corridor floor (or a door/bridge)
+/// becomes a wall, so corridors read as walled passages.
+fn paint_walls(g: &mut Grid) {
+    let mut to_wall: Vec<(i32, i32)> = Vec::new();
+    for y in 0..g.h {
+        for x in 0..g.w {
+            if !matches!(g.get(x, y), Tile::Void) {
+                continue;
+            }
+            'probe: for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    if matches!(
+                        g.get(x + dx, y + dy),
+                        Tile::Corridor { .. } | Tile::Door { .. } | Tile::Bridge { .. }
+                    ) {
+                        to_wall.push((x, y));
+                        break 'probe;
+                    }
+                }
+            }
+        }
+    }
+    for (x, y) in to_wall {
+        g.set(x, y, Tile::Wall);
+    }
+}
+
+/// Realize one layer's sub-graph as a tile grid (stages S1–S5; see module docs).
+/// Deterministic: the same graph always yields the identical `TilePlan`.
+pub fn realize_layer(graph: &MapGraph, layer: LayerId) -> TilePlan {
+    let sub = graph.layer_subgraph(layer);
+    // Route only the 8-way compass edges; Up/Down/In/Out become features (S5)
+    // and Unknown is skipped, so none of them may claim corridor lanes.
+    let mut planar = sub.clone();
+    let non_planar: Vec<(RoomId, Direction)> = planar
+        .connections()
+        .iter()
+        .filter(|c| grid_offset(c.dir).is_none())
+        .map(|c| (c.origin, c.dir))
+        .collect();
+    for (o, d) in non_planar {
+        planar.remove_connection(o, d);
+    }
+    let plan = route_lanes(&planar);
+
+    let cells: BTreeMap<RoomId, (i32, i32)> =
+        sub.rooms().filter_map(|r| r.pos.map(|p| (r.id, p))).collect();
+    if cells.is_empty() {
+        return TilePlan::default();
+    }
+
+    // S1: room floor sizes; per-track box maxima.
+    let sizes = floor_sizes(&sub);
+    let mut col_box: BTreeMap<i32, i32> = BTreeMap::new();
+    let mut row_box: BTreeMap<i32, i32> = BTreeMap::new();
+    for (id, &(cx, cy)) in &cells {
+        let (fw, fh) = sizes[id];
+        let e = col_box.entry(cx).or_insert(0);
+        *e = (*e).max(fw + 2);
+        let e = row_box.entry(cy).or_insert(0);
+        *e = (*e).max(fh + 2);
+    }
+
+    // S2: gutters sized from the route plan's lane counts; a diagonal's corner
+    // needs one lane's worth of space in both its channels even though it
+    // carries no lane (mirrors `RoutePlan::diag_corners`).
+    let mut v_lanes = plan.v_lanes.clone();
+    let mut h_lanes = plan.h_lanes.clone();
+    for &(vc, hc) in &plan.diag_corners {
+        v_lanes.entry(vc).or_insert(1);
+        h_lanes.entry(hc).or_insert(1);
+    }
+    let min_c = cells.values().map(|p| p.0).min().unwrap_or(0);
+    let max_c = cells.values().map(|p| p.0).max().unwrap_or(0);
+    let min_r = cells.values().map(|p| p.1).min().unwrap_or(0);
+    let max_r = cells.values().map(|p| p.1).max().unwrap_or(0);
+    let (x_track, col_w, gutter_x, w) = build_axis(min_c, max_c, &col_box, &v_lanes);
+    let (y_track, row_h, gutter_y, h) = build_axis(min_r, max_r, &row_box, &h_lanes);
+    let tracks = Tracks { x_track, col_w, gutter_x, y_track, row_h, gutter_y };
+
+    // S3: centre each box in its track cell...
+    let mut boxes: BTreeMap<RoomId, RoomBox> = BTreeMap::new();
+    for (&id, &(cx, cy)) in &cells {
+        let (fw, fh) = sizes[&id];
+        let (bw, bh) = (fw + 2, fh + 2);
+        let x0 = tracks.x_track[&cx] + (tracks.col_w[&cx] - bw) / 2;
+        let y0 = tracks.y_track[&cy] + (tracks.row_h[&cy] - bh) / 2;
+        boxes.insert(id, RoomBox { id, x0, y0, x1: x0 + bw - 1, y1: y0 + bh - 1 });
+    }
+    // ...then extend connected zero-gutter neighbours to the shared track
+    // boundary so their walls land on the same line.
+    for c in &plan.connectors {
+        if let Some(side) = shared_wall_side(c, &cells, &tracks) {
+            let a = cells[&c.origin];
+            let b = cells[&c.dest];
+            match side {
+                Side::Right => {
+                    let bd = tracks.x_track[&b.0];
+                    if let Some(bx) = boxes.get_mut(&c.origin) {
+                        bx.x1 = bd;
+                    }
+                    if let Some(bx) = boxes.get_mut(&c.dest) {
+                        bx.x0 = bd;
+                    }
+                }
+                Side::Left => {
+                    let bd = tracks.x_track[&a.0];
+                    if let Some(bx) = boxes.get_mut(&c.origin) {
+                        bx.x0 = bd;
+                    }
+                    if let Some(bx) = boxes.get_mut(&c.dest) {
+                        bx.x1 = bd;
+                    }
+                }
+                Side::Bottom => {
+                    let bd = tracks.y_track[&b.1];
+                    if let Some(bx) = boxes.get_mut(&c.origin) {
+                        bx.y1 = bd;
+                    }
+                    if let Some(bx) = boxes.get_mut(&c.dest) {
+                        bx.y0 = bd;
+                    }
+                }
+                Side::Top => {
+                    let bd = tracks.y_track[&a.1];
+                    if let Some(bx) = boxes.get_mut(&c.origin) {
+                        bx.y0 = bd;
+                    }
+                    if let Some(bx) = boxes.get_mut(&c.dest) {
+                        bx.y1 = bd;
+                    }
+                }
+            }
+        }
+    }
+
+    // Stamp room boxes: wall ring + floor interior (shared walls simply coincide).
+    let mut g = Grid::new(w, h);
+    for bx in boxes.values() {
+        for y in bx.y0..=bx.y1 {
+            for x in bx.x0..=bx.x1 {
+                let edge = x == bx.x0 || x == bx.x1 || y == bx.y0 || y == bx.y1;
+                let t = if edge { Tile::Wall } else { Tile::Floor { room: bx.id } };
+                g.set(x, y, t);
+            }
+        }
+    }
+
+    // S3/S4: one TileConn per routed connector; realize each as a shared-wall
+    // door, a walled corridor, or a stub pair (distorted fallback / merge).
+    let conns: Vec<TileConn> = plan
+        .connectors
+        .iter()
+        .map(|c| TileConn {
+            origin: c.origin,
+            dest: c.dest,
+            dir: c.exit_dir,
+            reciprocal: c.reciprocal,
+            distorted: c.distorted,
+        })
+        .collect();
+    for (ci, c) in plan.connectors.iter().enumerate() {
+        let conn = ci as u16;
+        let Some(&ba) = boxes.get(&c.origin) else { continue };
+        let exit_corner = is_diagonal(c.exit_dir).then_some(c.exit_dir);
+        if c.merge || c.distorted {
+            realize_stub(&mut g, &ba, exit_corner, c.exit, c.exit_slot, conn, c.exit_dir);
+            if !c.merge {
+                if let Some(&bb) = boxes.get(&c.dest) {
+                    let dir = c.entry_dir.unwrap_or_else(|| opposite(c.exit_dir));
+                    realize_stub(&mut g, &bb, c.entry_corner, c.entry, c.entry_slot, conn, dir);
+                }
+            }
+            continue;
+        }
+        let Some(&bb) = boxes.get(&c.dest) else { continue };
+        if let Some(side) = shared_wall_side(c, &cells, &tracks) {
+            realize_shared_door(&mut g, c, conn, side, &ba, &bb);
+        } else {
+            realize_corridor(&mut g, c, conn, &ba, &bb, &tracks);
+        }
+    }
+
+    stamp_features(&mut g, &sub, &boxes);
+    paint_walls(&mut g);
+
+    let rooms: Vec<TileRoom> = boxes
+        .values()
+        .map(|b| TileRoom {
+            id: b.id,
+            bounds: Rect {
+                x: b.x0 as usize,
+                y: b.y0 as usize,
+                w: (b.x1 - b.x0 + 1) as usize,
+                h: (b.y1 - b.y0 + 1) as usize,
+            },
+            floor: Rect {
+                x: (b.x0 + 1) as usize,
+                y: (b.y0 + 1) as usize,
+                w: (b.x1 - b.x0 - 1) as usize,
+                h: (b.y1 - b.y0 - 1) as usize,
+            },
+        })
+        .collect();
+    TilePlan { w: w as usize, h: h as usize, tiles: g.tiles, rooms, conns }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::direction::Direction;
+    use crate::graph::MapGraph;
+    use crate::layer::MAIN_LAYER;
+
+    fn grid_room(g: &mut MapGraph, id: RoomId, pos: (i32, i32)) {
+        g.upsert_room(id, format!("r{id}"));
+        g.set_pos(id, pos);
+    }
+
+    fn door_tiles(p: &TilePlan) -> Vec<(usize, usize, u16, DoorKind)> {
+        let mut v = Vec::new();
+        for y in 0..p.h {
+            for x in 0..p.w {
+                if let Tile::Door { conn, kind } = p.get(x, y) {
+                    v.push((x, y, conn, kind));
+                }
+            }
+        }
+        v
+    }
+
+    fn room(p: &TilePlan, id: RoomId) -> &TileRoom {
+        p.rooms.iter().find(|r| r.id == id).unwrap()
+    }
+
+    fn rects_intersect(a: Rect, b: Rect) -> bool {
+        a.x <= b.right() && b.x <= a.right() && a.y <= b.bottom() && b.y <= a.bottom()
+    }
+
+    /// ~20 rooms, mixed directions (reciprocal + one-way cardinals, diagonals,
+    /// Up/Down, In/Out, Unknown, and shapes that force distortion), laid out by
+    /// the real layout engine.
+    fn big_graph() -> MapGraph {
+        let mut g = MapGraph::new();
+        for id in 1..=20u16 {
+            g.upsert_room(id, format!("r{id}"));
+        }
+        let edges: &[(u16, Direction, u16)] = &[
+            (1, Direction::E, 2),
+            (2, Direction::W, 1),
+            (2, Direction::E, 3),
+            (3, Direction::E, 4),
+            (1, Direction::S, 5),
+            (5, Direction::N, 1),
+            (5, Direction::E, 6),
+            (6, Direction::W, 5),
+            (3, Direction::S, 7),
+            (7, Direction::N, 3),
+            (4, Direction::SE, 8),
+            (8, Direction::NW, 4),
+            (5, Direction::S, 9),
+            (9, Direction::E, 10),
+            (10, Direction::E, 11),
+            (11, Direction::W, 10),
+            (11, Direction::E, 12),
+            (12, Direction::W, 11),
+            (9, Direction::S, 13),
+            (13, Direction::E, 14),
+            (14, Direction::N, 10),
+            (11, Direction::S, 15),
+            (15, Direction::N, 11),
+            (15, Direction::E, 16),
+            (16, Direction::W, 15),
+            (13, Direction::S, 17),
+            (17, Direction::N, 13),
+            (17, Direction::E, 18),
+            (18, Direction::W, 17),
+            (18, Direction::E, 19),
+            (19, Direction::N, 20),
+            (20, Direction::S, 19),
+            (6, Direction::Up, 7),
+            (7, Direction::Down, 6),
+            (7, Direction::NE, 2),
+            (20, Direction::In, 1),
+            (12, Direction::Out, 2),
+            (15, Direction::Unknown, 16),
+        ];
+        for &(o, d, t) in edges {
+            g.add_edge(o, d, t);
+        }
+        crate::layout::relayout_auto(&mut g);
+        g
+    }
+
+    #[test]
+    fn adjacent_reciprocal_pair_shares_one_wall_with_one_twoway_door() {
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (1, 0));
+        g.add_edge(1, Direction::E, 2);
+        g.add_edge(2, Direction::W, 1);
+        let p = realize_layer(&g, MAIN_LAYER);
+        let (a, b) = (room(&p, 1), room(&p, 2));
+        assert_eq!(a.bounds.right(), b.bounds.x, "boxes share exactly one wall column");
+        let doors = door_tiles(&p);
+        assert_eq!(doors.len(), 1, "one reciprocal pair → one door: {doors:?}");
+        let (x, _, conn, kind) = doors[0];
+        assert_eq!(x, a.bounds.right(), "the door sits in the shared wall");
+        assert_eq!(kind, DoorKind::TwoWay);
+        let tc = p.conns[conn as usize];
+        assert_eq!((tc.origin, tc.dest), (1, 2));
+    }
+
+    #[test]
+    fn one_way_edge_gets_a_one_way_door() {
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (1, 0));
+        g.add_edge(1, Direction::E, 2);
+        let p = realize_layer(&g, MAIN_LAYER);
+        let doors = door_tiles(&p);
+        assert_eq!(doors.len(), 1);
+        assert_eq!(doors[0].3, DoorKind::OneWay(Direction::E));
+    }
+
+    #[test]
+    fn adjacent_unconnected_rooms_share_a_wall_with_no_door() {
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (1, 0));
+        let p = realize_layer(&g, MAIN_LAYER);
+        let (a, b) = (room(&p, 1), room(&p, 2));
+        assert_eq!(a.bounds.right(), b.bounds.x, "boxes still meet on one shared column");
+        assert!(door_tiles(&p).is_empty(), "no connection → no door");
+        for y in a.floor.y..=a.floor.bottom() {
+            assert_eq!(p.get(a.bounds.right(), y), Tile::Wall, "shared column stays solid wall");
+        }
+    }
+
+    #[test]
+    fn distant_rooms_get_a_walled_corridor_with_doors_at_both_ends() {
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (2, 0));
+        g.add_edge(1, Direction::E, 2);
+        let p = realize_layer(&g, MAIN_LAYER);
+        let corridor: Vec<(usize, usize)> = (0..p.h)
+            .flat_map(|y| (0..p.w).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(p.get(x, y), Tile::Corridor { .. }))
+            .collect();
+        assert!(!corridor.is_empty(), "two columns apart → corridor tiles exist");
+        assert_eq!(door_tiles(&p).len(), 2, "a door on each room's wall");
+        // The paint pass walls the corridor in: no corridor tile touches bare Void.
+        for &(x, y) in &corridor {
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    assert!(nx >= 0 && ny >= 0 && (nx as usize) < p.w && (ny as usize) < p.h);
+                    assert_ne!(
+                        p.get(nx as usize, ny as usize),
+                        Tile::Void,
+                        "corridor at ({x},{y}) leaks into void at ({nx},{ny})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn perpendicular_crossing_corridors_get_a_bridge() {
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (2, 0));
+        grid_room(&mut g, 3, (1, -1));
+        grid_room(&mut g, 4, (1, 1));
+        g.add_edge(1, Direction::E, 2);
+        g.add_edge(3, Direction::S, 4);
+        let p = realize_layer(&g, MAIN_LAYER);
+        let bridges = p.tiles.iter().filter(|t| matches!(t, Tile::Bridge { .. })).count();
+        assert!(bridges >= 1, "perpendicular corridors must cross on a bridge");
+    }
+
+    #[test]
+    fn up_edge_stamps_stairs_on_the_origin_floor() {
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (1, 0));
+        g.add_edge(1, Direction::Up, 2);
+        let p = realize_layer(&g, MAIN_LAYER);
+        let f = room(&p, 1).floor;
+        let found = (f.y..=f.bottom()).any(|y| {
+            (f.x..=f.right())
+                .any(|x| p.get(x, y) == Tile::Feature { room: 1, kind: FeatureKind::StairsUp })
+        });
+        assert!(found, "Up edge → StairsUp feature on room 1's floor");
+    }
+
+    #[test]
+    fn door_count_minimums_grow_the_floor() {
+        // Three one-way E arrivals land on room 1's LEFT wall → floor_h ≥ 2*3+1 = 7.
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (-1, 0));
+        grid_room(&mut g, 3, (-1, -1));
+        grid_room(&mut g, 4, (-1, 1));
+        g.add_edge(2, Direction::E, 1);
+        g.add_edge(3, Direction::E, 1);
+        g.add_edge(4, Direction::E, 1);
+        let p = realize_layer(&g, MAIN_LAYER);
+        assert_eq!(room(&p, 1).floor.h, 7, "three left-wall doors need a 7-tall floor");
+    }
+
+    #[test]
+    fn realize_layer_is_deterministic() {
+        let g = big_graph();
+        let a = realize_layer(&g, MAIN_LAYER);
+        let b = realize_layer(&g, MAIN_LAYER);
+        assert_eq!(a, b, "two realizations of the same graph must be identical");
+    }
+
+    #[test]
+    fn every_connection_is_represented() {
+        let g = big_graph();
+        let p = realize_layer(&g, MAIN_LAYER);
+        let doors = door_tiles(&p);
+        let feature =
+            |room: RoomId, kind: FeatureKind| p.tiles.contains(&Tile::Feature { room, kind });
+        for c in g.connections() {
+            let pair = (c.origin.min(c.dest), c.origin.max(c.dest));
+            let ok = match c.dir {
+                Direction::Unknown => continue, // skipped by design (parity with classic)
+                Direction::Up => feature(c.origin, FeatureKind::StairsUp),
+                Direction::Down => feature(c.origin, FeatureKind::StairsDown),
+                Direction::In => feature(c.origin, FeatureKind::PortalIn),
+                Direction::Out => feature(c.origin, FeatureKind::PortalOut),
+                _ => doors.iter().any(|&(_, _, conn, _)| {
+                    let tc = p.conns[conn as usize];
+                    (tc.origin.min(tc.dest), tc.origin.max(tc.dest)) == pair
+                }),
+            };
+            assert!(ok, "connection {c:?} has no door, corridor, stub, or feature");
+        }
+    }
+
+    #[test]
+    fn floors_never_overlap_and_bounds_stay_inside_the_grid() {
+        let g = big_graph();
+        let p = realize_layer(&g, MAIN_LAYER);
+        for (i, a) in p.rooms.iter().enumerate() {
+            assert!(
+                a.bounds.right() < p.w && a.bounds.bottom() < p.h,
+                "room {} bounds {:?} exceed the {}x{} grid",
+                a.id,
+                a.bounds,
+                p.w,
+                p.h
+            );
+            for b in &p.rooms[i + 1..] {
+                assert!(
+                    !rects_intersect(a.floor, b.floor),
+                    "floors of rooms {} and {} overlap: {:?} vs {:?}",
+                    a.id,
+                    b.id,
+                    a.floor,
+                    b.floor
+                );
+            }
+        }
+    }
+}

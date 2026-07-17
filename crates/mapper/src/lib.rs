@@ -7,3 +7,4 @@ pub mod persist;
 pub mod render;
 pub mod route;
 pub mod router;
+pub mod tiles;
