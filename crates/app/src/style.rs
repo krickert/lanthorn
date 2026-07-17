@@ -1592,7 +1592,10 @@ pub fn write_style_full(
     ov.insert("tile.door_s".to_string(),      set.tiles.door_s.to_string());
     ov.insert("tile.door_w".to_string(),      set.tiles.door_w.to_string());
     ov.insert("tile.door_stub".to_string(),   set.tiles.door_stub.to_string());
+    ov.insert("tile.dash_h".to_string(),      set.tiles.dash_h.to_string());
+    ov.insert("tile.dash_v".to_string(),      set.tiles.dash_v.to_string());
     ov.insert("tile.bridge".to_string(),      set.tiles.bridge.to_string());
+    ov.insert("tile.bridge_v".to_string(),    set.tiles.bridge_v.to_string());
     ov.insert("tile.stairs_up".to_string(),   set.tiles.stairs_up.to_string());
     ov.insert("tile.stairs_down".to_string(), set.tiles.stairs_down.to_string());
     ov.insert("tile.portal_in".to_string(),   set.tiles.portal_in.to_string());

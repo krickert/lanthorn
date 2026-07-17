@@ -92,13 +92,15 @@ fn main() {
         }
     }
 
+    let t0 = std::time::Instant::now();
     let plan = realize_layer(&graph, layer);
+    let elapsed = t0.elapsed();
     if plan.w == 0 || plan.h == 0 {
         println!("(layer {layer}: empty plan)");
         return;
     }
     eprintln!(
-        "layer {layer}: {} rooms, {} conns, {}x{} tiles",
+        "layer {layer}: {} rooms, {} conns, {}x{} tiles, realized in {elapsed:?}",
         plan.rooms.len(),
         plan.conns.len(),
         plan.w,

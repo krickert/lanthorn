@@ -124,8 +124,14 @@ pub struct TileGlyphs {
     pub door_w: char,
     /// Dead-end stub door (route-failure edge).
     pub door_stub: char,
-    /// Perpendicular corridor crossing.
+    /// Dashed passage-floor trail for a distorted connection, horizontal run.
+    pub dash_h: char,
+    /// Dashed passage-floor trail for a distorted connection, vertical run.
+    pub dash_v: char,
+    /// Perpendicular corridor crossing, over-corridor horizontal.
     pub bridge: char,
+    /// Perpendicular corridor crossing, over-corridor vertical.
+    pub bridge_v: char,
     pub stairs_up: char,
     pub stairs_down: char,
     pub portal_in: char,
@@ -235,7 +241,10 @@ impl Default for SymbolSet {
                 door_s: '▾',
                 door_w: '◂',
                 door_stub: '?',
+                dash_h: '╌',
+                dash_v: '╎',
                 bridge: '╪',
+                bridge_v: '╫',
                 stairs_up: '<',
                 stairs_down: '>',
                 portal_in: '⊙',
@@ -641,7 +650,10 @@ fn apply_override(s: &mut SymbolSet, key: &str, ch: char) {
         "tile.door_s"      => s.tiles.door_s = ch,
         "tile.door_w"      => s.tiles.door_w = ch,
         "tile.door_stub"   => s.tiles.door_stub = ch,
+        "tile.dash_h"      => s.tiles.dash_h = ch,
+        "tile.dash_v"      => s.tiles.dash_v = ch,
         "tile.bridge"      => s.tiles.bridge = ch,
+        "tile.bridge_v"    => s.tiles.bridge_v = ch,
         "tile.stairs_up"   => s.tiles.stairs_up = ch,
         "tile.stairs_down" => s.tiles.stairs_down = ch,
         "tile.portal_in"   => s.tiles.portal_in = ch,

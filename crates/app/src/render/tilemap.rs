@@ -4,7 +4,7 @@
 //! nothing here is hard-coded, matching the classic renderer's theming rules.
 
 use mapper::graph::{MapGraph, RoomId};
-use mapper::tiles::{DoorKind, FeatureKind, Tile, TilePlan, MIN_TRACK};
+use mapper::tiles::{DoorKind, FeatureKind, Tile, TilePlan, WallKind, MIN_TRACK};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -47,15 +47,55 @@ fn tile_origin(plan: &TilePlan, state: &AppState, area: Rect) -> (i32, i32) {
     )
 }
 
-/// True when the tile at (x, y) continues a wall run: a wall, a door punched
-/// into one, or an in-wall portal feature. Out-of-plan coordinates are Void.
+/// True when the tile at (x, y) continues a ROOM wall run: the box ring, a door
+/// punched into it, or an in-wall portal feature. Painted passage walls do NOT
+/// count — room outlines stay pure double-line where a passage side abuts.
 fn in_wall_run(plan: &TilePlan, x: usize, y: usize) -> bool {
     matches!(
         plan.get(x, y),
-        Tile::Wall
+        Tile::Wall { kind: WallKind::Room }
             | Tile::Door { .. }
             | Tile::Feature { kind: FeatureKind::PortalIn | FeatureKind::PortalOut, .. }
     )
+}
+
+/// True when the tile at (x, y) is passage interior: corridor floor, a
+/// crossing, or a door opening.
+fn passage_interior(plan: &TilePlan, x: i32, y: i32) -> bool {
+    x >= 0
+        && y >= 0
+        && (x as usize) < plan.w
+        && (y as usize) < plan.h
+        && matches!(
+            plan.get(x as usize, y as usize),
+            Tile::Corridor { .. } | Tile::Bridge { .. } | Tile::Door { .. }
+        )
+}
+
+/// True when the wall tiles at `a` and `b` (orthogonally adjacent) bound the
+/// SAME passage: some passage-interior tile is 8-adjacent to both. Without this
+/// check the painted walls of two passages running side by side cross-link into
+/// tee/cross mush; with it they render as two clean parallel lines.
+fn path_walls_linked(plan: &TilePlan, a: (usize, usize), b: (usize, usize)) -> bool {
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            let (cx, cy) = (a.0 as i32 + dx, a.1 as i32 + dy);
+            if passage_interior(plan, cx, cy)
+                && (cx - b.0 as i32).abs() <= 1
+                && (cy - b.1 as i32).abs() <= 1
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when the tile at (x, y) can continue a PASSAGE wall run: painted path
+/// walls junction with each other and run into room walls and door openings.
+/// Whether a specific neighbor pair actually joins is [`path_walls_linked`].
+fn in_path_run(plan: &TilePlan, x: usize, y: usize) -> bool {
+    matches!(plan.get(x, y), Tile::Wall { .. } | Tile::Door { .. })
 }
 
 /// 4-neighbor direction mask over `probe`, guarding the plan bounds.
@@ -98,20 +138,37 @@ fn wall_glyph(mask: u8, w: &WallGlyphs) -> char {
 }
 
 /// The glyph for a door tile: a two-way door is a single-line stroke oriented by
-/// the wall run it sits in (left+right walls → `─`, above+below → `│`; corner
-/// doors tie and render horizontal); one-way keeps its direction triangle (a
-/// diagonal renders as its vertical cardinal); stub keeps `?`.
-fn door_glyph(plan: &TilePlan, x: usize, y: usize, kind: DoorKind, g: &TileGlyphs) -> char {
+/// the wall run it sits in (left+right walls → `─`, above+below → `│`); a door
+/// sitting ON a box corner (diagonal corner doors) renders as the single-line
+/// corner matching its two wall runs so the outline stays closed; one-way keeps
+/// its direction triangle (a diagonal renders as its vertical cardinal); stub
+/// keeps `?`.
+fn door_glyph(
+    plan: &TilePlan,
+    x: usize,
+    y: usize,
+    kind: DoorKind,
+    g: &TileGlyphs,
+    path: &crate::symbols::PathGlyphs,
+) -> char {
     use mapper::direction::Direction as D;
     match kind {
         DoorKind::TwoWay => {
             let m = neighbor_mask(plan, x, y, |nx, ny| in_wall_run(plan, nx, ny));
-            let v = u8::from(m & DIR_N != 0) + u8::from(m & DIR_S != 0);
-            let h = u8::from(m & DIR_E != 0) + u8::from(m & DIR_W != 0);
-            if v > h {
-                g.door_v
-            } else {
-                g.door_h
+            match m {
+                m if m == DIR_S | DIR_E => path.se,
+                m if m == DIR_S | DIR_W => path.sw,
+                m if m == DIR_N | DIR_E => path.ne,
+                m if m == DIR_N | DIR_W => path.nw,
+                _ => {
+                    let v = u8::from(m & DIR_N != 0) + u8::from(m & DIR_S != 0);
+                    let h = u8::from(m & DIR_E != 0) + u8::from(m & DIR_W != 0);
+                    if v > h {
+                        g.door_v
+                    } else {
+                        g.door_h
+                    }
+                }
             }
         }
         DoorKind::Stub(_) => g.door_stub,
@@ -156,24 +213,62 @@ pub fn render_tile_map(
         for tx in ox as usize..x1 {
             let (ch, style) = match plan.get(tx, ty) {
                 Tile::Void => continue,
-                Tile::Wall => {
+                Tile::Wall { kind: WallKind::Room } => {
                     let m = neighbor_mask(plan, tx, ty, |nx, ny| in_wall_run(plan, nx, ny));
                     (wall_glyph(m, &g.walls), cs.tile_wall)
                 }
-                Tile::Floor { .. } => (g.floor, cs.tile_floor),
-                Tile::Corridor { .. } => {
-                    // Single-line line-art through the classic path table: the
-                    // mask is the corridor's 4-neighborhood of connecting tiles.
+                Tile::Wall { kind: WallKind::Path } => {
+                    // Passage sides: single-line art through the classic path
+                    // table, junctioning with other path walls and running into
+                    // room walls and door openings — but only where a neighbor
+                    // bounds the SAME passage (see path_walls_linked).
                     let m = neighbor_mask(plan, tx, ty, |nx, ny| {
-                        matches!(
-                            plan.get(nx, ny),
-                            Tile::Corridor { .. } | Tile::Door { .. } | Tile::Bridge { .. }
-                        )
+                        in_path_run(plan, nx, ny) && path_walls_linked(plan, (tx, ty), (nx, ny))
                     });
-                    (glyph_for(m, &state.symbols.path).unwrap_or(g.floor), cs.tile_corridor)
+                    let ch = glyph_for(m, &state.symbols.path).unwrap_or(state.symbols.path.ew);
+                    (ch, cs.tile_corridor)
                 }
-                Tile::Door { kind, .. } => (door_glyph(plan, tx, ty, kind, g), cs.tile_door),
-                Tile::Bridge { .. } => (g.bridge, cs.tile_bridge),
+                Tile::Floor { .. } => (g.floor, cs.tile_floor),
+                Tile::Corridor { conn } => {
+                    // Passage floor. A distorted conn's trail renders dashed
+                    // (straight stretches only — bends keep the floor dot).
+                    let distorted =
+                        plan.conns.get(conn as usize).is_some_and(|tc| tc.distorted);
+                    let ch = if distorted {
+                        let m = neighbor_mask(plan, tx, ty, |nx, ny| match plan.get(nx, ny) {
+                            Tile::Corridor { conn: o } => o == conn,
+                            Tile::Door { .. } | Tile::Bridge { .. } => true,
+                            _ => false,
+                        });
+                        match m {
+                            m if m & (DIR_E | DIR_W) != 0 && m & (DIR_N | DIR_S) == 0 => g.dash_h,
+                            m if m & (DIR_N | DIR_S) != 0 && m & (DIR_E | DIR_W) == 0 => g.dash_v,
+                            _ => g.floor,
+                        }
+                    } else {
+                        g.floor
+                    };
+                    (ch, cs.tile_corridor)
+                }
+                Tile::Door { kind, .. } => {
+                    (door_glyph(plan, tx, ty, kind, g, &state.symbols.path), cs.tile_door)
+                }
+                Tile::Bridge { over, .. } => {
+                    // The over-conn's axis picks the glyph: its corridor
+                    // continues on a vertical neighbor → it runs vertical.
+                    let over_vertical = [(0i32, -1i32), (0, 1)].into_iter().any(|(dx, dy)| {
+                        let (nx, ny) = (tx as i32 + dx, ty as i32 + dy);
+                        nx >= 0
+                            && ny >= 0
+                            && (nx as usize) < plan.w
+                            && (ny as usize) < plan.h
+                            && matches!(
+                                plan.get(nx as usize, ny as usize),
+                                Tile::Corridor { conn: o } if o == over
+                            )
+                    });
+                    (if over_vertical { g.bridge_v } else { g.bridge }, cs.tile_bridge)
+                }
                 Tile::Feature { kind, .. } => (feature_glyph(kind, g), cs.tile_stairs),
             };
             let sx = i32::from(area.x) + tx as i32 - ox;
@@ -284,17 +379,17 @@ mod tests {
 
         // Verified by eye: double-line room outlines with ╣ junctions where room
         // 2's taller box meets the shared wall; a │ door in the shared wall and
-        // in each corridor-end wall; a single-line ─── corridor to room 3; '@'
-        // sits on room 1's floor centre; Void stays blank (rows are padded to
-        // the 40-cell area).
+        // in each passage-end wall; the short 2→3 passage stays direct — dim ···
+        // floor walled by single-line ─── path walls; '@' sits on room 1's floor
+        // centre; Void stays blank (rows are padded to the 40-cell area).
         let expected = concat!(
             "                                        \n",
             "                                        \n",
             "        ╔═══════╗   ╔═════╗             \n",
             "  ╔═════╣·······║   ║·····║             \n",
-            "  ║·····║·······║   ║·····║             \n",
-            "  ║··@··│·······│───│·····║             \n",
-            "  ║·····║·······║   ║·····║             \n",
+            "  ║·····║·······║───║·····║             \n",
+            "  ║··@··│·······│···│·····║             \n",
+            "  ║·····║·······║───║·····║             \n",
             "  ╚═════╣·······║   ║·····║             \n",
             "        ╚═══════╝   ╚═════╝             \n",
             "                                        \n",
@@ -316,14 +411,14 @@ mod tests {
         let f = r1.floor;
         let (cx, cy) = ((f.x + f.w / 2) as u16, (f.y + f.h / 2) as u16);
         assert_eq!(buf.cell((cx, cy)).unwrap().symbol(), "@");
-        // The 2→3 corridor is line-art now: a ─ stroke with bare Void around it.
+        // The 2→3 passage: dim · floor walled with single-line ─ path walls.
         let (tx, ty) = (0..plan.h)
             .flat_map(|y| (0..plan.w).map(move |x| (x, y)))
             .find(|&(x, y)| matches!(plan.get(x, y), Tile::Corridor { .. }))
             .expect("corridor tiles exist between rooms 2 and 3");
-        assert_eq!(buf.cell((tx as u16, ty as u16)).unwrap().symbol(), "─");
-        assert_eq!(buf.cell((tx as u16, ty as u16 - 1)).unwrap().symbol(), " ");
-        assert_eq!(buf.cell((tx as u16, ty as u16 + 1)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((tx as u16, ty as u16)).unwrap().symbol(), "·");
+        assert_eq!(buf.cell((tx as u16, ty as u16 - 1)).unwrap().symbol(), "─");
+        assert_eq!(buf.cell((tx as u16, ty as u16 + 1)).unwrap().symbol(), "─");
     }
 
     #[test]
