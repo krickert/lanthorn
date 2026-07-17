@@ -109,6 +109,10 @@
   cursor-addressed games (forms, status displays) want a roomy story pane.
 - `undo_levels` (default 16) — how many in-memory undo states the Z-machine
   keeps for the game's own UNDO command (0 disables undo).
+- `map_renderer` (default `"classic"`) — which renderer draws the Boxes-zoom
+  map pane: `"classic"` line-art boxes or the experimental `"tiles"` tile-grid
+  view (shared walls, punched doors, walled corridors). Flip it live with the
+  `toggle-map-renderer` command; Compact/Overview zooms always draw classic.
 - **In-app config screen** (`F2`) — a settings modal for the common options
   with an explicit Save (writes the config file, format-preserving) and Cancel;
   changes apply live.

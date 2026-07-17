@@ -28,6 +28,7 @@ use app::render::hints_panel::{hint_key_routes, HintKeyKind, HintsPanelRects};
 use app::render::verbmenu::draw_verb_menu;
 use app::render::inspector::{draw_inspector, room_diagnostics};
 use app::render::map::{pulse_border_color, render_map_layered, room_screen_rects, sound_pulse_color};
+use app::render::tilemap::tile_room_screen_rects;
 use app::render::paneframe::{build_layer_segments, draw_framed, draw_header_plain, draw_top_inset, InsetSegment};
 use app::render::tidy_panel::draw_tidy_panel;
 use mapper::graph::RoomId;
@@ -316,6 +317,17 @@ fn draw_frame(
                 }
             }
         };
+        // Tile renderer (`map_renderer = "tiles"`, Boxes zoom): the plan is
+        // realized by the background render job (spawned from `cached_map_render`
+        // above) and only READ here; until the first plan lands the classic
+        // renderer keeps drawing, so the pane is never blank. Replay and
+        // tidy-animation frames always draw classic — their graphs aren't
+        // tracked by `graph_gen`, so no cached plan exists for them.
+        let tile_plan = (app::state::render_job_wants_tiles(state.config.map_renderer, state.zoom)
+            && replay_graph.is_none()
+            && state.tidy_anim.is_none())
+        .then(|| state.cached_tile_plan())
+        .flatten();
 
         // ── Inventory dock: reserve a bottom band (above the help row) that
         // slides up when toggled, sized from the item list + slide fraction.
@@ -403,7 +415,7 @@ fn draw_frame(
                 story_area = story_fp.content;
 
                 let map_fp = draw_framed(buf, pane_layout.map, state.colors.map_border_sides, &state.colors.map_border_glyphs, map_border_color, state.colors.map_header_on);
-                render_map_layered(&rm, &mapper.graph, state, map_fp.content, buf);
+                render_map_layered(&rm, tile_plan.as_deref(), &mapper.graph, state, map_fp.content, buf);
                 if let Some(anim) = &state.tidy_anim {
                     let tidy_ds = make_dialog_style(state);
                     if let Some(dr) = draw_tidy_panel(anim.current(), map_fp.content, buf, &tidy_ds) {
@@ -469,9 +481,13 @@ fn draw_frame(
             }
         }
 
-        // Compute room screen rects for accurate mouse hit-testing.
+        // Compute room screen rects for accurate mouse hit-testing, from
+        // whichever renderer actually drew the rooms this frame.
         room_rects_out = if map_area.height > 0 {
-            room_screen_rects(&rm, state, map_area)
+            match &tile_plan {
+                Some(plan) => tile_room_screen_rects(plan, state, map_area),
+                None => room_screen_rects(&rm, state, map_area),
+            }
         } else {
             Vec::new()
         };

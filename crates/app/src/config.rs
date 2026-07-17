@@ -300,6 +300,22 @@ pub enum BackgroundTidy {
 /// Number of new rooms that must accumulate before a `Debounced` background tidy fires.
 pub const BG_TIDY_DEBOUNCE: u32 = 5;
 
+/// Which map renderer draws the Boxes-zoom map pane. Exactly one is active at a
+/// time; `toggle-map-renderer` flips it at runtime.
+///
+/// TOML: `map_renderer = "classic"` (default) or `"tiles"` (the experimental
+/// tile-grid renderer — shared walls, punched doors, walled corridors).
+/// Compact/Overview zooms always use the classic renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MapRenderer {
+    /// The line-art box renderer (default).
+    #[default]
+    Classic,
+    /// The tile-grid ("ASCII-art") renderer.
+    Tiles,
+}
+
 /// Where to persist v5 auxiliary save data (the `save/restore table` opcodes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -402,6 +418,9 @@ pub struct Config {
     /// Default: EveryRoom (re-tidy on each turn that finds a new room).
     #[serde(default)]
     pub background_tidy: BackgroundTidy,
+    /// Which renderer draws the Boxes-zoom map pane. Default: Classic.
+    #[serde(default)]
+    pub map_renderer: MapRenderer,
     /// Where to persist v5 auxiliary save data. Default: Ask.
     #[serde(default)]
     pub aux_storage: AuxStorage,
@@ -508,6 +527,7 @@ impl Default for Config {
             prompt_load_on_launch: true,
             record_turn_history: false,
             background_tidy: BackgroundTidy::EveryRoom,
+            map_renderer: MapRenderer::Classic,
             aux_storage: AuxStorage::Ask,
             keymap: KeymapConfig::default(),
             hotkeys: HotkeysConfig::default(),
@@ -583,6 +603,7 @@ pub fn resolve(cli: &Cli) -> Config {
             cfg.prompt_load_on_launch = from_file.prompt_load_on_launch;
             cfg.record_turn_history = from_file.record_turn_history;
             cfg.background_tidy = from_file.background_tidy;
+            cfg.map_renderer = from_file.map_renderer;
             cfg.aux_storage = from_file.aux_storage;
             cfg.keymap = from_file.keymap;
             cfg.hotkeys = from_file.hotkeys;
@@ -651,6 +672,11 @@ pub fn write_config(dir: &std::path::Path, cfg: &Config) -> std::io::Result<()> 
         BackgroundTidy::Debounced => "debounced",
     };
     doc["background_tidy"] = toml_edit::value(bg_str);
+    let renderer_str = match cfg.map_renderer {
+        MapRenderer::Classic => "classic",
+        MapRenderer::Tiles => "tiles",
+    };
+    doc["map_renderer"] = toml_edit::value(renderer_str);
     let aux_str = match cfg.aux_storage {
         AuxStorage::Ask => "ask",
         AuxStorage::Archive => "archive",
@@ -936,6 +962,19 @@ use_defaults = false
     }
 
     #[test]
+    fn map_renderer_defaults_classic() {
+        assert_eq!(Config::default().map_renderer, MapRenderer::Classic);
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.map_renderer, MapRenderer::Classic);
+    }
+
+    #[test]
+    fn map_renderer_parses_tiles_from_toml() {
+        let cfg: Config = toml::from_str("map_renderer = \"tiles\"").unwrap();
+        assert_eq!(cfg.map_renderer, MapRenderer::Tiles);
+    }
+
+    #[test]
     fn aux_storage_defaults_to_ask() {
         assert_eq!(Config::default().aux_storage, AuxStorage::Ask);
     }
@@ -967,6 +1006,7 @@ use_defaults = false
             prompt_load_on_launch: true,
             record_turn_history: false,
             background_tidy: BackgroundTidy::OnOverlap,
+            map_renderer: MapRenderer::Tiles,
             aux_storage: AuxStorage::Ask,
             keymap: KeymapConfig::default(),
             hotkeys: HotkeysConfig::default(),
@@ -1002,6 +1042,7 @@ use_defaults = false
         assert_eq!(doc["auto_load"].as_bool(), Some(false));
         assert_eq!(doc["auto_save"].as_bool(), Some(true));
         assert_eq!(doc["background_tidy"].as_str(), Some("on_overlap"));
+        assert_eq!(doc["map_renderer"].as_str(), Some("tiles"));
         assert_eq!(doc["split_ratio"].as_integer(), Some(70));
         assert_eq!(doc["verb_dock_pct"].as_integer(), Some(40));
         assert_eq!(doc["inv_dock_pct"].as_integer(), Some(25));

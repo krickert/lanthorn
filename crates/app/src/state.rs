@@ -671,8 +671,9 @@ impl std::fmt::Debug for TidyJob {
 /// phase so the map pane can show a live progress trace. The run loop polls
 /// `handle.is_finished()` and installs the result when `gen` still matches.
 pub struct RenderJob {
-    /// Worker thread handle. Returns the routed `RenderMap`.
-    pub handle: std::thread::JoinHandle<mapper::render::RenderMap>,
+    /// Worker thread handle. Returns the routed `RenderMap`, plus the realized
+    /// `TilePlan` when the tile renderer wanted one (see `render_job_wants_tiles`).
+    pub handle: std::thread::JoinHandle<(mapper::render::RenderMap, Option<mapper::tiles::TilePlan>)>,
     /// The layer this model is being routed for.
     pub layer: mapper::layer::LayerId,
     /// Graph generation recorded at spawn; a mismatch on completion means the
@@ -1257,6 +1258,18 @@ pub(crate) struct MapRenderCache {
     pub layer: LayerId,
     /// The routed, zoom-independent render model.
     pub rm: mapper::render::RenderMap,
+    /// The realized tile plan for the tile renderer (`map_renderer = "tiles"`),
+    /// produced by the same background job and keyed by the same `(gen, layer)`.
+    /// `None` in classic mode (no tile work runs) and while the first tiles-mode
+    /// job is still in flight — the draw falls back to the classic renderer then.
+    pub tile_plan: Option<mapper::tiles::TilePlan>,
+}
+
+/// Whether the background render job should also realize a [`mapper::tiles::TilePlan`].
+/// Only the tile renderer at Boxes zoom consumes one — classic mode (and the
+/// Compact/Overview zooms, which always draw classic) must cost zero extra work.
+pub fn render_job_wants_tiles(renderer: crate::config::MapRenderer, zoom: Zoom) -> bool {
+    renderer == crate::config::MapRenderer::Tiles && zoom == Zoom::Boxes
 }
 
 /// Modal / overlay UI state carved off `AppState` (SQ-0307). Each field's
@@ -2208,7 +2221,12 @@ impl AppState {
         graph: &mapper::graph::MapGraph,
     ) -> std::cell::Ref<'_, mapper::render::RenderMap> {
         let gen = self.graph_gen;
-        let fresh = matches!(self.map_render.borrow().as_ref(), Some(c) if c.gen == gen && c.layer == layer);
+        // A tiles-mode cache entry without a plan (e.g. built in classic mode, or
+        // the renderer was just toggled) is not fresh: a job respawns to realize
+        // the plan while the classic model keeps being served as the fallback.
+        let wants_tiles = render_job_wants_tiles(self.config.map_renderer, self.zoom);
+        let fresh = matches!(self.map_render.borrow().as_ref(),
+            Some(c) if c.gen == gen && c.layer == layer && (!wants_tiles || c.tile_plan.is_some()));
         if !fresh {
             // No routing ever runs on the main thread (SQ-0379). If there is no
             // model yet, seed an empty one so the pane can draw (blank) this frame;
@@ -2219,9 +2237,10 @@ impl AppState {
                     gen,
                     layer,
                     rm: mapper::render::render(&mapper::graph::MapGraph::new()),
+                    tile_plan: None,
                 });
             }
-            self.spawn_render_job(layer, graph, gen);
+            self.spawn_render_job(layer, graph, gen, wants_tiles);
         }
         // Live, cheap refresh of the per-move-changeable fields on whatever model
         // is currently shown — no re-route (SQ-0378).
@@ -2239,10 +2258,36 @@ impl AppState {
         })
     }
 
+    /// Borrow the cached tile plan for the live map. It lives in the same cache
+    /// entry as the `RenderMap` that `cached_map_render` is serving, so it is
+    /// exactly as (stale-but-consistent) as that model: while a rebuild is in
+    /// flight the last-ready plan keeps being served, and `None` only before the
+    /// first tiles-mode job lands (the draw then falls back to the classic
+    /// renderer). Purely a cache read — never realizes anything; production
+    /// stays on the background render job (`cached_map_render` spawns it when
+    /// tiles mode wants a plan the cache lacks).
+    pub fn cached_tile_plan(&self) -> Option<std::cell::Ref<'_, mapper::tiles::TilePlan>> {
+        let b = self.map_render.borrow();
+        if !matches!(b.as_ref(), Some(c) if c.tile_plan.is_some()) {
+            return None;
+        }
+        Some(std::cell::Ref::map(b, |c| {
+            c.as_ref().and_then(|c| c.tile_plan.as_ref()).expect("checked above")
+        }))
+    }
+
     /// Spawn the background map-render worker for `(gen, layer)` unless one is
     /// already in flight (coalesced — like the tidy worker). The worker routes a
-    /// clone of the graph and reports each phase into `render_steps`. (SQ-0379)
-    fn spawn_render_job(&self, layer: LayerId, graph: &mapper::graph::MapGraph, gen: u64) {
+    /// clone of the graph and reports each phase into `render_steps`; with
+    /// `wants_tiles` it also realizes the tile plan there — never on the main
+    /// thread. (SQ-0379)
+    fn spawn_render_job(
+        &self,
+        layer: LayerId,
+        graph: &mapper::graph::MapGraph,
+        gen: u64,
+        wants_tiles: bool,
+    ) {
         let mut job = self.render_job.borrow_mut();
         if job.is_some() {
             // A job is already running; let it finish. `poll_render_job` discards
@@ -2260,7 +2305,12 @@ impl AppState {
                     s.push(name.to_string());
                 }
             };
-            mapper::render::render_layer_traced(&g, layer, &mut push)
+            let rm = mapper::render::render_layer_traced(&g, layer, &mut push);
+            let plan = wants_tiles.then(|| {
+                push("tile plan");
+                mapper::tiles::realize_layer(&g, layer)
+            });
+            (rm, plan)
         });
         *job = Some(RenderJob { handle, layer, gen, started: std::time::Instant::now() });
     }
@@ -2280,10 +2330,10 @@ impl AppState {
         }
         let job = self.render_job.borrow_mut().take().expect("checked above");
         match job.handle.join() {
-            Ok(rm) => {
+            Ok((rm, tile_plan)) => {
                 if job.gen == self.graph_gen {
                     *self.map_render.borrow_mut() =
-                        Some(MapRenderCache { gen: job.gen, layer: job.layer, rm });
+                        Some(MapRenderCache { gen: job.gen, layer: job.layer, rm, tile_plan });
                     if let Ok(mut s) = self.render_steps.lock() {
                         s.clear();
                     }
@@ -4350,6 +4400,58 @@ mod tests {
             let rm = s.cached_map_render(0, &g);
             assert_eq!(rm.rooms.len(), 2, "the freshly routed model is now served");
         }
+    }
+
+    /// The "should this job realize tiles?" decision: only the tile renderer at
+    /// Boxes zoom — classic mode and the classic-only zooms cost zero tile work.
+    #[test]
+    fn render_job_wants_tiles_only_for_tiles_renderer_at_boxes() {
+        use crate::config::MapRenderer;
+        assert!(render_job_wants_tiles(MapRenderer::Tiles, Zoom::Boxes));
+        assert!(!render_job_wants_tiles(MapRenderer::Classic, Zoom::Boxes));
+        assert!(!render_job_wants_tiles(MapRenderer::Tiles, Zoom::Compact));
+        assert!(!render_job_wants_tiles(MapRenderer::Tiles, Zoom::Overview));
+    }
+
+    /// The background render job carries a `TilePlan` in tiles mode and none in
+    /// classic mode; toggling to tiles against a fresh classic cache respawns
+    /// the job (classic model keeps being served as the fallback meanwhile).
+    #[test]
+    fn render_job_carries_tile_plan_only_in_tiles_mode() {
+        use mapper::graph::MapGraph;
+        let mut g = MapGraph::new();
+        g.upsert_room(1, "A".into());
+        g.set_pos(1, (0, 0));
+        let mut s = AppState::default(); // classic renderer, Boxes zoom
+
+        // Classic mode: the job result carries no plan.
+        let _ = s.cached_map_render(0, &g);
+        drain_render_job(&mut s);
+        assert!(s.map_render.borrow().as_ref().unwrap().tile_plan.is_none());
+        assert!(s.cached_tile_plan().is_none());
+
+        // Toggle to tiles: the fresh classic model is no longer enough — a job
+        // respawns for the plan while the classic model stays served.
+        s.config.map_renderer = crate::config::MapRenderer::Tiles;
+        {
+            let rm = s.cached_map_render(0, &g);
+            assert_eq!(rm.rooms.len(), 1, "classic fallback served while the plan builds");
+        }
+        assert!(s.render_job.borrow().is_some(), "tiles toggle respawns the render job");
+        assert!(s.cached_tile_plan().is_none(), "no plan until the job lands");
+        drain_render_job(&mut s);
+        let plan = s.cached_tile_plan().expect("tiles-mode job carries a plan");
+        assert_eq!(plan.rooms.len(), 1);
+        drop(plan);
+
+        // Same (gen, layer) in tiles mode: fully fresh, no new worker.
+        let _ = s.cached_map_render(0, &g);
+        assert!(s.render_job.borrow().is_none());
+
+        // Back to classic: the cache (with its plan) still satisfies — no worker.
+        s.config.map_renderer = crate::config::MapRenderer::Classic;
+        let _ = s.cached_map_render(0, &g);
+        assert!(s.render_job.borrow().is_none());
     }
 
     /// SQ-0378: a step between already-placed rooms changes the current-room

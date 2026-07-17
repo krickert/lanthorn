@@ -190,6 +190,8 @@ pub enum Action {
     TogglePortalLabels,
     /// Toggle room-number (#id) visibility in Boxes-zoom room boxes.
     ToggleRoomNumbers,
+    /// Switch the Boxes-zoom map renderer between classic line-art and tiles.
+    ToggleMapRenderer,
     ToggleStatusBar,
     /// Toggle honoring the Z-machine's timed-input (`read`/`read_char` timers).
     ToggleTimedInput,
@@ -1849,6 +1851,19 @@ pub fn apply_action(action: Action, state: &mut AppState, mapper: &mut Mapper) {
         Action::ToggleAlignment => state.show_alignment = !state.show_alignment,
         Action::TogglePortalLabels => state.show_portal_labels = !state.show_portal_labels,
         Action::ToggleRoomNumbers => state.show_room_numbers = !state.show_room_numbers,
+        Action::ToggleMapRenderer => {
+            use crate::config::MapRenderer;
+            state.config.map_renderer = match state.config.map_renderer {
+                MapRenderer::Classic => MapRenderer::Tiles,
+                MapRenderer::Tiles => MapRenderer::Classic,
+            };
+            // The next draw notices the cache lacks (or no longer needs) a tile
+            // plan and (re)spawns the background render job — nothing runs here.
+            state.set_status(match state.config.map_renderer {
+                MapRenderer::Classic => "map renderer: classic",
+                MapRenderer::Tiles => "map renderer: tiles",
+            });
+        }
         Action::ToggleLocMethod => state.show_loc_method = !state.show_loc_method,
         Action::ToggleStatusBar => state.show_status_bar = !state.show_status_bar,
         Action::ToggleTimedInput => {
@@ -3940,6 +3955,18 @@ mod tests {
         assert!(s.show_portal_labels, "TogglePortalLabels turns labels on");
         apply_action(Action::TogglePortalLabels, &mut s, &mut m);
         assert!(!s.show_portal_labels, "TogglePortalLabels toggles back off");
+    }
+
+    #[test]
+    fn toggle_map_renderer_flips_between_classic_and_tiles() {
+        use crate::config::MapRenderer;
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        assert_eq!(s.config.map_renderer, MapRenderer::Classic, "default classic");
+        apply_action(Action::ToggleMapRenderer, &mut s, &mut m);
+        assert_eq!(s.config.map_renderer, MapRenderer::Tiles);
+        apply_action(Action::ToggleMapRenderer, &mut s, &mut m);
+        assert_eq!(s.config.map_renderer, MapRenderer::Classic);
     }
 
     #[test]

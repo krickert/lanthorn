@@ -705,8 +705,14 @@ pub(crate) fn loc_method_label(m: zvm::location::LocationMethod) -> &'static str
 
 /// because in that case the border carries layer tabs via `draw_top_inset` and drawing the
 /// in-content strip would produce a double indicator and consume a content row.
+///
+/// `tile_plan` selects the map body's renderer: `Some` draws the tile map
+/// (`map_renderer = "tiles"`, Boxes zoom, plan already realized by the
+/// background render job — never here), `None` the classic line-art map. All
+/// surrounding chrome (layer strip, indicators, progress) is shared.
 pub fn render_map_layered(
     rm: &RenderMap,
+    tile_plan: Option<&mapper::tiles::TilePlan>,
     graph: &mapper::graph::MapGraph,
     state: &AppState,
     area: Rect,
@@ -724,7 +730,10 @@ pub fn render_map_layered(
     } else {
         area
     };
-    render_map(rm, state, body_area, buf);
+    match tile_plan {
+        Some(plan) => crate::render::tilemap::render_tile_map(plan, graph, state, body_area, buf),
+        None => render_map(rm, state, body_area, buf),
+    }
 
     // Detection-method indicator: bottom-right corner, hidden by default.
     if state.show_loc_method {
@@ -2994,7 +3003,7 @@ mod tests {
 
         let area = Rect::new(3, 2, 140, 48); // offset origin: the SIZE is what recentring needs
         let mut buf = Buffer::empty(Rect::new(0, 0, 200, 60));
-        render_map_layered(&rm, &g, &state, area, &mut buf);
+        render_map_layered(&rm, None, &g, &state, area, &mut buf);
 
         assert_eq!(
             state.map_pane_size.get(),
@@ -3013,7 +3022,7 @@ mod tests {
         state.loc_method = Some(zvm::location::LocationMethod::StatusName);
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
-        render_map_layered(&rm, &g, &state, area, &mut buf);
+        render_map_layered(&rm, None, &g, &state, area, &mut buf);
         // The label "via name match" ends at the bottom-right; check its last char.
         let row = area.bottom() - 1;
         let last = buf.cell((area.right() - 1, row)).unwrap().symbol().to_string();
@@ -5674,7 +5683,7 @@ mod tests {
         let mut state = AppState::default();
         state.colors.map_border_style = BorderStyle::Single;
 
-        render_map_layered(&rm, &g, &state, area, &mut buf);
+        render_map_layered(&rm, None, &g, &state, area, &mut buf);
 
         // The strip would write REVERSED style to cells in row 0. With a border active,
         // the strip is suppressed so no REVERSED cells appear in row 0.
@@ -5708,7 +5717,7 @@ mod tests {
         state.zoom = crate::state::Zoom::Boxes; // strip requires non-Overview
         state.colors.map_border_style = BorderStyle::None;
 
-        render_map_layered(&rm, &g, &state, area, &mut buf);
+        render_map_layered(&rm, None, &g, &state, area, &mut buf);
 
         // The strip draws REVERSED on active tab cells in row 0.
         let reversed_in_row0 = (area.x..area.right())

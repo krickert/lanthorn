@@ -309,6 +309,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "toggle-room-numbers", category: Category::Map, context: Context::Global,
         usage: "toggle-room-numbers", description: "toggle room-number labels",
         dispatch: |_| SlashOutcome::Action(crate::input::Action::ToggleRoomNumbers) },
+    CommandSpec { name: "toggle-map-renderer", category: Category::Map, context: Context::Global,
+        usage: "toggle-map-renderer", description: "switch the map between the classic and tile renderers",
+        dispatch: |_| SlashOutcome::Action(crate::input::Action::ToggleMapRenderer) },
     CommandSpec { name: "toggle-loc-method", category: Category::Map, context: Context::Global,
         usage: "toggle-loc-method", description: "toggle the room-detection-method indicator",
         dispatch: |_| SlashOutcome::Action(crate::input::Action::ToggleLocMethod) },
@@ -720,9 +723,19 @@ mod tests {
         assert_eq!(by("save-state").category, Category::Game);
         assert_eq!(by("zoom-map").category, Category::Map);
         assert_eq!(by("anim-step").context, Context::Anim);
-        // Total count matches the spec table (Game 12, Map 21, View 6,
+        // Total count matches the spec table (Game 12, Map 22, View 6,
         // Transcript 3, Style 7, Export 3, Animation 4, Help 2).
-        assert_eq!(COMMANDS.len(), 58, "registry must match the spec's Full command table");
+        assert_eq!(COMMANDS.len(), 59, "registry must match the spec's Full command table");
+    }
+
+    #[test]
+    fn toggle_map_renderer_command_present() {
+        let c = find_command("toggle-map-renderer").expect("toggle-map-renderer");
+        assert_eq!(c.category, Category::Map);
+        assert!(matches!(
+            parse("toggle-map-renderer", '/'),
+            SlashOutcome::Action(crate::input::Action::ToggleMapRenderer)
+        ));
     }
 
     #[test]
