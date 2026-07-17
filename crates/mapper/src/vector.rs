@@ -717,35 +717,18 @@ mod tests {
         let p = realize_layer_vector(&g, MAIN_LAYER, 4.0);
         assert_eq!(p.rooms.len(), 5, "chamber stamping must not destroy member rooms");
         assert_eq!(p, realize_layer_vector(&g, MAIN_LAYER, 4.0), "deterministic");
-        // Chamber walls: Path-kind walls with NO corridor/bridge in their
-        // 8-neighbourhood (passage paint always hugs a corridor tile).
-        let mut chamber_walls = 0;
-        for y in 0..p.h as i32 {
-            for x in 0..p.w as i32 {
-                if !matches!(p.get(x as usize, y as usize), Tile::Wall { kind: WallKind::Path }) {
-                    continue;
-                }
-                let near_corridor = (-1..=1).any(|dy| {
-                    (-1..=1).any(|dx| {
-                        let (nx, ny) = (x + dx, y + dy);
-                        nx >= 0
-                            && ny >= 0
-                            && nx < p.w as i32
-                            && ny < p.h as i32
-                            && matches!(
-                                p.get(nx as usize, ny as usize),
-                                Tile::Corridor { .. }
-                                    | Tile::CorridorDiag { .. }
-                                    | Tile::Bridge { .. }
-                            )
-                    })
-                });
-                if !near_corridor {
-                    chamber_walls += 1;
-                }
-            }
-        }
+        // Chamber walls carry their own kind (trails are unwalled, so any
+        // remaining Path-kind wall would be a paint-pass leak).
+        let chamber_walls = p
+            .tiles
+            .iter()
+            .filter(|t| matches!(t, Tile::Wall { kind: WallKind::Chamber }))
+            .count();
         assert!(chamber_walls > 0, "maze chamber outline must be stamped");
+        assert!(
+            !p.tiles.iter().any(|t| matches!(t, Tile::Wall { kind: WallKind::Path })),
+            "vector plans no longer paint passage walls"
+        );
         // Member rooms keep their floors and structural walls.
         for r in &p.rooms {
             assert!(

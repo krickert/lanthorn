@@ -2,8 +2,8 @@
 //! pivot, task V3): scale `s` chars per model unit vertically and `2s`
 //! horizontally (terminal cell aspect), snap rooms to integer rects with
 //! shared-wall handling, punch doors where each path's door point meets its
-//! owning wall, and rasterize path polylines into orthogonal and 45°-diagonal
-//! corridor tiles. The output reuses the spike's [`TilePlan`] wholesale, so the
+//! owning wall, and sample path polylines into dotted single-tile trails. The
+//! output reuses the spike's [`TilePlan`] wholesale, so the
 //! app rasterizer, theming, background-job plumbing, and scroll mapping keep
 //! working unchanged.
 //!
@@ -18,12 +18,14 @@
 //!   minimum size and then nudging it one tile per pass, in deterministic
 //!   (id-sorted) pair order. Rooms are never dropped and nothing panics.
 //!
-//! Path rasterization classifies every polyline segment: orthogonal → Corridor
-//! tiles, exact 45° (in TILE space, i.e. after aspect scaling) →
-//! [`Tile::CorridorDiag`], any other slope → stair-step orthogonal
-//! decomposition. Corridor-vs-corridor perpendicular collisions and any
-//! diagonal collision become [`Tile::Bridge`]. The shared passage paint pass
-//! from `tiles` walls the result in.
+//! Paths rasterize as DOTTED TRAILS, one char wide: each polyline is sampled
+//! along its arc length (visual length — x counts half, undoing the aspect
+//! doubling) and a single [`Tile::Corridor`] dot is stamped per sample. Any
+//! slope works without staircase decomposition; distorted paths sample ~2×
+//! sparser so they read as faint dashed trails. Sampling always includes both
+//! endpoints (the punched door tiles), so a trail visually connects door to
+//! door. Two different trails' dots sharing a cell become [`Tile::Bridge`].
+//! No passage wall paint runs — trails are unwalled footpaths.
 
 use std::collections::BTreeMap;
 
@@ -31,8 +33,7 @@ use crate::direction::{grid_offset, is_diagonal, opposite, Direction};
 use crate::graph::RoomId;
 use crate::model::{MapModel, ModelFeature, ModelPath, ModelRoom, PathKind, Vec2};
 use crate::tiles::{
-    paint_path_walls, DiagSlope, DoorKind, FeatureKind, Rect, Tile, TileConn, TilePlan, TileRoom,
-    WallKind,
+    DoorKind, FeatureKind, Rect, Tile, TileConn, TilePlan, TileRoom, WallKind,
 };
 
 /// Void margin around the projected content.
@@ -45,11 +46,12 @@ const ABUT_EPS: f32 = 0.05;
 /// Overlap-resolution sweep cap; each pass moves offenders at least one tile.
 const RESOLVE_PASSES: usize = 32;
 
-/// Corridor travel axes for bridge detection (0 = none in the axis grid).
-const AXIS_H: u8 = 1;
-const AXIS_V: u8 = 2;
-const AXIS_DIAG_DOWN: u8 = 3;
-const AXIS_DIAG_UP: u8 = 4;
+/// Visual arc-length between trail dots. Lengths weigh x by 0.5 (undoing the
+/// projection's aspect doubling), so dots look evenly spaced on screen: about
+/// one dot per row vertically, one dot every other column horizontally.
+const TRAIL_SPACING: f32 = 1.2;
+/// Distorted paths sample this much sparser — a fainter, more tentative trail.
+const TRAIL_SPACING_DISTORTED_MUL: f32 = 2.0;
 
 /// A room's mutable tile-space box during placement (walls included).
 #[derive(Debug, Clone, Copy)]
@@ -61,18 +63,17 @@ struct RoomBox {
     y1: i32,
 }
 
-/// Working grid: tiles plus the corridor travel axis per tile.
+/// Working grid of tiles.
 struct Grid {
     w: i32,
     h: i32,
     tiles: Vec<Tile>,
-    axes: Vec<u8>,
 }
 
 impl Grid {
     fn new(w: i32, h: i32) -> Self {
         let n = (w.max(0) * h.max(0)) as usize;
-        Grid { w, h, tiles: vec![Tile::Void; n], axes: vec![0; n] }
+        Grid { w, h, tiles: vec![Tile::Void; n] }
     }
     fn idx(&self, x: i32, y: i32) -> Option<usize> {
         (x >= 0 && x < self.w && y >= 0 && y < self.h).then(|| (y * self.w + x) as usize)
@@ -308,108 +309,75 @@ fn punch(g: &mut Grid, cands: &[(i32, i32)], door: Tile) -> (i32, i32) {
     p
 }
 
-/// The travel axis of a unit step (diagonal steps map to their glyph slope).
-fn axis_for_step(dx: i32, dy: i32) -> u8 {
-    if dx != 0 && dy != 0 {
-        if dx.signum() == dy.signum() {
-            AXIS_DIAG_DOWN
-        } else {
-            AXIS_DIAG_UP
-        }
-    } else if dy == 0 {
-        AXIS_H
-    } else {
-        AXIS_V
-    }
-}
-
-/// Stamp one corridor tile. Only Void is claimed; a collision with a DIFFERENT
-/// connection becomes a [`Tile::Bridge`] when the axes are perpendicular or
-/// either side is diagonal (deterministic over/under: lower index over, as in
-/// `tiles`). Rooms, doors, and existing bridges are left alone.
-fn stamp(g: &mut Grid, x: i32, y: i32, conn: u16, axis: u8) {
+/// Stamp one trail dot. Only Void is claimed; a dot from a DIFFERENT
+/// connection landing on an existing dot becomes a [`Tile::Bridge`]
+/// (deterministic over/under: lower conn index over, as in `tiles`). Rooms,
+/// doors, and existing bridges are left alone.
+fn stamp_dot(g: &mut Grid, x: i32, y: i32, conn: u16) {
     let Some(i) = g.idx(x, y) else { return };
-    let diag = axis >= AXIS_DIAG_DOWN;
     match g.tiles[i] {
-        Tile::Void => {
-            g.tiles[i] = if diag {
-                let slope =
-                    if axis == AXIS_DIAG_DOWN { DiagSlope::Down } else { DiagSlope::Up };
-                Tile::CorridorDiag { conn, slope }
-            } else {
-                Tile::Corridor { conn }
-            };
-            g.axes[i] = axis;
-        }
-        Tile::Corridor { conn: o } if o != conn && (diag || g.axes[i] != axis) => {
-            g.tiles[i] = Tile::Bridge { over: o.min(conn), under: o.max(conn) };
-        }
-        Tile::CorridorDiag { conn: o, .. } if o != conn => {
+        Tile::Void => g.tiles[i] = Tile::Corridor { conn },
+        Tile::Corridor { conn: o } if o != conn => {
             g.tiles[i] = Tile::Bridge { over: o.min(conn), under: o.max(conn) };
         }
         _ => {}
     }
 }
 
-/// Rasterize one polyline segment from `p` (exclusive) to `q` (inclusive):
-/// orthogonal runs stamp Corridor, exact tile-space 45° runs stamp
-/// CorridorDiag, anything else stair-steps through a 4-connected Bresenham so
-/// the corridor stays orthogonally connected.
-fn raster_segment(g: &mut Grid, conn: u16, p: (i32, i32), q: (i32, i32)) {
-    let (dx, dy) = (q.0 - p.0, q.1 - p.1);
-    if dx == 0 && dy == 0 {
+/// Visual length of a tile-space step: x counts half to undo the projection's
+/// aspect doubling, so trail dots come out evenly spaced ON SCREEN.
+fn visual_len(dx: f32, dy: f32) -> f32 {
+    (0.25 * dx * dx + dy * dy).sqrt()
+}
+
+/// Stamp a dotted trail along the tile-space polyline `pts`: sample the arc
+/// every `spacing` (visual) units plus both endpoints, one dot per sample.
+/// The endpoints are the punched door tiles (no-op stamps there), so the
+/// nearest dots always sit within one sample step of each door mouth. Any
+/// slope works — no staircase decomposition, dots simply follow the line.
+fn stamp_trail(g: &mut Grid, conn: u16, pts: &[(i32, i32)], spacing: f32) {
+    if pts.len() < 2 {
         return;
     }
-    let (sx, sy) = (dx.signum(), dy.signum());
-    let (mut x, mut y) = p;
-    if dy == 0 {
-        while x != q.0 {
-            x += sx;
-            stamp(g, x, y, conn, AXIS_H);
+    let fpts: Vec<(f32, f32)> = pts.iter().map(|&(x, y)| (x as f32, y as f32)).collect();
+    let lens: Vec<f32> = fpts
+        .windows(2)
+        .map(|w| visual_len(w[1].0 - w[0].0, w[1].1 - w[0].1))
+        .collect();
+    let total: f32 = lens.iter().sum();
+    if total <= 0.0 {
+        return;
+    }
+    let n = (total / spacing).floor() as usize;
+    let mut targets: Vec<f32> = (0..=n).map(|k| k as f32 * spacing).collect();
+    if total - targets.last().copied().unwrap_or(0.0) > 1e-3 {
+        targets.push(total);
+    }
+    let (mut seg, mut seg_start) = (0usize, 0.0f32);
+    let mut last: Option<(i32, i32)> = None;
+    for t in targets {
+        while seg + 1 < lens.len() && t > seg_start + lens[seg] {
+            seg_start += lens[seg];
+            seg += 1;
         }
-    } else if dx == 0 {
-        while y != q.1 {
-            y += sy;
-            stamp(g, x, y, conn, AXIS_V);
-        }
-    } else if dx.abs() == dy.abs() {
-        let axis = axis_for_step(sx, sy);
-        while x != q.0 {
-            x += sx;
-            y += sy;
-            stamp(g, x, y, conn, axis);
-        }
-    } else {
-        // Stair-step decomposition: each step moves one axis, choosing the move
-        // that keeps the accumulated error closest to the ideal line.
-        let (adx, ady) = (i64::from(dx.abs()), i64::from(dy.abs()));
-        let mut err: i64 = 0;
-        while (x, y) != q {
-            let step_x = if x == q.0 {
-                false
-            } else if y == q.1 {
-                true
-            } else {
-                (err - ady).abs() <= (err + adx).abs()
-            };
-            if step_x {
-                x += sx;
-                err -= ady;
-                stamp(g, x, y, conn, AXIS_H);
-            } else {
-                y += sy;
-                err += adx;
-                stamp(g, x, y, conn, AXIS_V);
-            }
+        let f = if lens[seg] > 0.0 { ((t - seg_start) / lens[seg]).clamp(0.0, 1.0) } else { 0.0 };
+        let (a, b) = (fpts[seg], fpts[seg + 1]);
+        let p = (
+            (a.0 + (b.0 - a.0) * f).round() as i32,
+            (a.1 + (b.1 - a.1) * f).round() as i32,
+        );
+        if last != Some(p) {
+            stamp_dot(g, p.0, p.1, conn);
+            last = Some(p);
         }
     }
 }
 
-/// A stub endpoint: a `Stub` door plus one corridor tile fading outward.
+/// A stub endpoint: a `Stub` door plus one trail dot fading outward.
 fn realize_stub(g: &mut Grid, bx: &RoomBox, dir: Direction, at: (i32, i32), conn: u16) {
     let Some((cands, out)) = door_candidates(bx, dir, at) else { return };
     let p = punch(g, &cands, Tile::Door { conn, kind: DoorKind::Stub(dir) });
-    stamp(g, p.0 + out.0, p.1 + out.1, conn, axis_for_step(out.0, out.1));
+    stamp_dot(g, p.0 + out.0, p.1 + out.1, conn);
 }
 
 /// The boxes' shared-wall relation for a cardinal path, if their walls coincide:
@@ -482,9 +450,9 @@ fn stamp_feature(g: &mut Grid, bx: &RoomBox, kind: FeatureKind, at: (i32, i32)) 
 
 /// Realize one drawable (non-stub) path: a single door through a shared wall
 /// when the boxes abut on the path's cardinal, a single corner door when
-/// diagonal endpoints coincide, else door → rasterized polyline → door. Paths
-/// routed in model space carry their polyline in `points`; an empty polyline
-/// (the V1 model) falls back to a straight door-to-door segment.
+/// diagonal endpoints coincide, else door → dotted trail → door. Paths routed
+/// in model space carry their polyline in `points`; an empty polyline (the V1
+/// model) falls back to a straight door-to-door segment.
 fn realize_path(
     g: &mut Grid,
     path: &ModelPath,
@@ -537,20 +505,23 @@ fn realize_path(
     } else {
         vec![da, db]
     };
-    // Pin the polyline's ends to the punched door tiles so the corridor always
+    // Pin the polyline's ends to the punched door tiles so the trail always
     // connects door-to-door even after clamping/probing moved a door.
     let n = pts.len();
     pts[0] = da;
     pts[n - 1] = db;
-    for w in pts.windows(2) {
-        raster_segment(g, conn, w[0], w[1]);
-    }
+    let spacing = if path.distorted {
+        TRAIL_SPACING * TRAIL_SPACING_DISTORTED_MUL
+    } else {
+        TRAIL_SPACING
+    };
+    stamp_trail(g, conn, &pts, spacing);
 }
 
 /// Stamp one chamber polygon's edges (including the closing edge) as
-/// `Wall { kind: Path }` tiles, sampling each scaled segment at one step per
-/// tile of its longer axis. Only Void is claimed, so rooms, corridors, doors,
-/// and painted passage walls all survive. Deterministic.
+/// `Wall { kind: Chamber }` tiles, sampling each scaled segment at one step
+/// per tile of its longer axis. Only Void is claimed, so rooms, trail dots,
+/// and doors all survive. Deterministic.
 fn stamp_chamber(g: &mut Grid, poly: &[Vec2], s: f32, off: (i32, i32)) {
     if poly.len() < 2 {
         return;
@@ -571,7 +542,7 @@ fn stamp_chamber(g: &mut Grid, poly: &[Vec2], s: f32, off: (i32, i32)) {
             let x = (a.0 as f32 + (b.0 - a.0) as f32 * f).round() as i32;
             let y = (a.1 as f32 + (b.1 - a.1) as f32 * f).round() as i32;
             if matches!(g.get(x, y), Tile::Void) {
-                g.set(x, y, Tile::Wall { kind: WallKind::Path });
+                g.set(x, y, Tile::Wall { kind: WallKind::Chamber });
             }
         }
     }
@@ -591,10 +562,10 @@ pub fn project(model: &MapModel, graph_cells: &BTreeMap<RoomId, (i32, i32)>, sca
 }
 
 /// [`project`] plus maze chamber outlines: each polygon (global model coords,
-/// closed implicitly) is stamped after the passage paint pass as
-/// `Wall { kind: Path }` tiles along its scaled edges, claiming only Void —
-/// member rooms, corridors, and doors are never overwritten. The polygons also
-/// participate in the bounds fold so an outline always fits the plan.
+/// closed implicitly) is stamped as `Wall { kind: Chamber }` tiles along its
+/// scaled edges, claiming only Void — member rooms, trail dots, and doors are
+/// never overwritten. The polygons also participate in the bounds fold so an
+/// outline always fits the plan.
 pub fn project_with_chambers(
     model: &MapModel,
     graph_cells: &BTreeMap<RoomId, (i32, i32)>,
@@ -708,16 +679,15 @@ pub fn project_with_chambers(
         }
     }
 
-    // ── features, then the shared passage paint pass ──
+    // ── features (trails stay unwalled — no passage paint pass) ──
     for ModelFeature { room, kind, at } in &model.features {
         if let Some(&i) = by_id.get(room) {
             let (x, y) = proj(*at, s);
             stamp_feature(&mut g, &boxes[i], *kind, (x + off.0, y + off.1));
         }
     }
-    paint_path_walls(g.w, g.h, &mut g.tiles);
 
-    // ── maze chamber outlines: Path-kind walls along each scaled polygon ──
+    // ── maze chamber outlines: Chamber-kind walls along each scaled polygon ──
     for poly in chambers {
         stamp_chamber(&mut g, poly, s, off);
     }
@@ -816,39 +786,21 @@ mod tests {
         }
     }
 
-    /// True when `from` reaches `to` walking 4-adjacent passage tiles.
-    fn doors_connected(p: &TilePlan, from: (usize, usize), to: (usize, usize)) -> bool {
-        let passable = |x: usize, y: usize| {
-            matches!(
-                p.get(x, y),
-                Tile::Corridor { .. }
-                    | Tile::CorridorDiag { .. }
-                    | Tile::Door { .. }
-                    | Tile::Bridge { .. }
-            )
-        };
-        let mut seen = vec![false; p.w * p.h];
-        let mut stack = vec![from];
-        seen[from.1 * p.w + from.0] = true;
-        while let Some((x, y)) = stack.pop() {
-            if (x, y) == to {
-                return true;
-            }
-            let mut probe: Vec<(usize, usize)> = vec![(x + 1, y), (x, y + 1)];
-            if x > 0 {
-                probe.push((x - 1, y));
-            }
-            if y > 0 {
-                probe.push((x, y - 1));
-            }
-            for (nx, ny) in probe {
-                if nx < p.w && ny < p.h && !seen[ny * p.w + nx] && passable(nx, ny) {
-                    seen[ny * p.w + nx] = true;
-                    stack.push((nx, ny));
+    /// All trail-dot cells of `conn`, row-major order.
+    fn dots_of(p: &TilePlan, conn: u16) -> Vec<(i32, i32)> {
+        let mut v = Vec::new();
+        for y in 0..p.h {
+            for x in 0..p.w {
+                if p.get(x, y) == (Tile::Corridor { conn }) {
+                    v.push((x as i32, y as i32));
                 }
             }
         }
-        false
+        v
+    }
+
+    fn cheb(a: (i32, i32), b: (i32, i32)) -> i32 {
+        (a.0 - b.0).abs().max((a.1 - b.1).abs())
     }
 
     fn cells(pairs: &[(RoomId, (i32, i32))]) -> BTreeMap<RoomId, (i32, i32)> {
@@ -917,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_points_fall_back_to_a_connected_straight_corridor() {
+    fn empty_points_fall_back_to_a_dotted_straight_trail() {
         let m = MapModel {
             rooms: vec![room(1, 0.0, 0.0, 0.5, 0.5), room(2, 3.0, 0.0, 0.5, 0.5)],
             paths: vec![path(
@@ -936,23 +888,32 @@ mod tests {
         let p = project(&m, &BTreeMap::new(), 1.5);
         let doors = door_tiles(&p);
         assert_eq!(doors.len(), 2, "a door on each room's wall: {doors:?}");
+        let dots = dots_of(&p, 0);
+        assert!(!dots.is_empty(), "distant rooms → trail dots");
+        let da = (doors[0].0 as i32, doors[0].1 as i32);
+        let db = (doors[1].0 as i32, doors[1].1 as i32);
+        // Straight fallback: every dot sits on the door-to-door line.
+        assert!(dots.iter().all(|d| d.1 == da.1), "dots stray off the straight line: {dots:?}");
+        // One visual sample step is 2·TRAIL_SPACING columns horizontally (the
+        // aspect halving), so 3 tiles bounds every gap and both door mouths.
+        assert!(dots.iter().any(|&d| cheb(d, da) <= 3), "no dot at door {da:?}: {dots:?}");
+        assert!(dots.iter().any(|&d| cheb(d, db) <= 3), "no dot at door {db:?}: {dots:?}");
+        for w in dots.windows(2) {
+            assert!(w[1].0 - w[0].0 <= 3, "trail gap exceeds a sample step: {dots:?}");
+        }
+        // Trails are unwalled: the passage paint pass does not run in vector mode.
         assert!(
-            p.tiles.iter().any(|t| matches!(t, Tile::Corridor { conn: 0 })),
-            "distant rooms → corridor tiles"
-        );
-        let (a, b) = ((doors[0].0, doors[0].1), (doors[1].0, doors[1].1));
-        assert!(doors_connected(&p, a, b), "doors {a:?} and {b:?} are not connected");
-        // The reinstated paint pass walls the corridor in.
-        assert!(
-            p.tiles.iter().any(|t| matches!(t, Tile::Wall { kind: WallKind::Path })),
-            "passage paint pass ran"
+            p.tiles.iter().all(|t| !matches!(t, Tile::Wall { kind: WallKind::Path })),
+            "no path walls around trails"
         );
     }
 
     #[test]
-    fn tile_space_45_degree_path_rasterizes_as_diag_tiles() {
+    fn diagonal_path_rasterizes_as_a_dotted_trail() {
         // Geometry chosen so the two corner door tiles differ by exactly (4, 4)
         // in TILE space (model dy = 2·dx compensates the 2× x aspect scale).
+        // Dots handle the slope directly — no staircase decomposition and no
+        // CorridorDiag tiles.
         let m = MapModel {
             rooms: vec![room(1, 0.0, 0.0, 0.5, 0.5), room(2, 4.0, 5.5, 1.0, 0.5)],
             paths: vec![path(
@@ -969,45 +930,33 @@ mod tests {
             ..MapModel::default()
         };
         let p = project(&m, &BTreeMap::new(), 1.0);
-        assert_eq!(door_tiles(&p).len(), 2, "corner doors on both rooms");
-        let diags: Vec<(u16, DiagSlope)> = p
-            .tiles
-            .iter()
-            .filter_map(|t| match t {
-                Tile::CorridorDiag { conn, slope } => Some((*conn, *slope)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(diags.len(), 3, "a 45° run of 3 interior tiles: {diags:?}");
+        let doors = door_tiles(&p);
+        assert_eq!(doors.len(), 2, "corner doors on both rooms");
+        let da = (doors[0].0 as i32, doors[0].1 as i32);
+        let dots = dots_of(&p, 0);
+        assert!(!dots.is_empty(), "diagonal trail dots exist");
         assert!(
-            diags.iter().all(|&(c, sl)| c == 0 && sl == DiagSlope::Down),
-            "SE travel slopes down (╲): {diags:?}"
+            dots.iter().all(|d| d.0 - da.0 == d.1 - da.1),
+            "dots follow the 45° line from {da:?}: {dots:?}"
+        );
+        assert!(
+            p.tiles.iter().all(|t| !matches!(t, Tile::CorridorDiag { .. })),
+            "trails never emit CorridorDiag tiles"
         );
     }
 
     #[test]
-    fn crossing_corridors_become_a_bridge() {
-        let m = MapModel {
-            rooms: vec![
-                room(1, 0.0, 2.0, 0.5, 0.5),
-                room(2, 6.0, 2.0, 0.5, 0.5),
-                room(3, 3.0, 0.0, 0.5, 0.5),
-                room(4, 3.0, 4.0, 0.5, 0.5),
-            ],
-            paths: vec![
-                path(1, 2, Direction::E, PathKind::Corridor, true, (0.5, 2.0), (5.5, 2.0), Vec::new()),
-                path(3, 4, Direction::S, PathKind::Corridor, true, (3.0, 0.5), (3.0, 3.5), Vec::new()),
-            ],
-            features: Vec::new(),
-            ..MapModel::default()
-        };
-        let p = project(&m, &BTreeMap::new(), 1.0);
-        let bridges: Vec<Tile> =
-            p.tiles.iter().copied().filter(|t| matches!(t, Tile::Bridge { .. })).collect();
+    fn crossing_trails_bridge_where_dots_share_a_cell() {
+        // Sample positions chosen so both trails dot the cell (5, 4): the
+        // horizontal trail's x = round(2·1.2·k) hits 5 at k = 2, the vertical
+        // trail's y = round(1.2·k) hits 4 at k = 3.
+        let mut g = Grid::new(9, 9);
+        stamp_trail(&mut g, 0, &[(0, 4), (8, 4)], TRAIL_SPACING);
+        stamp_trail(&mut g, 1, &[(5, 0), (5, 8)], TRAIL_SPACING);
         assert_eq!(
-            bridges,
-            vec![Tile::Bridge { over: 0, under: 1 }],
-            "perpendicular crossing → one deterministic bridge"
+            g.get(5, 4),
+            Tile::Bridge { over: 0, under: 1 },
+            "coinciding dots → one deterministic bridge"
         );
     }
 

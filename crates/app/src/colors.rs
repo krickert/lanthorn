@@ -386,6 +386,10 @@ pub struct ColorScheme {
     pub tile_bridge: Style,
     /// Tile map: stairs / portal feature tiles.
     pub tile_stairs: Style,
+    /// Tile map: maze chamber outline texture tiles.
+    pub tile_chamber: Style,
+    /// Tile map: room drop-shadow fringe (Void cells below/right of a box).
+    pub tile_shadow: Style,
     /// Tile map: the `@` player marker on the current room's floor.
     pub tile_player: Style,
     /// Tile map: the `#id` room-number label.
@@ -541,6 +545,8 @@ impl ColorScheme {
             tile_door: Style::new().fg(Color::Yellow),
             tile_bridge: Style::new().fg(Color::Cyan),
             tile_stairs: Style::new().fg(Color::Cyan),
+            tile_chamber: Style::new().fg(Color::DarkGray),
+            tile_shadow: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             tile_player: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             tile_room_number: Style::new().fg(Color::DarkGray),
             transcript_input: Style::new().fg(Color::Cyan),
@@ -754,6 +760,8 @@ impl ColorScheme {
             tile_door: Style::new().fg(scheme.palette[3]),
             tile_bridge: Style::new().fg(scheme.palette[6]),
             tile_stairs: Style::new().fg(scheme.palette[6]),
+            tile_chamber: Style::new().fg(scheme.palette[8]),
+            tile_shadow: Style::new().fg(scheme.palette[8]).add_modifier(Modifier::DIM),
             tile_player: Style::new().fg(scheme.palette[3]).add_modifier(Modifier::BOLD),
             tile_room_number: Style::new().fg(scheme.palette[8]),
             transcript_input: Style::new().fg(scheme.palette[6]),

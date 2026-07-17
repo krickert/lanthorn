@@ -53,6 +53,9 @@ pub enum WallKind {
     Room,
     /// A painted corridor side — the walls that make a passage.
     Path,
+    /// A maze chamber's outline (vector pipeline): rendered as rough texture,
+    /// not line art, so the pocket reads as a cave mouth.
+    Chamber,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

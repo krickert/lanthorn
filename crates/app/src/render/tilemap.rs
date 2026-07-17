@@ -13,6 +13,21 @@ use crate::render::{put_char, put_str};
 use crate::state::AppState;
 use crate::symbols::{TileGlyphs, WallGlyphs};
 
+/// Room-floor dot density, percent: floors draw their dot on roughly this
+/// share of tiles (deterministic per-tile hash) and stay airy elsewhere.
+const FLOOR_DOT_PCT: u64 = 30;
+
+/// Deterministic FNV-1a coin flip for the sparse floor: does the floor tile at
+/// (x, y) draw its dot? Position-stable, so panning never reshuffles the grain.
+fn floor_dot(x: usize, y: usize) -> bool {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in (x as u32).to_le_bytes().into_iter().chain((y as u32).to_le_bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h % 100 < FLOOR_DOT_PCT
+}
+
 /// Map a cell-unit scroll coordinate to the tile x/y of that cell's track edge
 /// via the plan's sorted `(cell, tile)` track table. Beyond the first/last
 /// track it extrapolates by [`MIN_TRACK`] per cell, so panning off the map's
@@ -193,7 +208,9 @@ fn feature_glyph(kind: FeatureKind, g: &TileGlyphs) -> char {
 
 /// Draw `plan` into `buf` for `area` (1 tile = 1 cell, clipped and panned via
 /// [`tile_origin`]). Void tiles leave the buffer untouched so the background
-/// shows through. The current room (from `graph.current()`) gets the player
+/// shows through — except the room drop-shadow fringe, which claims the Void
+/// cells hugging each box's bottom/right. The current room (from
+/// `graph.current()`) gets the player
 /// marker at its floor centre; `state.show_room_numbers` adds a `#id` label
 /// centred on each floor (shifted one row up on the current room).
 pub fn render_tile_map(
@@ -218,45 +235,33 @@ pub fn render_tile_map(
                     (wall_glyph(m, &g.walls), cs.tile_wall)
                 }
                 Tile::Wall { kind: WallKind::Path } => {
-                    // Passage sides: single-line art through the classic path
-                    // table, junctioning with other path walls and running into
-                    // room walls and door openings — but only where a neighbor
-                    // bounds the SAME passage (see path_walls_linked).
-                    let mut m = neighbor_mask(plan, tx, ty, |nx, ny| {
+                    // Passage sides (legacy tile-space realize_layer plans —
+                    // the vector pipeline's trails are unwalled): single-line
+                    // art through the classic path table, junctioning with
+                    // other path walls and running into room walls and door
+                    // openings — but only where a neighbor bounds the SAME
+                    // passage (see path_walls_linked).
+                    let m = neighbor_mask(plan, tx, ty, |nx, ny| {
                         in_path_run(plan, nx, ny) && path_walls_linked(plan, (tx, ty), (nx, ny))
                     });
-                    if m == 0 {
-                        // No passage neighbor at all: a maze chamber outline
-                        // (vector pipeline). Join it with its fellow path
-                        // walls so the boundary draws as continuous line art.
-                        m = neighbor_mask(plan, tx, ty, |nx, ny| {
-                            matches!(plan.get(nx, ny), Tile::Wall { kind: WallKind::Path })
-                        });
-                    }
                     let ch = glyph_for(m, &state.symbols.path).unwrap_or(state.symbols.path.ew);
                     (ch, cs.tile_corridor)
                 }
-                Tile::Floor { .. } => (g.floor, cs.tile_floor),
+                Tile::Wall { kind: WallKind::Chamber } => {
+                    // Maze chamber outline: rough texture, cave-mouth feel.
+                    (g.chamber, cs.tile_chamber)
+                }
+                Tile::Floor { .. } => {
+                    // Sparse floors: a deterministic ~30% of tiles carry the
+                    // dot, the rest stay air — grids stop reading as grids.
+                    (if floor_dot(tx, ty) { g.floor } else { ' ' }, cs.tile_floor)
+                }
                 Tile::Corridor { conn } => {
-                    // Passage floor. A distorted conn's trail renders dashed
-                    // (straight stretches only — bends keep the floor dot).
+                    // A trail dot; a distorted conn's sparser dots render
+                    // fainter so the trail reads as tentative.
                     let distorted =
                         plan.conns.get(conn as usize).is_some_and(|tc| tc.distorted);
-                    let ch = if distorted {
-                        let m = neighbor_mask(plan, tx, ty, |nx, ny| match plan.get(nx, ny) {
-                            Tile::Corridor { conn: o } => o == conn,
-                            Tile::Door { .. } | Tile::Bridge { .. } => true,
-                            _ => false,
-                        });
-                        match m {
-                            m if m & (DIR_E | DIR_W) != 0 && m & (DIR_N | DIR_S) == 0 => g.dash_h,
-                            m if m & (DIR_N | DIR_S) != 0 && m & (DIR_E | DIR_W) == 0 => g.dash_v,
-                            _ => g.floor,
-                        }
-                    } else {
-                        g.floor
-                    };
-                    (ch, cs.tile_corridor)
+                    (if distorted { g.trail_distorted } else { g.trail }, cs.tile_corridor)
                 }
                 Tile::CorridorDiag { slope, .. } => {
                     let ch = match slope {
@@ -269,9 +274,7 @@ pub fn render_tile_map(
                     (door_glyph(plan, tx, ty, kind, g, &state.symbols.path), cs.tile_door)
                 }
                 Tile::Bridge { over, .. } => {
-                    // The over-conn's axis picks the glyph: its corridor
-                    // continues on a vertical neighbor → it runs vertical.
-                    let over_vertical = [(0i32, -1i32), (0, 1)].into_iter().any(|(dx, dy)| {
+                    let corridor_at = |dx: i32, dy: i32, want: Option<u16>| {
                         let (nx, ny) = (tx as i32 + dx, ty as i32 + dy);
                         nx >= 0
                             && ny >= 0
@@ -279,16 +282,68 @@ pub fn render_tile_map(
                             && (ny as usize) < plan.h
                             && matches!(
                                 plan.get(nx as usize, ny as usize),
-                                Tile::Corridor { conn: o } if o == over
+                                Tile::Corridor { conn: o } if want.is_none_or(|w| o == w)
                             )
-                    });
-                    (if over_vertical { g.bridge_v } else { g.bridge }, cs.tile_bridge)
+                    };
+                    // An isolated dot collision (no adjacent corridor tiles at
+                    // all) is two trails crossing → ╳. A legacy contiguous
+                    // corridor crossing keeps its oriented glyph: the
+                    // over-conn continuing on a vertical neighbor runs vertical.
+                    let contiguous = [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)]
+                        .into_iter()
+                        .any(|(dx, dy)| corridor_at(dx, dy, None));
+                    if contiguous {
+                        let over_vertical = [(0i32, -1i32), (0, 1)]
+                            .into_iter()
+                            .any(|(dx, dy)| corridor_at(dx, dy, Some(over)));
+                        (if over_vertical { g.bridge_v } else { g.bridge }, cs.tile_bridge)
+                    } else {
+                        (g.trail_bridge, cs.tile_bridge)
+                    }
                 }
-                Tile::Feature { kind, .. } => (feature_glyph(kind, g), cs.tile_stairs),
+                Tile::Feature { kind, .. } => {
+                    // Stairs pair with the step motif (`☰^` / `☰v`) when the
+                    // tile to the left is plain floor; cramped floors keep the
+                    // bare arrow. The companion overwrites the already-drawn
+                    // floor cell (row order guarantees it was drawn first).
+                    if matches!(kind, FeatureKind::StairsUp | FeatureKind::StairsDown)
+                        && tx > 0
+                        && matches!(plan.get(tx - 1, ty), Tile::Floor { .. })
+                    {
+                        let sx = i32::from(area.x) + (tx - 1) as i32 - ox;
+                        let sy = i32::from(area.y) + ty as i32 - oy;
+                        put_char(buf, sx, sy, g.stair_steps, cs.tile_stairs, area);
+                    }
+                    (feature_glyph(kind, g), cs.tile_stairs)
+                }
             };
             let sx = i32::from(area.x) + tx as i32 - ox;
             let sy = i32::from(area.y) + ty as i32 - oy;
             put_char(buf, sx, sy, ch, style, area);
+        }
+    }
+
+    // Room drop shadows: a dim fringe into Void cells one tile below and one
+    // tile right of each room box (plus the below-right corner). Only Void
+    // receives shadow — trails, walls, floors, and chamber texture all win.
+    let mut shade = |x: i32, y: i32| {
+        if x < 0 || y < 0 || x as usize >= plan.w || y as usize >= plan.h {
+            return;
+        }
+        if !matches!(plan.get(x as usize, y as usize), Tile::Void) {
+            return;
+        }
+        let (sx, sy) = (i32::from(area.x) + x - ox, i32::from(area.y) + y - oy);
+        put_char(buf, sx, sy, g.shadow, cs.tile_shadow, area);
+    };
+    for room in &plan.rooms {
+        let b = room.bounds;
+        let (right, below) = (b.right() as i32 + 1, b.bottom() as i32 + 1);
+        for x in b.x as i32 + 1..=right {
+            shade(x, below);
+        }
+        for y in b.y as i32 + 1..=below {
+            shade(right, y);
         }
     }
 
@@ -394,20 +449,23 @@ mod tests {
 
         // Verified by eye: double-line room outlines with ╣ junctions where room
         // 2's taller box meets the shared wall; a │ door in the shared wall and
-        // in each passage-end wall; the short 2→3 passage stays direct — dim ···
-        // floor walled by single-line ─── path walls; '@' sits on room 1's floor
-        // centre; Void stays blank (rows are padded to the 40-cell area).
+        // in each passage-end wall; the short 2→3 passage stays direct — a ∘∘∘
+        // trail walled by single-line ─── path walls (legacy plans keep their
+        // painted passage sides); floors are sparse (deterministic ~30% dots);
+        // a dim ▒ drop-shadow fringe hugs each box's bottom/right Void; '@'
+        // sits on room 1's floor centre; other Void stays blank (rows are
+        // padded to the 40-cell area).
         let expected = concat!(
             "                                        \n",
             "                                        \n",
             "        ╔═══════╗   ╔═════╗             \n",
-            "  ╔═════╣·······║   ║·····║             \n",
-            "  ║·····║·······║───║·····║             \n",
-            "  ║··@··│·······│···│·····║             \n",
-            "  ║·····║·······║───║·····║             \n",
-            "  ╚═════╣·······║   ║·····║             \n",
-            "        ╚═══════╝   ╚═════╝             \n",
-            "                                        \n",
+            "  ╔═════╣     ··║▒  ║·    ║▒            \n",
+            "  ║ ··  ║···    ║───║·  ··║▒            \n",
+            "  ║ ·@· │··     │∘∘∘│·  · ║▒            \n",
+            "  ║   ··║····   ║───║ ··  ║▒            \n",
+            "  ╚═════╣  ·    ║▒  ║ ··  ║▒            \n",
+            "   ▒▒▒▒▒╚═══════╝▒  ╚═════╝▒            \n",
+            "         ▒▒▒▒▒▒▒▒▒   ▒▒▒▒▒▒▒            \n",
             "                                        \n",
             "                                        \n",
             "                                        \n",
@@ -426,14 +484,31 @@ mod tests {
         let f = r1.floor;
         let (cx, cy) = ((f.x + f.w / 2) as u16, (f.y + f.h / 2) as u16);
         assert_eq!(buf.cell((cx, cy)).unwrap().symbol(), "@");
-        // The 2→3 passage: dim · floor walled with single-line ─ path walls.
+        // The 2→3 passage: ∘ trail glyph walled with single-line ─ path walls.
         let (tx, ty) = (0..plan.h)
             .flat_map(|y| (0..plan.w).map(move |x| (x, y)))
             .find(|&(x, y)| matches!(plan.get(x, y), Tile::Corridor { .. }))
             .expect("corridor tiles exist between rooms 2 and 3");
-        assert_eq!(buf.cell((tx as u16, ty as u16)).unwrap().symbol(), "·");
+        assert_eq!(buf.cell((tx as u16, ty as u16)).unwrap().symbol(), "∘");
         assert_eq!(buf.cell((tx as u16, ty as u16 - 1)).unwrap().symbol(), "─");
         assert_eq!(buf.cell((tx as u16, ty as u16 + 1)).unwrap().symbol(), "─");
+        // Sparse floors are per-tile deterministic: every drawn floor cell
+        // matches the FNV coin, dot or air.
+        for r in &plan.rooms {
+            for y in r.floor.y..=r.floor.bottom() {
+                for x in r.floor.x..=r.floor.right() {
+                    if !matches!(plan.get(x, y), Tile::Floor { .. }) {
+                        continue;
+                    }
+                    let got = buf.cell((x as u16, y as u16)).unwrap().symbol().to_string();
+                    if got == "@" {
+                        continue; // player overlay
+                    }
+                    let want = if floor_dot(x, y) { "·" } else { " " };
+                    assert_eq!(got, want, "floor grain at ({x},{y}) not deterministic");
+                }
+            }
+        }
     }
 
     #[test]
@@ -527,6 +602,59 @@ mod tests {
         assert_eq!(buf.cell((3, 1)).unwrap().symbol(), "╲");
         // Diagonals use the corridor style slot.
         assert_eq!(buf.cell((1, 1)).unwrap().style(), buf.cell((2, 1)).unwrap().style());
+    }
+
+    #[test]
+    fn trails_chamber_and_stair_motif_render_softened() {
+        use mapper::tiles::TileConn;
+        // Synthetic plan: a plain and a distorted trail dot, an isolated
+        // dot-collision bridge, a chamber-outline wall, and stairs beside a
+        // free floor tile (room 1's floor spans (1,1)-(2,1), stairs at (2,1)).
+        let mut tiles = vec![Tile::Void; 7 * 5];
+        tiles[7 + 1] = Tile::Floor { room: 1 }; // (1,1)
+        tiles[7 + 2] = Tile::Feature { room: 1, kind: FeatureKind::StairsUp }; // (2,1)
+        tiles[7 + 4] = Tile::Wall { kind: WallKind::Chamber }; // (4,1)
+        tiles[3 * 7] = Tile::Bridge { over: 0, under: 1 }; // (0,3), isolated
+        tiles[3 * 7 + 3] = Tile::Corridor { conn: 0 }; // (3,3)
+        tiles[3 * 7 + 5] = Tile::Corridor { conn: 1 }; // (5,3)
+        let conn = |distorted| TileConn {
+            origin: 1,
+            dest: 2,
+            dir: Direction::E,
+            reciprocal: true,
+            distorted,
+        };
+        let plan = TilePlan {
+            w: 7,
+            h: 5,
+            tiles,
+            rooms: Vec::new(),
+            conns: vec![conn(false), conn(true)],
+            col_x: Vec::new(),
+            row_y: Vec::new(),
+        };
+        let g = MapGraph::new();
+        let mut state = AppState::default();
+        state.colors.tile_chamber = ratatui::style::Style::new().fg(ratatui::style::Color::Magenta);
+        let area = Rect::new(0, 0, 7, 5);
+        let mut buf = Buffer::empty(area);
+        render_tile_map(&plan, &g, &state, area, &mut buf);
+        let at = |x: u16, y: u16| buf.cell((x, y)).unwrap().symbol().to_string();
+        // Trails: plain ∘, distorted ·.
+        assert_eq!(at(3, 3), "∘");
+        assert_eq!(at(5, 3), "·");
+        // An isolated dot collision renders the trail crossing ╳.
+        assert_eq!(at(0, 3), "╳");
+        // Chamber outline: rough texture through its own selector.
+        assert_eq!(at(4, 1), "░");
+        assert_eq!(
+            buf.cell((4, 1)).unwrap().style().fg,
+            Some(ratatui::style::Color::Magenta),
+            "chamber texture styles via map.tile.chamber"
+        );
+        // Stairs pair with the step motif on the free floor tile: ☰^.
+        assert_eq!(at(1, 1), "☰");
+        assert_eq!(at(2, 1), "^");
     }
 
     #[test]

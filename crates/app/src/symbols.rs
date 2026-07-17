@@ -124,10 +124,16 @@ pub struct TileGlyphs {
     pub door_w: char,
     /// Dead-end stub door (route-failure edge).
     pub door_stub: char,
-    /// Dashed passage-floor trail for a distorted connection, horizontal run.
-    pub dash_h: char,
-    /// Dashed passage-floor trail for a distorted connection, vertical run.
-    pub dash_v: char,
+    /// Dotted-trail path dot (vector pipeline; distinct from the floor dot).
+    pub trail: char,
+    /// Trail dot for a distorted connection (sparser, fainter footpath).
+    pub trail_distorted: char,
+    /// Two trails crossing in one cell.
+    pub trail_bridge: char,
+    /// Maze chamber outline texture (cave-mouth feel, not line art).
+    pub chamber: char,
+    /// Room drop-shadow fringe painted into Void below/right of a room box.
+    pub shadow: char,
     /// 45° diagonal corridor, ascending left-to-right (`Tile::CorridorDiag` Up).
     pub diag_up: char,
     /// 45° diagonal corridor, descending left-to-right (`Tile::CorridorDiag` Down).
@@ -138,6 +144,9 @@ pub struct TileGlyphs {
     pub bridge_v: char,
     pub stairs_up: char,
     pub stairs_down: char,
+    /// Companion step glyph drawn on the floor tile beside a stairs arrow when
+    /// there is room (`☰^` / `☰v`); cramped floors fall back to the bare arrow.
+    pub stair_steps: char,
     pub portal_in: char,
     pub portal_out: char,
     /// The current-room marker on the floor centre.
@@ -245,14 +254,18 @@ impl Default for SymbolSet {
                 door_s: '▾',
                 door_w: '◂',
                 door_stub: '?',
-                dash_h: '╌',
-                dash_v: '╎',
+                trail: '∘',
+                trail_distorted: '·',
+                trail_bridge: '╳',
+                chamber: '░',
+                shadow: '▒',
                 diag_up: '╱',
                 diag_down: '╲',
                 bridge: '╪',
                 bridge_v: '╫',
-                stairs_up: '<',
-                stairs_down: '>',
+                stairs_up: '^',
+                stairs_down: 'v',
+                stair_steps: '☰',
                 portal_in: '⊙',
                 portal_out: '⊗',
                 player: '@',
@@ -656,14 +669,18 @@ fn apply_override(s: &mut SymbolSet, key: &str, ch: char) {
         "tile.door_s"      => s.tiles.door_s = ch,
         "tile.door_w"      => s.tiles.door_w = ch,
         "tile.door_stub"   => s.tiles.door_stub = ch,
-        "tile.dash_h"      => s.tiles.dash_h = ch,
-        "tile.dash_v"      => s.tiles.dash_v = ch,
+        "tile.trail"       => s.tiles.trail = ch,
+        "tile.trail_distorted" => s.tiles.trail_distorted = ch,
+        "tile.trail_bridge" => s.tiles.trail_bridge = ch,
+        "tile.chamber"     => s.tiles.chamber = ch,
+        "tile.shadow"      => s.tiles.shadow = ch,
         "tile.diag_up"     => s.tiles.diag_up = ch,
         "tile.diag_down"   => s.tiles.diag_down = ch,
         "tile.bridge"      => s.tiles.bridge = ch,
         "tile.bridge_v"    => s.tiles.bridge_v = ch,
         "tile.stairs_up"   => s.tiles.stairs_up = ch,
         "tile.stairs_down" => s.tiles.stairs_down = ch,
+        "tile.stair_steps" => s.tiles.stair_steps = ch,
         "tile.portal_in"   => s.tiles.portal_in = ch,
         "tile.portal_out"  => s.tiles.portal_out = ch,
         "tile.player"      => s.tiles.player = ch,
@@ -691,6 +708,31 @@ mod tests {
         let r = SymbolSet::resolve(&cfg);
         assert_eq!(r.meta_gutter, '|');
         assert_eq!(r.warning_gutter, '*');
+    }
+
+    #[test]
+    fn tile_trail_chamber_and_stair_defaults_and_overrides() {
+        let s = SymbolSet::default();
+        assert_eq!(
+            (s.tiles.trail, s.tiles.trail_distorted, s.tiles.trail_bridge),
+            ('∘', '·', '╳')
+        );
+        assert_eq!((s.tiles.chamber, s.tiles.shadow), ('░', '▒'));
+        assert_eq!(
+            (s.tiles.stairs_up, s.tiles.stairs_down, s.tiles.stair_steps),
+            ('^', 'v', '☰')
+        );
+        let mut cfg = crate::config::SymbolConfig::default();
+        cfg.overrides.insert("tile.trail".into(), "*".into());
+        cfg.overrides.insert("tile.trail_distorted".into(), ",".into());
+        cfg.overrides.insert("tile.trail_bridge".into(), "X".into());
+        cfg.overrides.insert("tile.chamber".into(), "#".into());
+        cfg.overrides.insert("tile.shadow".into(), "%".into());
+        cfg.overrides.insert("tile.stair_steps".into(), "=".into());
+        let r = SymbolSet::resolve(&cfg);
+        assert_eq!((r.tiles.trail, r.tiles.trail_distorted, r.tiles.trail_bridge), ('*', ',', 'X'));
+        assert_eq!((r.tiles.chamber, r.tiles.shadow), ('#', '%'));
+        assert_eq!(r.tiles.stair_steps, '=');
     }
 
     #[test]

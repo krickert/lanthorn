@@ -236,6 +236,8 @@ pub const SELECTOR_FIELDS: &[&str] = &[
     "map.tile.door",
     "map.tile.bridge",
     "map.tile.stairs",
+    "map.tile.chamber",
+    "map.tile.shadow",
     "map.tile.player",
     "map.tile.room-number",
 ];
@@ -255,7 +257,8 @@ pub const SELECTOR_GROUPS: &[(&str, &[&str])] = &[
         "map_border", "map_layer_tab", "map_layer_tab_active", "loc_indicator",
         "tidy_progress",
         "map.tile.wall", "map.tile.floor", "map.tile.corridor", "map.tile.door",
-        "map.tile.bridge", "map.tile.stairs", "map.tile.player", "map.tile.room-number",
+        "map.tile.bridge", "map.tile.stairs", "map.tile.chamber", "map.tile.shadow",
+        "map.tile.player", "map.tile.room-number",
     ]),
     ("Transcript", &[
         "transcript", "transcript:input", "transcript:meta", "transcript:warning",
@@ -340,6 +343,8 @@ pub fn style_for_selector(cs: &colors::ColorScheme, selector: &str) -> Style {
         "map.tile.door"        => cs.tile_door,
         "map.tile.bridge"      => cs.tile_bridge,
         "map.tile.stairs"      => cs.tile_stairs,
+        "map.tile.chamber"     => cs.tile_chamber,
+        "map.tile.shadow"      => cs.tile_shadow,
         "map.tile.player"      => cs.tile_player,
         "map.tile.room-number" => cs.tile_room_number,
         "story_info"        => cs.story_info,
@@ -582,6 +587,8 @@ pub fn apply_color_decls(
             "map.tile.door"        => cs.tile_door = cs.tile_door.patch(style),
             "map.tile.bridge"      => cs.tile_bridge = cs.tile_bridge.patch(style),
             "map.tile.stairs"      => cs.tile_stairs = cs.tile_stairs.patch(style),
+            "map.tile.chamber"     => cs.tile_chamber = cs.tile_chamber.patch(style),
+            "map.tile.shadow"      => cs.tile_shadow = cs.tile_shadow.patch(style),
             "map.tile.player"      => cs.tile_player = cs.tile_player.patch(style),
             "map.tile.room-number" => cs.tile_room_number = cs.tile_room_number.patch(style),
             _                    => warnings.push(format!("unknown selector: {}", selector)),
@@ -1498,6 +1505,8 @@ pub fn write_style_full(
     doc.colors.selectors.insert("map.tile.door".to_string(),        style_to_decl(&cs.tile_door));
     doc.colors.selectors.insert("map.tile.bridge".to_string(),      style_to_decl(&cs.tile_bridge));
     doc.colors.selectors.insert("map.tile.stairs".to_string(),      style_to_decl(&cs.tile_stairs));
+    doc.colors.selectors.insert("map.tile.chamber".to_string(),     style_to_decl(&cs.tile_chamber));
+    doc.colors.selectors.insert("map.tile.shadow".to_string(),      style_to_decl(&cs.tile_shadow));
     doc.colors.selectors.insert("map.tile.player".to_string(),      style_to_decl(&cs.tile_player));
     doc.colors.selectors.insert("map.tile.room-number".to_string(), style_to_decl(&cs.tile_room_number));
 
@@ -1592,12 +1601,16 @@ pub fn write_style_full(
     ov.insert("tile.door_s".to_string(),      set.tiles.door_s.to_string());
     ov.insert("tile.door_w".to_string(),      set.tiles.door_w.to_string());
     ov.insert("tile.door_stub".to_string(),   set.tiles.door_stub.to_string());
-    ov.insert("tile.dash_h".to_string(),      set.tiles.dash_h.to_string());
-    ov.insert("tile.dash_v".to_string(),      set.tiles.dash_v.to_string());
+    ov.insert("tile.trail".to_string(),       set.tiles.trail.to_string());
+    ov.insert("tile.trail_distorted".to_string(), set.tiles.trail_distorted.to_string());
+    ov.insert("tile.trail_bridge".to_string(), set.tiles.trail_bridge.to_string());
+    ov.insert("tile.chamber".to_string(),     set.tiles.chamber.to_string());
+    ov.insert("tile.shadow".to_string(),      set.tiles.shadow.to_string());
     ov.insert("tile.bridge".to_string(),      set.tiles.bridge.to_string());
     ov.insert("tile.bridge_v".to_string(),    set.tiles.bridge_v.to_string());
     ov.insert("tile.stairs_up".to_string(),   set.tiles.stairs_up.to_string());
     ov.insert("tile.stairs_down".to_string(), set.tiles.stairs_down.to_string());
+    ov.insert("tile.stair_steps".to_string(), set.tiles.stair_steps.to_string());
     ov.insert("tile.portal_in".to_string(),   set.tiles.portal_in.to_string());
     ov.insert("tile.portal_out".to_string(),  set.tiles.portal_out.to_string());
     ov.insert("tile.player".to_string(),      set.tiles.player.to_string());
@@ -1783,6 +1796,8 @@ align = "right"
 "map.tile.door"        = { fg = "magenta" }
 "map.tile.bridge"      = { fg = "yellow" }
 "map.tile.stairs"      = { fg = "white" }
+"map.tile.chamber"     = { fg = "dark-gray" }
+"map.tile.shadow"      = { fg = "black" }
 "map.tile.player"      = { fg = "cyan", bold = true }
 "map.tile.room-number" = { fg = "gray" }
 "##;
@@ -1796,12 +1811,15 @@ align = "right"
         assert_eq!(cs.tile_door.fg, Some(Color::Magenta));
         assert_eq!(cs.tile_bridge.fg, Some(Color::Yellow));
         assert_eq!(cs.tile_stairs.fg, Some(Color::White));
+        assert_eq!(cs.tile_chamber.fg, Some(Color::DarkGray));
+        assert_eq!(cs.tile_shadow.fg, Some(Color::Black));
         assert_eq!(cs.tile_player.fg, Some(Color::Cyan));
         assert!(cs.tile_player.add_modifier.contains(Modifier::BOLD));
         assert_eq!(cs.tile_room_number.fg, Some(Color::Gray));
         // Registered end-to-end: field list, editor groups, and read-accessor.
         for sel in ["map.tile.wall", "map.tile.floor", "map.tile.corridor", "map.tile.door",
-                    "map.tile.bridge", "map.tile.stairs", "map.tile.player", "map.tile.room-number"] {
+                    "map.tile.bridge", "map.tile.stairs", "map.tile.chamber", "map.tile.shadow",
+                    "map.tile.player", "map.tile.room-number"] {
             assert!(SELECTOR_FIELDS.contains(&sel), "{sel} missing from SELECTOR_FIELDS");
             assert!(SELECTOR_GROUPS.iter().any(|(_, s)| s.contains(&sel)), "{sel} missing from SELECTOR_GROUPS");
         }

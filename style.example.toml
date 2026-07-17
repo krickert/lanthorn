@@ -37,10 +37,12 @@
 # Tile map view (experimental, map_renderer = "tiles"): one glyph per map tile.
 "map.tile.wall"        = { fg = "dark-gray" }   # double-line room walls
 "map.tile.floor"       = { fg = "white", dim = true }  # room floor dots
-"map.tile.corridor"    = { fg = "white", dim = true }  # passage floor + painted side walls (wall glyphs from path_style)
+"map.tile.corridor"    = { fg = "white", dim = true }  # dotted path trails (∘, distorted ·)
 "map.tile.door"        = { fg = "yellow" }      # punched doors (two-way/one-way/stub)
-"map.tile.bridge"      = { fg = "cyan" }        # corridor-over-corridor crossing
-"map.tile.stairs"      = { fg = "cyan" }        # stairs / portal features
+"map.tile.bridge"      = { fg = "cyan" }        # trail/corridor crossings (╳ / ╪)
+"map.tile.stairs"      = { fg = "cyan" }        # stairs / portal features (☰^ / ☰v)
+"map.tile.chamber"     = { fg = "dark-gray" }   # maze chamber outline texture (░)
+"map.tile.shadow"      = { fg = "dark-gray", dim = true } # room drop-shadow fringe (▒)
 "map.tile.player"      = { fg = "yellow", bold = true } # the @ marker (current room)
 "map.tile.room-number" = { fg = "dark-gray" }   # the #id floor label
 
@@ -135,4 +137,4 @@ path_style   = "light"     # light | heavy | dotted
 "gutter.warning" = "!"     # warning transcript gutter marker
 # "arrow.north"  = "^"
 # "room.normal.tl" = "+"
-# "tile.wall_h"  = "="     # tile-map glyphs: tile.wall_v/_tl/_tee_n/_cross, tile.door_h/_v, tile.player, …
+# "tile.wall_h"  = "="     # tile-map glyphs: tile.wall_v/_tl/_tee_n/_cross, tile.door_h/_v, tile.trail(_distorted/_bridge), tile.chamber, tile.shadow, tile.stair_steps, tile.player, …
