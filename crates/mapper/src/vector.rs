@@ -2,7 +2,9 @@
 //! pipeline behind tiles mode. Per layer:
 //!
 //! 1. [`district::partition`] splits the layer into districts (planar
-//!    connected components, maze-classified);
+//!    connected components, maze-classified; a small stair-only satellite the
+//!    V1.5 collapse folds onto an anchor joins the ANCHOR's district, so the
+//!    per-district build can place it beside its anchor);
 //! 2. each district builds its continuous [`MapModel`] via
 //!    [`model::build_model`] over the district's own sub-graph, then its
 //!    intra-district connections are routed as true-angle polylines with
@@ -563,17 +565,19 @@ mod tests {
         g.set_pos(id, pos);
     }
 
-    /// Six rooms, two districts: a 4-room block (1–4, mixed reciprocal /
-    /// one-way / diagonal planar edges) and a 2-room annex (5–6) attached only
-    /// by a reciprocal stairwell 4↔5.
+    /// Eight rooms, two districts: a 4-room block (1–4, mixed reciprocal /
+    /// one-way / diagonal planar edges) and a 4-room annex (5–8) attached only
+    /// by a reciprocal stairwell 4↔5 — big enough (> COLLAPSE_THRESHOLD) that
+    /// the collapse union leaves it a separate district.
     fn two_district_graph() -> MapGraph {
         let mut g = MapGraph::new();
         room_at(&mut g, 1, (0, 0));
         room_at(&mut g, 2, (1, 0));
         room_at(&mut g, 3, (0, 1));
         room_at(&mut g, 4, (1, 1));
-        room_at(&mut g, 5, (10, 0));
-        room_at(&mut g, 6, (11, 0));
+        for i in 0u16..4 {
+            room_at(&mut g, 5 + i, (10 + i32::from(i), 0));
+        }
         g.add_edge(1, Direction::E, 2);
         g.add_edge(2, Direction::W, 1);
         g.add_edge(1, Direction::S, 3);
@@ -582,8 +586,10 @@ mod tests {
         g.add_edge(1, Direction::SE, 4); // diagonal
         g.add_edge(4, Direction::Up, 5);
         g.add_edge(5, Direction::Down, 4);
-        g.add_edge(5, Direction::E, 6);
-        g.add_edge(6, Direction::W, 5);
+        for i in 5u16..8 {
+            g.add_edge(i, Direction::E, i + 1);
+            g.add_edge(i + 1, Direction::W, i);
+        }
         g
     }
 
@@ -601,15 +607,15 @@ mod tests {
     fn two_district_end_to_end() {
         let g = two_district_graph();
         let p = realize_layer_vector(&g, MAIN_LAYER, 4.0);
-        assert_eq!(p.rooms.len(), 6, "every room survives the pipeline");
+        assert_eq!(p.rooms.len(), 8, "every room survives the pipeline");
         assert_eq!(
             p,
             realize_layer_vector(&g, MAIN_LAYER, 4.0),
             "vector realization must be deterministic"
         );
-        // Every deduped planar connection (4 in district A, 1 in district B)
+        // Every deduped planar connection (4 in district A, 3 in district B)
         // plus the cross-district stair link is a conn with a door.
-        assert_eq!(p.conns.len(), 6, "4 + 1 planar paths + 1 stair link: {:?}", p.conns);
+        assert_eq!(p.conns.len(), 8, "4 + 3 planar paths + 1 stair link: {:?}", p.conns);
         let doors = door_conns(&p);
         for ci in 0..p.conns.len() as u16 {
             assert!(
@@ -680,6 +686,98 @@ mod tests {
         };
         assert!(has_feature(FeatureKind::StairsUp, 1), "anchor keeps its stairs-up glyph");
         assert!(has_feature(FeatureKind::StairsDown, 3), "attic keeps its stairs-down glyph");
+    }
+
+    /// Assert `sat`'s room rect sits ADJACENT to `anchor`'s in the plan
+    /// (per-axis rect gap within a few tiles — not flung across the map), with
+    /// a dashed stair link between them and stairs glyphs on both.
+    fn assert_satellite_beside_anchor(p: &TilePlan, anchor: RoomId, sat: RoomId) {
+        let rect = |id: RoomId| p.rooms.iter().find(|r| r.id == id).unwrap().bounds;
+        let (a, s) = (rect(anchor), rect(sat));
+        let axis_gap = |lo_a: usize, len_a: usize, lo_b: usize, len_b: usize| -> usize {
+            lo_b.saturating_sub(lo_a + len_a).max(lo_a.saturating_sub(lo_b + len_b))
+        };
+        let gx = axis_gap(a.x, a.w, s.x, s.w);
+        let gy = axis_gap(a.y, a.h, s.y, s.h);
+        assert!(
+            gx <= 4 && gy <= 4,
+            "satellite {sat} must sit beside anchor {anchor}: gaps ({gx}, {gy}) tiles, rects {a:?} vs {s:?}"
+        );
+        let link = p
+            .conns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| {
+                c.distorted
+                    && ((c.origin, c.dest) == (anchor, sat) || (c.origin, c.dest) == (sat, anchor))
+            })
+            .map(|(i, _)| i as u16)
+            .expect("collapsed stair pair yields a dashed link");
+        assert!(
+            p.tiles.iter().any(|t| matches!(t, Tile::Door { conn, .. } if *conn == link)),
+            "the dashed stair link punches doors"
+        );
+        let has_feature = |kind: FeatureKind, room: RoomId| {
+            p.tiles.iter().any(|t| matches!(t, Tile::Feature { room: r, kind: k } if *r == room && *k == kind))
+        };
+        assert!(has_feature(FeatureKind::StairsUp, anchor), "anchor keeps its stairs-up glyph");
+        assert!(has_feature(FeatureKind::StairsDown, sat), "satellite keeps its stairs-down glyph");
+    }
+
+    #[test]
+    fn stair_only_attic_renders_beside_its_kitchen() {
+        // Kitchen 1 in a fully planar 2x2 house; attic 5 is connected ONLY by
+        // the reciprocal stairs — no planar edge — and previously became its
+        // own district, so the collapse never fired and the attic was thrown
+        // wherever composition put it.
+        let mut g = MapGraph::new();
+        room_at(&mut g, 1, (0, 0));
+        room_at(&mut g, 2, (1, 0));
+        room_at(&mut g, 3, (0, 1));
+        room_at(&mut g, 4, (1, 1));
+        g.add_edge(1, Direction::E, 2);
+        g.add_edge(2, Direction::W, 1);
+        g.add_edge(1, Direction::S, 3);
+        g.add_edge(3, Direction::N, 1);
+        g.add_edge(2, Direction::S, 4);
+        g.add_edge(4, Direction::N, 2);
+        g.add_edge(3, Direction::E, 4);
+        g.add_edge(4, Direction::W, 3);
+        room_at(&mut g, 5, (0, -1));
+        g.add_edge(1, Direction::Up, 5);
+        g.add_edge(5, Direction::Down, 1);
+        let p = realize_layer_vector(&g, MAIN_LAYER, 4.0);
+        assert_eq!(p.rooms.len(), 5);
+        assert_eq!(p, realize_layer_vector(&g, MAIN_LAYER, 4.0), "deterministic");
+        assert_satellite_beside_anchor(&p, 1, 5);
+    }
+
+    #[test]
+    fn up_a_tree_satellite_renders_beside_its_forest_room() {
+        // A 2x3 planar forest; room 4 has a one-room tree-top satellite
+        // reached only by Up/Down stairs.
+        let mut g = MapGraph::new();
+        for i in 0u16..6 {
+            room_at(&mut g, 1 + i, (i32::from(i % 3), i32::from(i / 3)));
+        }
+        for row in 0u16..2 {
+            for col in 0u16..2 {
+                let id = 1 + row * 3 + col;
+                g.add_edge(id, Direction::E, id + 1);
+                g.add_edge(id + 1, Direction::W, id);
+            }
+        }
+        for col in 0u16..3 {
+            g.add_edge(1 + col, Direction::S, 4 + col);
+            g.add_edge(4 + col, Direction::N, 1 + col);
+        }
+        room_at(&mut g, 9, (0, 2));
+        g.add_edge(4, Direction::Up, 9);
+        g.add_edge(9, Direction::Down, 4);
+        let p = realize_layer_vector(&g, MAIN_LAYER, 4.0);
+        assert_eq!(p.rooms.len(), 7);
+        assert_eq!(p, realize_layer_vector(&g, MAIN_LAYER, 4.0), "deterministic");
+        assert_satellite_beside_anchor(&p, 4, 9);
     }
 
     /// K5-density cluster (5 rooms, every pair connected, several distorted):

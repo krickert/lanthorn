@@ -14,7 +14,9 @@
 //! (`layout::vpsc` + `layout::stress`): half-extents are each district's model
 //! bounding-box half plus [`DISTRICT_MARGIN`], seeds are the mean member-room
 //! position (so the global arrangement follows the underlying layout), and
-//! inter-district edges pull like connections. Maze districts additionally get
+//! inter-district edges pull like connections; a centroid-pull compaction pass
+//! (`model::compact_toward_centroid`) then nestles the super-nodes together.
+//! Maze districts additionally get
 //! a chamber outline polygon. Deterministic throughout: BTree iteration, fixed
 //! iteration count, no RNG.
 
@@ -25,7 +27,7 @@ use crate::graph::{MapGraph, RoomId};
 use crate::layer::LayerId;
 use crate::layout::vpsc::Constraint;
 use crate::layout::{edge_is_satisfied, stress};
-use crate::model::{MapModel, Vec2};
+use crate::model::{self, compact_toward_centroid, MapModel, Vec2};
 
 /// How a district is rendered / abstracted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +60,10 @@ pub const MAZE_EDGE_RATIO: f32 = 1.6;
 /// which a component reads as a maze even when sparse.
 pub const MAZE_BAD_EDGE_FRACTION: f32 = 0.4;
 
-/// Margin added to each district super-node half-extent during composition.
-pub const DISTRICT_MARGIN: f32 = 0.5;
+/// Margin added to each district super-node half-extent during composition —
+/// kept small so districts nestle; the guaranteed clearance between two
+/// composed bboxes is twice this.
+pub const DISTRICT_MARGIN: f32 = 0.15;
 /// How far a maze chamber outline stands off its member room rects.
 pub const CHAMBER_INFLATE: f32 = 0.3;
 
@@ -85,10 +89,16 @@ pub fn is_maze(room_count: usize, planar_pairs: usize, compass_edges: usize, bad
 
 /// Partition `layer`'s sub-graph into districts: connected components over the
 /// planar (compass-direction) edges, each classified via [`is_maze`]. Rooms
-/// with no planar edges become singleton Standard districts. Districts are
-/// returned in ascending-id order; ids are the lowest member room id, so an
-/// existing district keeps its id and membership when new rooms are appended
-/// elsewhere (it only ever absorbs rooms that connect to it).
+/// with no planar edges become singleton Standard districts — EXCEPT a small
+/// vertical satellite the V1.5 collapse folds onto an in-layer anchor
+/// (`model::collapse_anchor_pairs`, computed on the full layer sub-graph):
+/// its stair link unions like a planar edge, so the anchor's district carries
+/// the satellite and the per-district build can place it beside its anchor.
+/// Big single-staircase structures (a 12-room cellar) never collapse and keep
+/// their own district; their stair stays a cross-district dashed trail.
+/// Districts are returned in ascending-id order; ids are the lowest member
+/// room id, so an existing district keeps its id and membership when new rooms
+/// are appended elsewhere (it only ever absorbs rooms that connect to it).
 pub fn partition(graph: &MapGraph, layer: LayerId) -> Vec<District> {
     let sub = graph.layer_subgraph(layer);
     let mut adj: BTreeMap<RoomId, BTreeSet<RoomId>> =
@@ -100,6 +110,12 @@ pub fn partition(graph: &MapGraph, layer: LayerId) -> Vec<District> {
         if adj.contains_key(&c.origin) && adj.contains_key(&c.dest) {
             adj.get_mut(&c.origin).unwrap().insert(c.dest);
             adj.get_mut(&c.dest).unwrap().insert(c.origin);
+        }
+    }
+    for (room, anchor) in model::collapse_anchor_pairs(graph, layer) {
+        if room != anchor && adj.contains_key(&room) && adj.contains_key(&anchor) {
+            adj.get_mut(&room).unwrap().insert(anchor);
+            adj.get_mut(&anchor).unwrap().insert(room);
         }
     }
 
@@ -275,7 +291,11 @@ pub fn compose(districts: &[(District, MapModel)], inter_edges: &[(RoomId, RoomI
         }
     }
     let dist = stress::all_pairs_dist(n, &adj);
-    let pos = stress::stress_layout(n, &dist, &xc, &yc, &seed, ITERS);
+    let mut pos = stress::stress_layout(n, &dist, &xc, &yc, &seed, ITERS);
+    // Same continuous compaction the per-level room solve gets: pull the
+    // super-nodes toward their centroid as far as the separation constraints
+    // allow, so districts nestle instead of keeping stress slack between them.
+    compact_toward_centroid(&mut pos, &xc, &yc);
 
     let offsets: Vec<(u16, (f32, f32))> = districts
         .iter()
@@ -568,11 +588,44 @@ mod tests {
         let mut g = MapGraph::new();
         grid3(&mut g, 1, (0, 0));
         room_at(&mut g, 30, (10, 10));
-        // A non-planar (Up) edge must not merge components.
-        g.add_edge(30, Direction::Up, 1);
         let d = partition(&g, MAIN_LAYER);
         assert_eq!(d.len(), 2);
         assert_eq!((d[1].id, d[1].kind, d[1].rooms.clone()), (30, DistrictKind::Standard, vec![30]));
+    }
+
+    #[test]
+    fn collapsed_stair_satellite_joins_its_anchors_district() {
+        // A one-room attic reached only by stairs collapses onto its anchor's
+        // plane, so it must land in the anchor's district for the per-district
+        // build to place it beside the anchor.
+        let mut g = MapGraph::new();
+        grid3(&mut g, 1, (0, 0));
+        room_at(&mut g, 30, (10, 10));
+        g.add_edge(1, Direction::Up, 30);
+        g.add_edge(30, Direction::Down, 1);
+        let d = partition(&g, MAIN_LAYER);
+        assert_eq!(d.len(), 1, "collapsed satellite unions into the anchor's district");
+        assert!(d[0].rooms.contains(&30));
+        assert_eq!(d[0].id, 1);
+    }
+
+    #[test]
+    fn big_stair_only_structure_keeps_its_own_district() {
+        // A 12-room cellar bridged by ONE staircase never collapses
+        // (> COLLAPSE_THRESHOLD), so the stair link must NOT merge districts.
+        let mut g = MapGraph::new();
+        grid3(&mut g, 1, (0, 0));
+        for i in 0u16..12 {
+            room_at(&mut g, 20 + i, (i32::from(i), 10));
+            if i > 0 {
+                g.add_edge(19 + i, Direction::E, 20 + i);
+            }
+        }
+        g.add_edge(1, Direction::Down, 20);
+        let d = partition(&g, MAIN_LAYER);
+        assert_eq!(d.len(), 2, "big cellar stays a separate district");
+        assert_eq!(d[1].id, 20);
+        assert_eq!(d[1].rooms, (20u16..=31).collect::<Vec<_>>());
     }
 
     #[test]

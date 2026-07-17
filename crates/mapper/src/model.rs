@@ -9,8 +9,12 @@
 //! positions are seeded from the cell layout (`Room::pos`) and refined by a
 //! rectangle-aware constrained stress pass reusing `layout::vpsc` /
 //! `layout::stress`: per-axis separation gaps of `half_a + half_b + margin`,
-//! with margin 0 for cardinally connected pairs (they may abut → shared wall
-//! after projection) and a minimum margin otherwise. Separation constraints
+//! with margin 0 for ANY planar-connected pair — a cardinal pair may abut
+//! (shared wall after projection), a diagonal pair may touch corners — and a
+//! minimum margin otherwise. Stress ideals are size-aware (direct edges target
+//! their abutment distance, multi-hop targets scale by the mean room extent),
+//! and a centroid-pull compaction pass squeezes out remaining slack after
+//! refinement (see [`compact_toward_centroid`]). Separation constraints
 //! follow cell order, so the relative order the cell layout established (N
 //! stays above, W stays left) is preserved by construction. Deterministic: BTree
 //! iteration, FNV-1a id hashing only, fixed iteration count.
@@ -108,7 +112,9 @@ pub const ROOM_H_MIN: f32 = 0.7;
 pub const ROOM_H_MAX: f32 = 1.6;
 /// Wall length one door needs; a side with `d` doors demands `d * DOOR_SPAN`.
 pub const DOOR_SPAN: f32 = 0.4;
-/// Minimum per-axis gap between rooms with no cardinal connection.
+/// Minimum per-axis gap between rooms with no planar (compass) connection.
+/// Connected pairs — cardinal AND diagonal — get margin 0: a cardinal pair may
+/// abut into a shared wall, a diagonal pair may close up to a corner touch.
 pub const UNCONNECTED_MARGIN: f32 = 0.35;
 
 /// Hash-bit size jitter amplitudes (kept below the door/clamp headroom).
@@ -119,6 +125,15 @@ const SEED_PITCH_X: f64 = 3.0;
 const SEED_PITCH_Y: f64 = 2.0;
 /// Fixed SMACOF iterations for the refinement pass (determinism + bounded cost).
 const ITERS: usize = 40;
+/// Slack added above the hard abutment distance in a direct edge's stress
+/// ideal, so the target sits just OUTSIDE the VPSC boundary instead of pulling
+/// against it every iteration; the compaction pass closes the slack afterward.
+const IDEAL_SLACK: f64 = 0.1;
+/// Fixed centroid-pull compaction rounds (see [`compact_toward_centroid`]).
+const COMPACT_ITERS: usize = 4;
+/// Fraction of the way each compaction round pulls a room toward the centroid
+/// before re-projecting onto the separation constraints.
+const COMPACT_STEP: f64 = 0.5;
 /// Fixed nudge-and-reproject rounds for stairwell coherence (see
 /// [`stairwell_coherence`]); geometric convergence makes a handful plenty.
 const COHERENCE_ITERS: usize = 8;
@@ -455,16 +470,22 @@ struct LevelSolve {
 /// majorization over the placed rooms. Every same-level pair whose cells differ
 /// on an axis gets a VPSC separation constraint on that axis, in cell order,
 /// with gap `half_a + half_b + margin` — so sizes genuinely push neighbors,
-/// order is preserved, and no two same-level rects can overlap. Cardinally
-/// connected pairs get margin 0 (may abut); everything else keeps
-/// [`UNCONNECTED_MARGIN`]. Rooms on OTHER levels impose nothing here — they are
-/// different floors and may overlap this one in x/y.
+/// order is preserved, and no two same-level rects can overlap. Planar-connected
+/// pairs (cardinal AND diagonal) get margin 0: a cardinal pair may abut, and a
+/// diagonal pair — constrained on both axes by its diagonal cell order — may
+/// close all the way up to a corner touch. (Relaxing one axis below the
+/// half-sum for diagonal-only pairs was evaluated and rejected: letting the
+/// pair overlap on an axis puts the arrival corner on the wrong side of the
+/// departure corner, so the drawn corner-to-corner diagonal would point the
+/// wrong way.) Everything else keeps [`UNCONNECTED_MARGIN`]. Rooms on OTHER
+/// levels impose nothing here — they are different floors and may overlap this
+/// one in x/y.
 fn refine_level(
     ids: &[RoomId],
     cells: &BTreeMap<RoomId, (i32, i32)>,
     sizes: &BTreeMap<RoomId, (f32, f32)>,
     sub: &MapGraph,
-    cardinal: &BTreeSet<(RoomId, RoomId)>,
+    connected: &BTreeSet<(RoomId, RoomId)>,
 ) -> LevelSolve {
     let n = ids.len();
     let index: BTreeMap<RoomId, usize> =
@@ -477,7 +498,7 @@ fn refine_level(
             let (a, b) = (ids[i], ids[j]);
             let (ca, cb) = (cells[&a], cells[&b]);
             let (sa, sb) = (sizes[&a], sizes[&b]);
-            let margin = if cardinal.contains(&(a.min(b), a.max(b))) {
+            let margin = if connected.contains(&(a.min(b), a.max(b))) {
                 0.0
             } else {
                 f64::from(UNCONNECTED_MARGIN)
@@ -501,20 +522,50 @@ fn refine_level(
         }
     }
 
-    // Graph-distance targets pull connected rooms together (hop = 1.0 unit);
-    // the VPSC projection each iteration keeps the gaps above feasible.
+    // Graph-distance targets pull connected rooms together; the VPSC projection
+    // each iteration keeps the gaps above feasible. Ideals are size-aware so
+    // stress stops fighting VPSC: a direct edge's ideal is the abutment
+    // distance (half-size sums along the connecting axis; the corner-touch
+    // center distance for a diagonal) plus [`IDEAL_SLACK`], and multi-hop
+    // ideals scale hop counts by the mean room extent.
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut edge_ideal: BTreeMap<(usize, usize), f64> = BTreeMap::new();
     for c in sub.connections() {
-        if grid_offset(c.dir).is_none() {
+        let Some(off) = grid_offset(c.dir) else { continue };
+        let (Some(&i), Some(&j)) = (index.get(&c.origin), index.get(&c.dest)) else { continue };
+        if i == j {
             continue;
         }
-        let (Some(&i), Some(&j)) = (index.get(&c.origin), index.get(&c.dest)) else { continue };
-        if i != j {
-            adj[i].push(j);
-            adj[j].push(i);
+        adj[i].push(j);
+        adj[j].push(i);
+        let (sa, sb) = (sizes[&ids[i]], sizes[&ids[j]]);
+        let ex = f64::from(sa.0 + sb.0) / 2.0;
+        let ey = f64::from(sa.1 + sb.1) / 2.0;
+        let abut = match (off.0 != 0, off.1 != 0) {
+            (true, false) => ex,
+            (false, true) => ey,
+            _ => ex.hypot(ey),
+        };
+        let d = abut + IDEAL_SLACK;
+        edge_ideal
+            .entry((i.min(j), i.max(j)))
+            .and_modify(|v| *v = v.min(d))
+            .or_insert(d);
+    }
+    let mut dist = stress::all_pairs_dist(n, &adj);
+    let mean_ext = ids.iter().map(|id| f64::from(sizes[id].0 + sizes[id].1) / 2.0).sum::<f64>()
+        / n as f64;
+    for row in &mut dist {
+        for d in row.iter_mut() {
+            if d.is_finite() {
+                *d *= mean_ext;
+            }
         }
     }
-    let dist = stress::all_pairs_dist(n, &adj);
+    for (&(i, j), &d) in &edge_ideal {
+        dist[i][j] = d;
+        dist[j][i] = d;
+    }
     let seed: Vec<(f64, f64)> = ids
         .iter()
         .map(|id| {
@@ -524,6 +575,38 @@ fn refine_level(
         .collect();
     let pos = stress::stress_layout(n, &dist, &xc, &yc, &seed, ITERS);
     LevelSolve { ids: ids.to_vec(), pos, xc, yc }
+}
+
+/// Continuous compaction: iteratively pull every position toward the layout's
+/// centroid as far as VPSC feasibility allows — the continuous analogue of
+/// `tiles::compact_empty_lines`. Each of the [`COMPACT_ITERS`] rounds moves
+/// every point [`COMPACT_STEP`] of the way toward the mean position, then
+/// re-projects each axis onto the SAME separation constraints the refinement
+/// used, so every ordering and minimum-gap guarantee survives while slack the
+/// stress solve left behind (ideal targets sit [`IDEAL_SLACK`] outside the
+/// boundary) is squeezed out. Shared with `district::compose` for the
+/// super-node layout. Deterministic: fixed rounds, uniform weights.
+pub(crate) fn compact_toward_centroid(
+    pos: &mut [(f64, f64)],
+    xc: &[Constraint],
+    yc: &[Constraint],
+) {
+    let n = pos.len();
+    if n <= 1 {
+        return;
+    }
+    let w = vec![1.0; n];
+    for _ in 0..COMPACT_ITERS {
+        let cx = pos.iter().map(|p| p.0).sum::<f64>() / n as f64;
+        let cy = pos.iter().map(|p| p.1).sum::<f64>() / n as f64;
+        let dx: Vec<f64> = pos.iter().map(|p| p.0 + COMPACT_STEP * (cx - p.0)).collect();
+        let dy: Vec<f64> = pos.iter().map(|p| p.1 + COMPACT_STEP * (cy - p.1)).collect();
+        let nx = vpsc::solve_axis(&dx, &w, xc);
+        let ny = vpsc::solve_axis(&dy, &w, yc);
+        for (i, p) in pos.iter_mut().enumerate() {
+            *p = (nx[i], ny[i]);
+        }
+    }
 }
 
 /// Stairwell coherence: pull each cross-level Up/Down edge's endpoints toward
@@ -641,13 +724,40 @@ fn feature_rank(kind: FeatureKind) -> u8 {
     }
 }
 
+/// Standalone V1.5 collapse derivation over a FULL layer sub-graph: the
+/// `(stair-side room, anchor room)` pair of every small vertical cluster that
+/// [`collapse_small_clusters`] folds onto its anchor's plane. Sorted by the
+/// collapsed room id (BTree iteration) — deterministic.
+///
+/// Used by `district::partition` to union a collapsed satellite into its
+/// anchor's district BEFORE the per-district builds: districts are planar
+/// components, so an attic reached only by stairs would otherwise become its
+/// own district and the per-district [`build_model`] would never see anchor and
+/// satellite together — the collapse placement could never fire. The
+/// per-district build then RECOMPUTES the same decisions on its district
+/// sub-graph; they coincide because the union puts the folded cluster, its
+/// single stair link, and its anchor all inside one district.
+pub(crate) fn collapse_anchor_pairs(graph: &MapGraph, layer: LayerId) -> Vec<(RoomId, RoomId)> {
+    let sub = graph.layer_subgraph(layer);
+    let cells: BTreeMap<RoomId, (i32, i32)> =
+        sub.rooms().filter_map(|r| r.pos.map(|p| (r.id, p))).collect();
+    if cells.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<RoomId> = cells.keys().copied().collect();
+    let (mut levels, _) = room_levels(&ids, &sub);
+    let (anchors, _) = collapse_small_clusters(&ids, &sub, &mut levels);
+    anchors.iter().map(|(&room, ca)| (room, ca.anchor)).collect()
+}
+
 /// Build the continuous model for one layer's sub-graph. Rooms and features
 /// only for now; `paths` is left empty until the polyline router (V2).
 ///
 /// Stages: derive 2.5D levels from the Up/Down subgraph ([`room_levels`]),
 /// fold small single-stair vertical stubs back into their anchor plane
 /// ([`collapse_small_clusters`]), refine x/y PER LEVEL ([`refine_level`] —
-/// rooms on different levels never constrain each other and may overlap), then
+/// rooms on different levels never constrain each other and may overlap),
+/// compact each level toward its centroid ([`compact_toward_centroid`]), then
 /// nudge stairwells coherent across levels ([`stairwell_coherence`]).
 /// Deterministic: the same graph always yields the identical `MapModel`.
 pub fn build_model(graph: &MapGraph, layer: LayerId) -> MapModel {
@@ -662,10 +772,11 @@ pub fn build_model(graph: &MapGraph, layer: LayerId) -> MapModel {
     let (mut levels, distorted_levels) = room_levels(&ids, &sub);
     let (anchors, collapsed) = collapse_small_clusters(&ids, &sub, &mut levels);
 
-    let mut cardinal: BTreeSet<(RoomId, RoomId)> = BTreeSet::new();
+    // ANY planar connection — cardinal or diagonal — earns the zero margin.
+    let mut connected: BTreeSet<(RoomId, RoomId)> = BTreeSet::new();
     for c in sub.connections() {
-        if matches!(c.dir, Direction::N | Direction::S | Direction::E | Direction::W) {
-            cardinal.insert((c.origin.min(c.dest), c.origin.max(c.dest)));
+        if grid_offset(c.dir).is_some() && c.origin != c.dest {
+            connected.insert((c.origin.min(c.dest), c.origin.max(c.dest)));
         }
     }
     let mut groups: BTreeMap<i32, Vec<RoomId>> = BTreeMap::new();
@@ -674,8 +785,15 @@ pub fn build_model(graph: &MapGraph, layer: LayerId) -> MapModel {
     }
     let mut solves: BTreeMap<i32, LevelSolve> = groups
         .iter()
-        .map(|(&lv, gids)| (lv, refine_level(gids, &cells, &sizes, &sub, &cardinal)))
+        .map(|(&lv, gids)| (lv, refine_level(gids, &cells, &sizes, &sub, &connected)))
         .collect();
+    // Compaction runs BEFORE the coherence nudge: the nudge re-projects onto
+    // the same constraints and is the last word on stairwell alignment and
+    // collapsed-room placement, so compacting first cannot break either —
+    // compacting after would drag aligned stair columns apart again.
+    for s in solves.values_mut() {
+        compact_toward_centroid(&mut s.pos, &s.xc, &s.yc);
+    }
     stairwell_coherence(&mut solves, &sub, &levels, &sizes, &anchors);
 
     let pos: BTreeMap<RoomId, (f64, f64)> = solves
@@ -878,6 +996,74 @@ mod tests {
         let (a, b) = (find(&m, 1), find(&m, 2));
         let gap = (b.center.0 - b.half.0) - (a.center.0 + a.half.0);
         assert!(gap.abs() < EPS, "connected E/W pair must abut, gap = {gap}");
+    }
+
+    #[test]
+    fn connected_diagonal_pair_touches_corners() {
+        let mut g = MapGraph::new();
+        room_at(&mut g, 1, (0, 0));
+        room_at(&mut g, 2, (1, 1));
+        g.add_edge(1, Direction::SE, 2);
+        g.add_edge(2, Direction::NW, 1);
+        let m = build_model(&g, MAIN_LAYER);
+        let (a, b) = (find(&m, 1), find(&m, 2));
+        assert!(
+            b.center.0 > a.center.0 && b.center.1 > a.center.1,
+            "SE neighbor must stay south-east: a {:?} b {:?}",
+            a.center,
+            b.center
+        );
+        let gx = (b.center.0 - b.half.0) - (a.center.0 + a.half.0);
+        let gy = (b.center.1 - b.half.1) - (a.center.1 + a.half.1);
+        assert!(gx.abs() < EPS, "diagonal pair closes to a corner touch in x: gap {gx}");
+        assert!(gy.abs() < EPS, "diagonal pair closes to a corner touch in y: gap {gy}");
+        // Tightness bound: the closest-corner Euclidean gap is (near) zero —
+        // nothing like the old UNCONNECTED_MARGIN on both axes.
+        assert!(gx.hypot(gy) < 2.0 * EPS, "corner gap {}", gx.hypot(gy));
+    }
+
+    #[test]
+    fn compaction_shrinks_l_shape_bbox() {
+        let mut g = MapGraph::new();
+        room_at(&mut g, 1, (0, 0));
+        room_at(&mut g, 2, (1, 0));
+        room_at(&mut g, 3, (1, 1));
+        g.add_edge(1, Direction::E, 2);
+        g.add_edge(2, Direction::S, 3);
+        let sub = g.layer_subgraph(MAIN_LAYER);
+        let cells: BTreeMap<RoomId, (i32, i32)> =
+            sub.rooms().filter_map(|r| r.pos.map(|p| (r.id, p))).collect();
+        let ids: Vec<RoomId> = cells.keys().copied().collect();
+        let sizes = room_sizes(&sub);
+        let connected: BTreeSet<(RoomId, RoomId)> = [(1, 2), (2, 3)].into();
+        let solve = refine_level(&ids, &cells, &sizes, &sub, &connected);
+        let bbox_area = |s: &LevelSolve| {
+            let (mut lo, mut hi) = ((f64::INFINITY, f64::INFINITY), (f64::NEG_INFINITY, f64::NEG_INFINITY));
+            for (i, id) in s.ids.iter().enumerate() {
+                let (hx, hy) = (f64::from(sizes[id].0) / 2.0, f64::from(sizes[id].1) / 2.0);
+                lo.0 = lo.0.min(s.pos[i].0 - hx);
+                lo.1 = lo.1.min(s.pos[i].1 - hy);
+                hi.0 = hi.0.max(s.pos[i].0 + hx);
+                hi.1 = hi.1.max(s.pos[i].1 + hy);
+            }
+            (hi.0 - lo.0) * (hi.1 - lo.1)
+        };
+        let before = bbox_area(&solve);
+        let mut compacted = solve.pos.clone();
+        compact_toward_centroid(&mut compacted, &solve.xc, &solve.yc);
+        let mut again = solve.pos.clone();
+        compact_toward_centroid(&mut again, &solve.xc, &solve.yc);
+        assert_eq!(compacted, again, "compaction is deterministic");
+        let after = bbox_area(&LevelSolve {
+            ids: solve.ids.clone(),
+            pos: compacted,
+            xc: solve.xc.clone(),
+            yc: solve.yc.clone(),
+        });
+        assert!(
+            after <= before + 1e-9,
+            "compaction must not grow the bounding box: {before} -> {after}"
+        );
     }
 
     #[test]
