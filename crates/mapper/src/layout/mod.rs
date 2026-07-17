@@ -31,9 +31,9 @@ use crate::graph::{Connection, MapGraph, RoomId};
 
 mod sort;
 mod incremental;
-mod vpsc;
+pub(crate) mod vpsc;
 mod constraints;
-mod stress;
+pub(crate) mod stress;
 mod chains;
 pub use incremental::place_incremental;
 pub use chains::{detect_chains, Chains};
