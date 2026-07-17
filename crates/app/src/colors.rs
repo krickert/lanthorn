@@ -374,6 +374,22 @@ pub struct ColorScheme {
     pub sound_beep_low: Style,
     /// Room-detection-method indicator (map corner).
     pub loc_indicator: Style,
+    /// Tile map (`map_renderer = "tiles"`): wall blocks.
+    pub tile_wall: Style,
+    /// Tile map: room floor tiles.
+    pub tile_floor: Style,
+    /// Tile map: corridor floor tiles.
+    pub tile_corridor: Style,
+    /// Tile map: door tiles (two-way, one-way, stub).
+    pub tile_door: Style,
+    /// Tile map: corridor-crossing bridge tiles.
+    pub tile_bridge: Style,
+    /// Tile map: stairs / portal feature tiles.
+    pub tile_stairs: Style,
+    /// Tile map: the `@` player marker on the current room's floor.
+    pub tile_player: Style,
+    /// Tile map: the `#id` room-number label.
+    pub tile_room_number: Style,
     /// Player input echo text.
     pub transcript_input: Style,
     /// Meta (app/slash) text.
@@ -519,6 +535,14 @@ impl ColorScheme {
             sound_beep_high: Style::new().fg(Color::Rgb(255, 180, 40)),
             sound_beep_low: Style::new().fg(Color::Rgb(60, 140, 220)),
             loc_indicator: Style::new().fg(Color::DarkGray),
+            tile_wall: Style::new().fg(Color::DarkGray),
+            tile_floor: Style::new().fg(Color::White).add_modifier(Modifier::DIM),
+            tile_corridor: Style::new().fg(Color::White).add_modifier(Modifier::DIM),
+            tile_door: Style::new().fg(Color::Yellow),
+            tile_bridge: Style::new().fg(Color::Cyan),
+            tile_stairs: Style::new().fg(Color::Cyan),
+            tile_player: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            tile_room_number: Style::new().fg(Color::DarkGray),
             transcript_input: Style::new().fg(Color::Cyan),
             transcript_meta: Style::new().fg(Color::DarkGray),
             transcript_warning: Style::new().fg(Color::Yellow),
@@ -724,6 +748,14 @@ impl ColorScheme {
             sound_beep_high: Style::new().fg(Color::Rgb(255, 180, 40)),
             sound_beep_low: Style::new().fg(Color::Rgb(60, 140, 220)),
             loc_indicator: Style::new().fg(scheme.palette[8]),
+            tile_wall: Style::new().fg(scheme.palette[8]),
+            tile_floor: Style::new().fg(fg).add_modifier(Modifier::DIM),
+            tile_corridor: Style::new().fg(fg).add_modifier(Modifier::DIM),
+            tile_door: Style::new().fg(scheme.palette[3]),
+            tile_bridge: Style::new().fg(scheme.palette[6]),
+            tile_stairs: Style::new().fg(scheme.palette[6]),
+            tile_player: Style::new().fg(scheme.palette[3]).add_modifier(Modifier::BOLD),
+            tile_room_number: Style::new().fg(scheme.palette[8]),
             transcript_input: Style::new().fg(scheme.palette[6]),
             transcript_meta: Style::new().fg(scheme.palette[8]),
             transcript_warning: Style::new().fg(scheme.palette[3]),

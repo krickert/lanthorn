@@ -84,6 +84,32 @@ pub struct PortalGlyphs {
     pub unknown: char,
 }
 
+/// Glyphs for the tile-map renderer (`map_renderer = "tiles"`): one glyph per
+/// semantic tile kind (see `mapper::tiles::Tile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileGlyphs {
+    pub wall: char,
+    pub floor: char,
+    pub corridor: char,
+    /// Two-way door.
+    pub door: char,
+    /// One-way door by exit direction (a diagonal renders as its N/S cardinal).
+    pub door_n: char,
+    pub door_e: char,
+    pub door_s: char,
+    pub door_w: char,
+    /// Dead-end stub door (route-failure edge).
+    pub door_stub: char,
+    /// Perpendicular corridor crossing.
+    pub bridge: char,
+    pub stairs_up: char,
+    pub stairs_down: char,
+    pub portal_in: char,
+    pub portal_out: char,
+    /// The current-room marker on the floor centre.
+    pub player: char,
+}
+
 // ── Top-level set ─────────────────────────────────────────────────────────────
 
 /// All map glyphs used by the renderer, resolved from config at startup.
@@ -111,6 +137,8 @@ pub struct SymbolSet {
     /// still leaves and arrives on the same CORNERS — that part is the router's doing, not this
     /// setting's — but walks between them orthogonally instead.
     pub diagonal_corners: bool,
+    /// Tile-map renderer glyphs (`map_renderer = "tiles"`).
+    pub tiles: TileGlyphs,
 }
 
 impl Default for SymbolSet {
@@ -161,6 +189,23 @@ impl Default for SymbolSet {
             meta_gutter: '▏',
             warning_gutter: '!',
             diagonal_corners: true,
+            tiles: TileGlyphs {
+                wall: '█',
+                floor: '·',
+                corridor: '·',
+                door: '∩',
+                door_n: '▴',
+                door_e: '▸',
+                door_s: '▾',
+                door_w: '◂',
+                door_stub: '?',
+                bridge: '╪',
+                stairs_up: '<',
+                stairs_down: '>',
+                portal_in: '⊙',
+                portal_out: '⊗',
+                player: '@',
+            },
         }
     }
 }
@@ -402,6 +447,7 @@ impl SymbolSet {
             meta_gutter: SymbolSet::default().meta_gutter,
             warning_gutter: SymbolSet::default().warning_gutter,
             diagonal_corners: cfg.diagonal_corners,
+            tiles: SymbolSet::default().tiles,
         };
 
         for (key, val) in &cfg.overrides {
@@ -540,6 +586,21 @@ fn apply_override(s: &mut SymbolSet, key: &str, ch: char) {
         "portal.marker"    => s.portal.marker = ch,
         "gutter.meta"      => s.meta_gutter = ch,
         "gutter.warning"   => s.warning_gutter = ch,
+        "tile.wall"        => s.tiles.wall = ch,
+        "tile.floor"       => s.tiles.floor = ch,
+        "tile.corridor"    => s.tiles.corridor = ch,
+        "tile.door"        => s.tiles.door = ch,
+        "tile.door_n"      => s.tiles.door_n = ch,
+        "tile.door_e"      => s.tiles.door_e = ch,
+        "tile.door_s"      => s.tiles.door_s = ch,
+        "tile.door_w"      => s.tiles.door_w = ch,
+        "tile.door_stub"   => s.tiles.door_stub = ch,
+        "tile.bridge"      => s.tiles.bridge = ch,
+        "tile.stairs_up"   => s.tiles.stairs_up = ch,
+        "tile.stairs_down" => s.tiles.stairs_down = ch,
+        "tile.portal_in"   => s.tiles.portal_in = ch,
+        "tile.portal_out"  => s.tiles.portal_out = ch,
+        "tile.player"      => s.tiles.player = ch,
         _ => {} // unknown key — ignored
     }
 }

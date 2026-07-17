@@ -30,6 +30,7 @@ pub mod file_picker;
 pub mod screen;
 pub mod scroll;
 pub mod tidy_panel;
+pub mod tilemap;
 pub mod transcript;
 pub mod verbmenu;
 
