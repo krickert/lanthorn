@@ -1139,6 +1139,177 @@ mod tests {
         }
     }
 
+    /// Stability regression guard: a Zork-flavoured exploration walk (30
+    /// observations) driven through the `Mapper` facade in Auto mode —
+    /// N/S/E/W moves, two diagonals, Up and Down, and several loop closures
+    /// revisiting known rooms. After every observation the MAIN_LAYER plan is
+    /// realized and compared with the previous turn's:
+    /// - realization never panics and is deterministic (realize twice, equal);
+    /// - a room whose logical cell and incident-connection count are both
+    ///   unchanged keeps its floor SIZE, unless its own row/col track changed
+    ///   size or a gutter opened/closed on an adjacent channel (abutment
+    ///   extends a floor to the shared track boundary, so size legitimately
+    ///   depends on that much context — and nothing else);
+    /// - for any two rooms that both stayed on their logical cells, their
+    ///   floor-rect ORDER never flips — by x within a shared row track, by y
+    ///   within a shared column track.
+    ///
+    /// Positions may still shift when tracks resize or gutters open — the goal
+    /// is catching gross reshuffles, not pinning exact coordinates.
+    #[test]
+    fn exploration_walk_keeps_tile_plans_stable() {
+        use crate::mapper::Mapper;
+        use Direction::{Down, Up, E, N, NE, S, SW, W};
+        let walk: &[(RoomId, &str, Option<Direction>)] = &[
+            (1, "West of House", None),
+            (2, "North of House", Some(N)),
+            (3, "Behind House", Some(E)),
+            (5, "Kitchen", Some(W)),
+            (6, "Living Room", Some(W)),
+            (8, "Cellar", Some(Down)),
+            (6, "Living Room", Some(Up)),
+            (5, "Kitchen", Some(E)),
+            (7, "Attic", Some(Up)),
+            (5, "Kitchen", Some(Down)),
+            (3, "Behind House", Some(E)),
+            (4, "South of House", Some(S)),
+            (1, "West of House", Some(W)), // loop closure around the house
+            (9, "Forest", Some(W)),
+            (10, "Forest Path", Some(N)),
+            (2, "North of House", Some(E)), // closure onto a mapped room
+            (10, "Forest Path", Some(W)),
+            (11, "Clearing", Some(NE)), // diagonal
+            (12, "Canyon View", Some(E)),
+            (13, "Rocky Ledge", Some(Down)),
+            (14, "Canyon Bottom", Some(S)),
+            (15, "End of Rainbow", Some(SW)), // diagonal
+            (14, "Canyon Bottom", Some(NE)),
+            (13, "Rocky Ledge", Some(N)),
+            (12, "Canyon View", Some(Up)),
+            (11, "Clearing", Some(W)),
+            (16, "Forest 2", Some(N)),
+            (10, "Forest Path", Some(S)), // geometrically-inconsistent closure
+            (9, "Forest", Some(S)),
+            (1, "West of House", Some(E)), // final closure home
+        ];
+        use std::collections::BTreeSet;
+        /// The track/gutter context a room's realized floor size may
+        /// legitimately depend on besides its own doors: per-column track
+        /// width, per-row track height (from S1 base sizes), and which
+        /// channels carry a gutter (abutment on/off). Mirrors
+        /// `realize_layer`'s S1/S2 pre-computation.
+        type SizeContext = (BTreeMap<i32, i32>, BTreeMap<i32, i32>, BTreeSet<i32>, BTreeSet<i32>);
+        fn size_context(g: &MapGraph) -> SizeContext {
+            let sub = g.layer_subgraph(MAIN_LAYER);
+            let mut planar = sub.clone();
+            let np: Vec<(RoomId, Direction)> = planar
+                .connections()
+                .iter()
+                .filter(|c| grid_offset(c.dir).is_none())
+                .map(|c| (c.origin, c.dir))
+                .collect();
+            for (o, d) in np {
+                planar.remove_connection(o, d);
+            }
+            let route = route_lanes(&planar);
+            let mut v: BTreeSet<i32> = route.v_lanes.keys().copied().collect();
+            let mut h: BTreeSet<i32> = route.h_lanes.keys().copied().collect();
+            for &(vc, hc) in &route.diag_corners {
+                v.insert(vc);
+                h.insert(hc);
+            }
+            let sizes = floor_sizes(&sub);
+            let mut col: BTreeMap<i32, i32> = BTreeMap::new();
+            let mut row: BTreeMap<i32, i32> = BTreeMap::new();
+            for r in sub.rooms() {
+                let Some((cx, cy)) = r.pos else { continue };
+                let (fw, fh) = sizes[&r.id];
+                let e = col.entry(cx).or_insert(0);
+                *e = (*e).max(fw + 2);
+                let e = row.entry(cy).or_insert(0);
+                *e = (*e).max(fh + 2);
+            }
+            (col, row, v, h)
+        }
+        type Snapshot =
+            (TilePlan, BTreeMap<RoomId, (i32, i32)>, BTreeMap<RoomId, usize>, SizeContext);
+        let mut m = Mapper::default();
+        let mut prev: Option<Snapshot> = None;
+        for &(id, name, via) in walk {
+            m.observe(id, name, via);
+            let plan = realize_layer(&m.graph, MAIN_LAYER);
+            assert_eq!(
+                plan,
+                realize_layer(&m.graph, MAIN_LAYER),
+                "realization must be deterministic after entering {name}"
+            );
+            let cells: BTreeMap<RoomId, (i32, i32)> =
+                m.graph.rooms().filter_map(|r| r.pos.map(|p| (r.id, p))).collect();
+            let mut conns: BTreeMap<RoomId, usize> = BTreeMap::new();
+            for c in m.graph.connections() {
+                *conns.entry(c.origin).or_default() += 1;
+                *conns.entry(c.dest).or_default() += 1;
+            }
+            let ctx = size_context(&m.graph);
+            for &rid in cells.keys() {
+                assert!(
+                    plan.rooms.iter().any(|r| r.id == rid),
+                    "placed room {rid} missing from the tile plan after entering {name}"
+                );
+            }
+            if let Some((pp, pc, pn, px)) = &prev {
+                let on_same_cell = |rid: RoomId| pc.get(&rid) == cells.get(&rid);
+                let same_ctx = |rid: RoomId| {
+                    let (cx, cy) = cells[&rid];
+                    px.0.get(&cx) == ctx.0.get(&cx)
+                        && px.1.get(&cy) == ctx.1.get(&cy)
+                        && [cx - 1, cx].iter().all(|c| px.2.contains(c) == ctx.2.contains(c))
+                        && [cy - 1, cy].iter().all(|c| px.3.contains(c) == ctx.3.contains(c))
+                };
+                for r in &plan.rooms {
+                    let Some(pr) = pp.rooms.iter().find(|q| q.id == r.id) else { continue };
+                    if on_same_cell(r.id) && pn.get(&r.id) == conns.get(&r.id) && same_ctx(r.id) {
+                        assert_eq!(
+                            (pr.floor.w, pr.floor.h),
+                            (r.floor.w, r.floor.h),
+                            "room {} floor resized with its cell, connections, track \
+                             sizes, and adjacent gutters all unchanged after entering {name}",
+                            r.id
+                        );
+                    }
+                    for b in &plan.rooms {
+                        if b.id <= r.id || !on_same_cell(r.id) || !on_same_cell(b.id) {
+                            continue;
+                        }
+                        let Some(pb) = pp.rooms.iter().find(|q| q.id == b.id) else { continue };
+                        let (ca, cb) = (cells[&r.id], cells[&b.id]);
+                        if ca.1 == cb.1 {
+                            assert_eq!(
+                                pr.floor.x < pb.floor.x,
+                                r.floor.x < b.floor.x,
+                                "rooms {} and {} swapped x-order in row {} after entering {name}",
+                                r.id,
+                                b.id,
+                                ca.1
+                            );
+                        }
+                        if ca.0 == cb.0 {
+                            assert_eq!(
+                                pr.floor.y < pb.floor.y,
+                                r.floor.y < b.floor.y,
+                                "rooms {} and {} swapped y-order in column {} after entering {name}",
+                                r.id,
+                                b.id,
+                                ca.0
+                            );
+                        }
+                    }
+                }
+            }
+            prev = Some((plan, cells, conns, ctx));
+        }
+    }
+
     #[test]
     fn floors_never_overlap_and_bounds_stay_inside_the_grid() {
         let g = big_graph();

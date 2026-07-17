@@ -49,6 +49,9 @@ from a `.zip`, or from a **Blorb** container (`.zblorb`/`.blorb`/`.gblorb`).
 - **Live automapping** — rooms and connections placed, routed, and de-overlapped
   automatically as you explore, across layered multi-level areas, and continuously
   re-tidied. Works for Z-machine *and* Glulx/Inform 7 games. → [mapping](docs/features/mapping.md)
+- **Experimental tile map renderer** — an ASCII-art view of the map with walled
+  rooms, punched doors, and corridors; enable with `map_renderer = "tiles"` in
+  the config or the `toggle-map-renderer` command. → [concept & status](docs/ascii-art-map-concept.md)
 - **Sound** — Z-machine `sound_effect` bleeps and Blorb sampled audio, plus Glulx
   Glk sound channels with per-channel volume and finish events (AIFF/Ogg/MOD).
   → [interpreter](docs/features/interpreter.md) · [remote audio](docs/remote-sound.md)
