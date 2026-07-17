@@ -35,9 +35,9 @@
 "map_layer_tab_active" = { fg = "cyan", bold = true }
 "loc_indicator"        = { fg = "dark-gray" }   # room-detection method indicator
 # Tile map view (experimental, map_renderer = "tiles"): one glyph per map tile.
-"map.tile.wall"        = { fg = "dark-gray" }   # solid wall blocks
+"map.tile.wall"        = { fg = "dark-gray" }   # double-line room walls
 "map.tile.floor"       = { fg = "white", dim = true }  # room floor dots
-"map.tile.corridor"    = { fg = "white", dim = true }  # corridor floor dots
+"map.tile.corridor"    = { fg = "white", dim = true }  # corridor line-art (glyphs from path_style)
 "map.tile.door"        = { fg = "yellow" }      # punched doors (two-way/one-way/stub)
 "map.tile.bridge"      = { fg = "cyan" }        # corridor-over-corridor crossing
 "map.tile.stairs"      = { fg = "cyan" }        # stairs / portal features
@@ -135,4 +135,4 @@ path_style   = "light"     # light | heavy | dotted
 "gutter.warning" = "!"     # warning transcript gutter marker
 # "arrow.north"  = "^"
 # "room.normal.tl" = "+"
-# "tile.wall"    = "#"     # tile-map glyphs: tile.floor / tile.door / tile.player / …
+# "tile.wall_h"  = "="     # tile-map glyphs: tile.wall_v/_tl/_tee_n/_cross, tile.door_h/_v, tile.player, …

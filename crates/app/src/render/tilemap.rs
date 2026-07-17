@@ -4,41 +4,123 @@
 //! nothing here is hard-coded, matching the classic renderer's theming rules.
 
 use mapper::graph::{MapGraph, RoomId};
-use mapper::tiles::{DoorKind, FeatureKind, Tile, TilePlan};
+use mapper::tiles::{DoorKind, FeatureKind, Tile, TilePlan, MIN_TRACK};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use crate::render::map::{glyph_for, DIR_E, DIR_N, DIR_S, DIR_W};
 use crate::render::{put_char, put_str};
 use crate::state::AppState;
-use crate::symbols::TileGlyphs;
+use crate::symbols::{TileGlyphs, WallGlyphs};
 
-/// The tile shown at the pane's top-left corner. Mirrors `render_map`'s pan
-/// state (`state.scroll` cells + `state.char_pan` chars; at this zoom both are
-/// tile units, and positive `char_pan` shifts content right like the classic
-/// renderer's `+ char_pan` offset), clamped so the plan can always be panned
-/// fully into view and never entirely off-screen.
+/// Map a cell-unit scroll coordinate to the tile x/y of that cell's track edge
+/// via the plan's sorted `(cell, tile)` track table. Beyond the first/last
+/// track it extrapolates by [`MIN_TRACK`] per cell, so panning off the map's
+/// edge keeps moving and then clamps sanely in [`tile_origin`].
+fn cell_to_tile(tracks: &[(i32, i32)], cell: i32) -> i32 {
+    let Some(&(first_c, first_t)) = tracks.first() else { return 0 };
+    let &(last_c, last_t) = tracks.last().expect("non-empty");
+    if cell <= first_c {
+        return first_t - (first_c - cell) * MIN_TRACK;
+    }
+    if cell >= last_c {
+        return last_t + (cell - last_c) * MIN_TRACK;
+    }
+    match tracks.binary_search_by_key(&cell, |&(c, _)| c) {
+        Ok(i) | Err(i) => tracks[i].1, // tracks are contiguous; Err rides the next edge
+    }
+}
+
+/// The tile shown at the pane's top-left corner. `state.scroll` is CELL units
+/// (shared with the classic renderer, so shift+arrows move one room track per
+/// press and `recenter_on` keeps working); it maps through the plan's track
+/// tables to tiles. `state.char_pan` stays 1:1 tile-fine (drag pan), positive
+/// shifting content right like the classic renderer's `+ char_pan` offset. The
+/// result is clamped so the plan can always be panned fully into view and never
+/// entirely off-screen.
 fn tile_origin(plan: &TilePlan, state: &AppState, area: Rect) -> (i32, i32) {
     let max_x = (plan.w as i32 - i32::from(area.width)).max(0);
     let max_y = (plan.h as i32 - i32::from(area.height)).max(0);
     (
-        (state.scroll.0 - state.char_pan.0).clamp(0, max_x),
-        (state.scroll.1 - state.char_pan.1).clamp(0, max_y),
+        (cell_to_tile(&plan.col_x, state.scroll.0) - state.char_pan.0).clamp(0, max_x),
+        (cell_to_tile(&plan.row_y, state.scroll.1) - state.char_pan.1).clamp(0, max_y),
     )
 }
 
-/// The glyph for a door tile: two-way `∩`, one-way a direction triangle (a
-/// diagonal renders as its vertical cardinal), stub `?`.
-fn door_glyph(kind: DoorKind, g: &TileGlyphs) -> char {
+/// True when the tile at (x, y) continues a wall run: a wall, a door punched
+/// into one, or an in-wall portal feature. Out-of-plan coordinates are Void.
+fn in_wall_run(plan: &TilePlan, x: usize, y: usize) -> bool {
+    matches!(
+        plan.get(x, y),
+        Tile::Wall
+            | Tile::Door { .. }
+            | Tile::Feature { kind: FeatureKind::PortalIn | FeatureKind::PortalOut, .. }
+    )
+}
+
+/// 4-neighbor direction mask over `probe`, guarding the plan bounds.
+fn neighbor_mask(plan: &TilePlan, x: usize, y: usize, probe: impl Fn(usize, usize) -> bool) -> u8 {
+    let mut m = 0;
+    if y > 0 && probe(x, y - 1) {
+        m |= DIR_N;
+    }
+    if x + 1 < plan.w && probe(x + 1, y) {
+        m |= DIR_E;
+    }
+    if y + 1 < plan.h && probe(x, y + 1) {
+        m |= DIR_S;
+    }
+    if x > 0 && probe(x - 1, y) {
+        m |= DIR_W;
+    }
+    m
+}
+
+/// Double-line wall glyph for a wall tile's neighbor mask — the wall-set mirror
+/// of the classic renderer's `glyph_for`. A bare N/S stub renders vertical;
+/// anything else (bare E/W, isolated) falls back to horizontal.
+fn wall_glyph(mask: u8, w: &WallGlyphs) -> char {
+    match mask {
+        m if m == DIR_E | DIR_W => w.h,
+        m if m == DIR_N | DIR_S => w.v,
+        m if m == DIR_S | DIR_E => w.tl,
+        m if m == DIR_S | DIR_W => w.tr,
+        m if m == DIR_N | DIR_E => w.bl,
+        m if m == DIR_N | DIR_W => w.br,
+        m if m == DIR_N | DIR_S | DIR_E => w.tee_e,
+        m if m == DIR_N | DIR_S | DIR_W => w.tee_w,
+        m if m == DIR_E | DIR_W | DIR_S => w.tee_s,
+        m if m == DIR_E | DIR_W | DIR_N => w.tee_n,
+        m if m == DIR_N | DIR_E | DIR_S | DIR_W => w.cross,
+        m if m == DIR_N || m == DIR_S => w.v,
+        _ => w.h,
+    }
+}
+
+/// The glyph for a door tile: a two-way door is a single-line stroke oriented by
+/// the wall run it sits in (left+right walls → `─`, above+below → `│`; corner
+/// doors tie and render horizontal); one-way keeps its direction triangle (a
+/// diagonal renders as its vertical cardinal); stub keeps `?`.
+fn door_glyph(plan: &TilePlan, x: usize, y: usize, kind: DoorKind, g: &TileGlyphs) -> char {
     use mapper::direction::Direction as D;
     match kind {
-        DoorKind::TwoWay => g.door,
+        DoorKind::TwoWay => {
+            let m = neighbor_mask(plan, x, y, |nx, ny| in_wall_run(plan, nx, ny));
+            let v = u8::from(m & DIR_N != 0) + u8::from(m & DIR_S != 0);
+            let h = u8::from(m & DIR_E != 0) + u8::from(m & DIR_W != 0);
+            if v > h {
+                g.door_v
+            } else {
+                g.door_h
+            }
+        }
         DoorKind::Stub(_) => g.door_stub,
         DoorKind::OneWay(dir) => match dir {
             D::N | D::NE | D::NW => g.door_n,
             D::S | D::SE | D::SW => g.door_s,
             D::E => g.door_e,
             D::W => g.door_w,
-            _ => g.door,
+            _ => g.door_h,
         },
     }
 }
@@ -74,10 +156,23 @@ pub fn render_tile_map(
         for tx in ox as usize..x1 {
             let (ch, style) = match plan.get(tx, ty) {
                 Tile::Void => continue,
-                Tile::Wall => (g.wall, cs.tile_wall),
+                Tile::Wall => {
+                    let m = neighbor_mask(plan, tx, ty, |nx, ny| in_wall_run(plan, nx, ny));
+                    (wall_glyph(m, &g.walls), cs.tile_wall)
+                }
                 Tile::Floor { .. } => (g.floor, cs.tile_floor),
-                Tile::Corridor { .. } => (g.corridor, cs.tile_corridor),
-                Tile::Door { kind, .. } => (door_glyph(kind, g), cs.tile_door),
+                Tile::Corridor { .. } => {
+                    // Single-line line-art through the classic path table: the
+                    // mask is the corridor's 4-neighborhood of connecting tiles.
+                    let m = neighbor_mask(plan, tx, ty, |nx, ny| {
+                        matches!(
+                            plan.get(nx, ny),
+                            Tile::Corridor { .. } | Tile::Door { .. } | Tile::Bridge { .. }
+                        )
+                    });
+                    (glyph_for(m, &state.symbols.path).unwrap_or(g.floor), cs.tile_corridor)
+                }
+                Tile::Door { kind, .. } => (door_glyph(plan, tx, ty, kind, g), cs.tile_door),
                 Tile::Bridge { .. } => (g.bridge, cs.tile_bridge),
                 Tile::Feature { kind, .. } => (feature_glyph(kind, g), cs.tile_stairs),
             };
@@ -187,19 +282,21 @@ mod tests {
         render_tile_map(&plan, &g, &state, area, &mut buf);
         let got = frame(&buf, area);
 
-        // Verified by eye: rooms 1|2 share a wall column with one ∩ door; room 3
-        // hangs off a walled corridor with ∩ doors at both ends; '@' sits on room
-        // 1's floor centre; Void stays blank (rows are padded to the 40-cell area).
+        // Verified by eye: double-line room outlines with ╣ junctions where room
+        // 2's taller box meets the shared wall; a │ door in the shared wall and
+        // in each corridor-end wall; a single-line ─── corridor to room 3; '@'
+        // sits on room 1's floor centre; Void stays blank (rows are padded to
+        // the 40-cell area).
         let expected = concat!(
             "                                        \n",
             "                                        \n",
-            "        █████████   ███████             \n",
-            "  ███████·······█   █·····█             \n",
-            "  █·····█·······█████·····█             \n",
-            "  █··@··∩·······∩···∩·····█             \n",
-            "  █·····█·······█████·····█             \n",
-            "  ███████·······█   █·····█             \n",
-            "        █████████   ███████             \n",
+            "        ╔═══════╗   ╔═════╗             \n",
+            "  ╔═════╣·······║   ║·····║             \n",
+            "  ║·····║·······║   ║·····║             \n",
+            "  ║··@··│·······│───│·····║             \n",
+            "  ║·····║·······║   ║·····║             \n",
+            "  ╚═════╣·······║   ║·····║             \n",
+            "        ╚═══════╝   ╚═════╝             \n",
             "                                        \n",
             "                                        \n",
             "                                        \n",
@@ -212,21 +309,21 @@ mod tests {
         assert_eq!(r1.bounds.right(), r2.bounds.x, "rooms 1|2 share exactly one wall column");
         let shared_x = r1.bounds.right() as u16;
         let doors_in_shared: Vec<u16> = (0..area.height)
-            .filter(|&y| buf.cell((shared_x, y)).unwrap().symbol() == "∩")
+            .filter(|&y| buf.cell((shared_x, y)).unwrap().symbol() == "│")
             .collect();
-        assert_eq!(doors_in_shared.len(), 1, "one ∩ door in the shared wall");
+        assert_eq!(doors_in_shared.len(), 1, "one │ door in the shared wall");
         // '@' on room 1's floor centre.
         let f = r1.floor;
         let (cx, cy) = ((f.x + f.w / 2) as u16, (f.y + f.h / 2) as u16);
         assert_eq!(buf.cell((cx, cy)).unwrap().symbol(), "@");
-        // The 2→3 corridor: a '·' corridor tile walled with '█' above and below.
+        // The 2→3 corridor is line-art now: a ─ stroke with bare Void around it.
         let (tx, ty) = (0..plan.h)
             .flat_map(|y| (0..plan.w).map(move |x| (x, y)))
             .find(|&(x, y)| matches!(plan.get(x, y), Tile::Corridor { .. }))
             .expect("corridor tiles exist between rooms 2 and 3");
-        assert_eq!(buf.cell((tx as u16, ty as u16)).unwrap().symbol(), "·");
-        assert_eq!(buf.cell((tx as u16, ty as u16 - 1)).unwrap().symbol(), "█");
-        assert_eq!(buf.cell((tx as u16, ty as u16 + 1)).unwrap().symbol(), "█");
+        assert_eq!(buf.cell((tx as u16, ty as u16)).unwrap().symbol(), "─");
+        assert_eq!(buf.cell((tx as u16, ty as u16 - 1)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((tx as u16, ty as u16 + 1)).unwrap().symbol(), " ");
     }
 
     #[test]
@@ -274,16 +371,53 @@ mod tests {
             );
         }
 
-        // Scrolled by (1,1) with the pane smaller than the plan (no clamping):
-        // every rect shifts by exactly (-1,-1).
+        // Drag-panned by char_pan (1,1) with the pane smaller than the plan (no
+        // clamping: the base origin sits at the col-0 track edge, 2 tiles in):
+        // every rect shifts by exactly (+1,+1) — char_pan stays tile-fine.
         let small = Rect::new(0, 0, (plan.w - 2) as u16, (plan.h - 2) as u16);
-        let mut scrolled = AppState::default();
-        scrolled.scroll = (1, 1);
+        let mut panned = AppState::default();
+        panned.char_pan = (1, 1);
         let base = tile_room_screen_rects(&plan, &AppState::default(), small);
-        let moved = tile_room_screen_rects(&plan, &scrolled, small);
+        let moved = tile_room_screen_rects(&plan, &panned, small);
         for (id, r) in &moved {
             let (_, b) = base.iter().find(|(bid, _)| bid == id).expect("room visible in both");
-            assert_eq!((r.x, r.y), (b.x - 1, b.y - 1), "room {id} shifted with the scroll");
+            assert_eq!((r.x, r.y), (b.x + 1, b.y + 1), "room {id} shifted with the drag pan");
         }
+    }
+
+    #[test]
+    fn tile_origin_maps_cell_scroll_through_the_track_table() {
+        // A synthetic plan with known track tables: columns -1/0/1 start at tile
+        // x 2/10/22, rows 0/1 at tile y 2/9. tile_origin never reads the tiles.
+        let plan = TilePlan {
+            w: 62,
+            h: 40,
+            tiles: Vec::new(),
+            rooms: Vec::new(),
+            conns: Vec::new(),
+            col_x: vec![(-1, 2), (0, 10), (1, 22)],
+            row_y: vec![(0, 2), (1, 9)],
+        };
+        let area = Rect::new(0, 0, 22, 10); // max origin (40, 30)
+        let mut s = AppState::default();
+
+        // A cell scroll lands on its column/row track's left/top edge.
+        s.scroll = (0, 1);
+        assert_eq!(tile_origin(&plan, &s, area), (10, 9));
+        s.scroll = (1, 0);
+        assert_eq!(tile_origin(&plan, &s, area), (22, 2));
+        s.scroll = (-1, 0);
+        assert_eq!(tile_origin(&plan, &s, area), (2, 2));
+        // West/north of the first track: extrapolates by MIN_TRACK per cell,
+        // then clamps at 0 — negative scroll can never wedge the view.
+        s.scroll = (-9, -9);
+        assert_eq!(tile_origin(&plan, &s, area), (0, 0));
+        // Beyond the last track: extrapolates, then clamps to plan − area.
+        s.scroll = (99, 99);
+        assert_eq!(tile_origin(&plan, &s, area), (40, 30));
+        // char_pan applies tile-fine on top of the cell mapping.
+        s.scroll = (0, 0);
+        s.char_pan = (3, -4);
+        assert_eq!(tile_origin(&plan, &s, area), (7, 6));
     }
 }

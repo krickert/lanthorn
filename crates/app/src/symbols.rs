@@ -84,15 +84,39 @@ pub struct PortalGlyphs {
     pub unknown: char,
 }
 
+/// The 11-glyph wall set for the tile-map renderer: the rasterizer picks one per
+/// Wall tile from its 4-neighbor mask of wall-run tiles (walls, doors, in-wall
+/// portals), mirroring how `PathGlyphs` + `glyph_for` resolve path junctions.
+/// Tee names are by the branch direction: `tee_e` (╠) branches east off a
+/// vertical run, `tee_s` (╦) branches south off a horizontal run, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallGlyphs {
+    pub h: char,
+    pub v: char,
+    pub tl: char,
+    pub tr: char,
+    pub bl: char,
+    pub br: char,
+    pub tee_n: char,
+    pub tee_s: char,
+    pub tee_e: char,
+    pub tee_w: char,
+    pub cross: char,
+}
+
 /// Glyphs for the tile-map renderer (`map_renderer = "tiles"`): one glyph per
-/// semantic tile kind (see `mapper::tiles::Tile`).
+/// semantic tile kind (see `mapper::tiles::Tile`). Corridor line-art has no
+/// slots here — it reuses `SymbolSet::path` (the classic connector set), so the
+/// `path_style` preset and `path.*` overrides theme it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileGlyphs {
-    pub wall: char,
+    /// Junction-resolved double-line room walls.
+    pub walls: WallGlyphs,
     pub floor: char,
-    pub corridor: char,
-    /// Two-way door.
-    pub door: char,
+    /// Two-way door in a horizontal wall run (wall neighbors left+right).
+    pub door_h: char,
+    /// Two-way door in a vertical wall run (wall neighbors above+below).
+    pub door_v: char,
     /// One-way door by exit direction (a diagonal renders as its N/S cardinal).
     pub door_n: char,
     pub door_e: char,
@@ -190,10 +214,22 @@ impl Default for SymbolSet {
             warning_gutter: '!',
             diagonal_corners: true,
             tiles: TileGlyphs {
-                wall: '█',
+                walls: WallGlyphs {
+                    h: '═',
+                    v: '║',
+                    tl: '╔',
+                    tr: '╗',
+                    bl: '╚',
+                    br: '╝',
+                    tee_n: '╩',
+                    tee_s: '╦',
+                    tee_e: '╠',
+                    tee_w: '╣',
+                    cross: '╬',
+                },
                 floor: '·',
-                corridor: '·',
-                door: '∩',
+                door_h: '─',
+                door_v: '│',
                 door_n: '▴',
                 door_e: '▸',
                 door_s: '▾',
@@ -586,10 +622,20 @@ fn apply_override(s: &mut SymbolSet, key: &str, ch: char) {
         "portal.marker"    => s.portal.marker = ch,
         "gutter.meta"      => s.meta_gutter = ch,
         "gutter.warning"   => s.warning_gutter = ch,
-        "tile.wall"        => s.tiles.wall = ch,
+        "tile.wall_h"      => s.tiles.walls.h = ch,
+        "tile.wall_v"      => s.tiles.walls.v = ch,
+        "tile.wall_tl"     => s.tiles.walls.tl = ch,
+        "tile.wall_tr"     => s.tiles.walls.tr = ch,
+        "tile.wall_bl"     => s.tiles.walls.bl = ch,
+        "tile.wall_br"     => s.tiles.walls.br = ch,
+        "tile.wall_tee_n"  => s.tiles.walls.tee_n = ch,
+        "tile.wall_tee_s"  => s.tiles.walls.tee_s = ch,
+        "tile.wall_tee_e"  => s.tiles.walls.tee_e = ch,
+        "tile.wall_tee_w"  => s.tiles.walls.tee_w = ch,
+        "tile.wall_cross"  => s.tiles.walls.cross = ch,
         "tile.floor"       => s.tiles.floor = ch,
-        "tile.corridor"    => s.tiles.corridor = ch,
-        "tile.door"        => s.tiles.door = ch,
+        "tile.door_h"      => s.tiles.door_h = ch,
+        "tile.door_v"      => s.tiles.door_v = ch,
         "tile.door_n"      => s.tiles.door_n = ch,
         "tile.door_e"      => s.tiles.door_e = ch,
         "tile.door_s"      => s.tiles.door_s = ch,

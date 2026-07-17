@@ -1573,10 +1573,20 @@ pub fn write_style_full(
     ov.insert("gutter.meta".to_string(),    set.meta_gutter.to_string());
     ov.insert("gutter.warning".to_string(), set.warning_gutter.to_string());
     // Tile-map glyphs
-    ov.insert("tile.wall".to_string(),        set.tiles.wall.to_string());
+    ov.insert("tile.wall_h".to_string(),      set.tiles.walls.h.to_string());
+    ov.insert("tile.wall_v".to_string(),      set.tiles.walls.v.to_string());
+    ov.insert("tile.wall_tl".to_string(),     set.tiles.walls.tl.to_string());
+    ov.insert("tile.wall_tr".to_string(),     set.tiles.walls.tr.to_string());
+    ov.insert("tile.wall_bl".to_string(),     set.tiles.walls.bl.to_string());
+    ov.insert("tile.wall_br".to_string(),     set.tiles.walls.br.to_string());
+    ov.insert("tile.wall_tee_n".to_string(),  set.tiles.walls.tee_n.to_string());
+    ov.insert("tile.wall_tee_s".to_string(),  set.tiles.walls.tee_s.to_string());
+    ov.insert("tile.wall_tee_e".to_string(),  set.tiles.walls.tee_e.to_string());
+    ov.insert("tile.wall_tee_w".to_string(),  set.tiles.walls.tee_w.to_string());
+    ov.insert("tile.wall_cross".to_string(),  set.tiles.walls.cross.to_string());
     ov.insert("tile.floor".to_string(),       set.tiles.floor.to_string());
-    ov.insert("tile.corridor".to_string(),    set.tiles.corridor.to_string());
-    ov.insert("tile.door".to_string(),        set.tiles.door.to_string());
+    ov.insert("tile.door_h".to_string(),      set.tiles.door_h.to_string());
+    ov.insert("tile.door_v".to_string(),      set.tiles.door_v.to_string());
     ov.insert("tile.door_n".to_string(),      set.tiles.door_n.to_string());
     ov.insert("tile.door_e".to_string(),      set.tiles.door_e.to_string());
     ov.insert("tile.door_s".to_string(),      set.tiles.door_s.to_string());

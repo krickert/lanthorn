@@ -92,6 +92,12 @@ pub struct TilePlan {
     pub tiles: Vec<Tile>,
     pub rooms: Vec<TileRoom>,
     pub conns: Vec<TileConn>,
+    /// Sorted `(logical column, tile x of that column track's left edge)` — the
+    /// cell→tile mapping the renderer needs to translate cell-unit scroll state
+    /// into a tile origin. Contiguous over the layer's occupied column range.
+    pub col_x: Vec<(i32, i32)>,
+    /// Row counterpart of [`Self::col_x`]: `(logical row, tile y of its track top)`.
+    pub row_y: Vec<(i32, i32)>,
 }
 
 impl TilePlan {
@@ -102,11 +108,13 @@ impl TilePlan {
 
 // ── internals ────────────────────────────────────────────────────────────────
 
-/// Void margin around the track region so stubs and the wall-paint pass never
-/// need to write outside the grid.
+/// Void margin around the track region so stubs never need to write outside
+/// the grid.
 const MARGIN: i32 = 2;
-/// Width/height of a track with no room in it (corridors pass through its centre).
-const MIN_TRACK: i32 = 5;
+/// Width/height of a track with no room in it (corridors pass through its
+/// centre). Public so the renderer can extrapolate the cell→tile scroll mapping
+/// beyond the ends of [`TilePlan::col_x`]/[`TilePlan::row_y`].
+pub const MIN_TRACK: i32 = 5;
 
 /// Working grid: tiles plus the corridor travel axis per tile (0 none, 1
 /// horizontal, 2 vertical) so a perpendicular re-stamp can detect a crossing.
@@ -286,7 +294,7 @@ fn shared_wall_side(
     cells: &BTreeMap<RoomId, (i32, i32)>,
     tracks: &Tracks,
 ) -> Option<Side> {
-    if c.merge || c.distorted {
+    if c.merge {
         return None;
     }
     let a = cells.get(&c.origin).copied()?;
@@ -449,7 +457,9 @@ fn realize_stub(
 
 /// S3: punch a door through the shared wall of two abutting rooms, at the midpoint
 /// of the floors' overlap span shifted by the connector's slot (the fan for
-/// multiple doors between one pair).
+/// multiple doors between one pair). Returns false — nothing punched — when the
+/// floors have no overlap span, so no straight doorway exists; the caller falls
+/// back to a stub pair.
 fn realize_shared_door(
     g: &mut Grid,
     c: &RoutedConnector,
@@ -457,7 +467,7 @@ fn realize_shared_door(
     side: Side,
     ba: &RoomBox,
     bb: &RoomBox,
-) {
+) -> bool {
     let kind = if c.reciprocal { DoorKind::TwoWay } else { DoorKind::OneWay(c.exit_dir) };
     let door = Tile::Door { conn, kind };
     match side {
@@ -466,7 +476,7 @@ fn realize_shared_door(
             let lo = (ba.y0 + 1).max(bb.y0 + 1);
             let hi = (ba.y1 - 1).min(bb.y1 - 1);
             if lo > hi {
-                return; // floors never overlap in y — no straight doorway exists
+                return false; // floors never overlap in y — no straight doorway exists
             }
             let want = (x, ((lo + hi) / 2 + slot_shift(c.exit_slot)).clamp(lo, hi));
             punch_door_along(g, want, false, (lo, hi), door);
@@ -476,12 +486,13 @@ fn realize_shared_door(
             let lo = (ba.x0 + 1).max(bb.x0 + 1);
             let hi = (ba.x1 - 1).min(bb.x1 - 1);
             if lo > hi {
-                return;
+                return false;
             }
             let want = (((lo + hi) / 2 + slot_shift(c.exit_slot)).clamp(lo, hi), y);
             punch_door_along(g, want, true, (lo, hi), door);
         }
     }
+    true
 }
 
 /// Map a doubled-coordinate vertical line (`x = k`) to its tile column: a room
@@ -527,6 +538,11 @@ fn map_y(k: i32, c: &RoutedConnector, t: &Tracks) -> i32 {
 /// track centres for room lines, gutter lane columns/rows for channels — and the
 /// first/last run carries its door's cross coordinate so the corridor leaves the
 /// wall exactly at the punched door.
+///
+/// Dry-runs the planned waypoints before stamping: when any tile between the two
+/// doors is a room `Floor`/`Wall` (the route would tunnel through a room) or a
+/// hop is non-orthogonal after the L-split, every write is undone and `false` is
+/// returned — the caller falls back to an honest stub pair.
 fn realize_corridor(
     g: &mut Grid,
     c: &RoutedConnector,
@@ -534,7 +550,7 @@ fn realize_corridor(
     ba: &RoomBox,
     bb: &RoomBox,
     tracks: &Tracks,
-) {
+) -> bool {
     let kind = if c.reciprocal { DoorKind::TwoWay } else { DoorKind::OneWay(c.exit_dir) };
     let door = Tile::Door { conn, kind };
     let exit_corner = is_diagonal(c.exit_dir).then_some(c.exit_dir);
@@ -543,8 +559,10 @@ fn realize_corridor(
     if want_a == want_b {
         // Diagonally-abutting boxes share the corner tile: the door IS the connection.
         punch_endpoint(g, ba, exit_corner, c.exit, c.exit_slot, door);
-        return;
+        return true;
     }
+    // Snapshot before punching: on a blocked route the doors must vanish again.
+    let saved = (g.tiles.clone(), g.axes.clone());
     let da = punch_endpoint(g, ba, exit_corner, c.exit, c.exit_slot, door);
     let db = punch_endpoint(g, bb, c.entry_corner, c.entry, c.entry_slot, door);
 
@@ -572,7 +590,8 @@ fn realize_corridor(
         }
     }
     if segs.is_empty() {
-        return;
+        (g.tiles, g.axes) = saved;
+        return false;
     }
     let n = segs.len();
     let lines: Vec<i32> = segs
@@ -611,11 +630,31 @@ fn realize_corridor(
         }
     }
     wps.push(db);
-    for w in wps.windows(2) {
+    // Dry-run: the corridor may share tiles with other corridors, doors, and
+    // bridges, but never tunnel through a room's floor or wall ring.
+    let blocked = wps.windows(2).any(|w| {
         let (a, b) = (w[0], w[1]);
         if a.0 != b.0 && a.1 != b.1 {
-            continue; // paranoia: never stamp a non-orthogonal hop
+            return true; // non-orthogonal hop survived the L-split
         }
+        let (dx, dy) = ((b.0 - a.0).signum(), (b.1 - a.1).signum());
+        let mut p = a;
+        loop {
+            if p != da && p != db && matches!(g.get(p.0, p.1), Tile::Floor { .. } | Tile::Wall) {
+                return true;
+            }
+            if p == b {
+                return false;
+            }
+            p = (p.0 + dx, p.1 + dy);
+        }
+    });
+    if blocked {
+        (g.tiles, g.axes) = saved;
+        return false;
+    }
+    for w in wps.windows(2) {
+        let (a, b) = (w[0], w[1]);
         let horiz = a.1 == b.1;
         let (dx, dy) = ((b.0 - a.0).signum(), (b.1 - a.1).signum());
         let mut p = a;
@@ -629,6 +668,7 @@ fn realize_corridor(
             p = (p.0 + dx, p.1 + dy);
         }
     }
+    true
 }
 
 /// S5: Up/Down land on the floor tile nearest the room's top-right/bottom-right
@@ -689,36 +729,6 @@ fn stamp_features(g: &mut Grid, sub: &MapGraph, boxes: &BTreeMap<RoomId, RoomBox
             FeatureKind::StairsUp | FeatureKind::StairsDown => stamp_stairs(g, bx, kind),
             FeatureKind::PortalIn | FeatureKind::PortalOut => stamp_portal(g, bx, kind),
         }
-    }
-}
-
-/// S4 paint pass: every Void 8-adjacent to corridor floor (or a door/bridge)
-/// becomes a wall, so corridors read as walled passages.
-fn paint_walls(g: &mut Grid) {
-    let mut to_wall: Vec<(i32, i32)> = Vec::new();
-    for y in 0..g.h {
-        for x in 0..g.w {
-            if !matches!(g.get(x, y), Tile::Void) {
-                continue;
-            }
-            'probe: for dy in -1..=1 {
-                for dx in -1..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    if matches!(
-                        g.get(x + dx, y + dy),
-                        Tile::Corridor { .. } | Tile::Door { .. } | Tile::Bridge { .. }
-                    ) {
-                        to_wall.push((x, y));
-                        break 'probe;
-                    }
-                }
-            }
-        }
-    }
-    for (x, y) in to_wall {
-        g.set(x, y, Tile::Wall);
     }
 }
 
@@ -844,7 +854,9 @@ pub fn realize_layer(graph: &MapGraph, layer: LayerId) -> TilePlan {
     }
 
     // S3/S4: one TileConn per routed connector; realize each as a shared-wall
-    // door, a walled corridor, or a stub pair (distorted fallback / merge).
+    // door or a corridor — distorted edges included, their polylines are just as
+    // drawable — with stubs only for merge connectors and routes that genuinely
+    // cannot be stamped.
     let conns: Vec<TileConn> = plan
         .connectors
         .iter()
@@ -860,26 +872,25 @@ pub fn realize_layer(graph: &MapGraph, layer: LayerId) -> TilePlan {
         let conn = ci as u16;
         let Some(&ba) = boxes.get(&c.origin) else { continue };
         let exit_corner = is_diagonal(c.exit_dir).then_some(c.exit_dir);
-        if c.merge || c.distorted {
+        let bb = if c.merge { None } else { boxes.get(&c.dest).copied() };
+        let Some(bb) = bb else {
+            // A merge stub (single-sided by design) or an unplaced destination.
             realize_stub(&mut g, &ba, exit_corner, c.exit, c.exit_slot, conn, c.exit_dir);
-            if !c.merge {
-                if let Some(&bb) = boxes.get(&c.dest) {
-                    let dir = c.entry_dir.unwrap_or_else(|| opposite(c.exit_dir));
-                    realize_stub(&mut g, &bb, c.entry_corner, c.entry, c.entry_slot, conn, dir);
-                }
-            }
             continue;
-        }
-        let Some(&bb) = boxes.get(&c.dest) else { continue };
-        if let Some(side) = shared_wall_side(c, &cells, &tracks) {
-            realize_shared_door(&mut g, c, conn, side, &ba, &bb);
-        } else {
-            realize_corridor(&mut g, c, conn, &ba, &bb, &tracks);
+        };
+        let realized = match shared_wall_side(c, &cells, &tracks) {
+            Some(side) => realize_shared_door(&mut g, c, conn, side, &ba, &bb),
+            None => realize_corridor(&mut g, c, conn, &ba, &bb, &tracks),
+        };
+        if !realized {
+            // No stampable route — an honest stub pair on both rooms instead.
+            realize_stub(&mut g, &ba, exit_corner, c.exit, c.exit_slot, conn, c.exit_dir);
+            let dir = c.entry_dir.unwrap_or_else(|| opposite(c.exit_dir));
+            realize_stub(&mut g, &bb, c.entry_corner, c.entry, c.entry_slot, conn, dir);
         }
     }
 
     stamp_features(&mut g, &sub, &boxes);
-    paint_walls(&mut g);
 
     let rooms: Vec<TileRoom> = boxes
         .values()
@@ -899,7 +910,9 @@ pub fn realize_layer(graph: &MapGraph, layer: LayerId) -> TilePlan {
             },
         })
         .collect();
-    TilePlan { w: w as usize, h: h as usize, tiles: g.tiles, rooms, conns }
+    let col_x: Vec<(i32, i32)> = tracks.x_track.iter().map(|(&c, &x)| (c, x)).collect();
+    let row_y: Vec<(i32, i32)> = tracks.y_track.iter().map(|(&r, &y)| (r, y)).collect();
+    TilePlan { w: w as usize, h: h as usize, tiles: g.tiles, rooms, conns, col_x, row_y }
 }
 
 #[cfg(test)]
@@ -1034,8 +1047,37 @@ mod tests {
         }
     }
 
+    /// True when `from` reaches `to` walking 4-adjacent Corridor/Door/Bridge tiles.
+    fn doors_connected(p: &TilePlan, from: (usize, usize), to: (usize, usize)) -> bool {
+        let passable = |x: usize, y: usize| {
+            matches!(p.get(x, y), Tile::Corridor { .. } | Tile::Door { .. } | Tile::Bridge { .. })
+        };
+        let mut seen = vec![false; p.w * p.h];
+        let mut stack = vec![from];
+        seen[from.1 * p.w + from.0] = true;
+        while let Some((x, y)) = stack.pop() {
+            if (x, y) == to {
+                return true;
+            }
+            let mut probe: Vec<(usize, usize)> = vec![(x + 1, y), (x, y + 1)];
+            if x > 0 {
+                probe.push((x - 1, y));
+            }
+            if y > 0 {
+                probe.push((x, y - 1));
+            }
+            for (nx, ny) in probe {
+                if nx < p.w && ny < p.h && !seen[ny * p.w + nx] && passable(nx, ny) {
+                    seen[ny * p.w + nx] = true;
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        false
+    }
+
     #[test]
-    fn distant_rooms_get_a_walled_corridor_with_doors_at_both_ends() {
+    fn distant_rooms_get_a_connected_corridor_with_doors_at_both_ends() {
         let mut g = MapGraph::new();
         grid_room(&mut g, 1, (0, 0));
         grid_room(&mut g, 2, (2, 0));
@@ -1046,21 +1088,120 @@ mod tests {
             .filter(|&(x, y)| matches!(p.get(x, y), Tile::Corridor { .. }))
             .collect();
         assert!(!corridor.is_empty(), "two columns apart → corridor tiles exist");
-        assert_eq!(door_tiles(&p).len(), 2, "a door on each room's wall");
-        // The paint pass walls the corridor in: no corridor tile touches bare Void.
-        for &(x, y) in &corridor {
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                    assert!(nx >= 0 && ny >= 0 && (nx as usize) < p.w && (ny as usize) < p.h);
-                    assert_ne!(
-                        p.get(nx as usize, ny as usize),
-                        Tile::Void,
-                        "corridor at ({x},{y}) leaks into void at ({nx},{ny})"
-                    );
+        let doors = door_tiles(&p);
+        assert_eq!(doors.len(), 2, "a door on each room's wall");
+        // The corridor is a connected orthogonal path from door to door.
+        let (a, b) = ((doors[0].0, doors[0].1), (doors[1].0, doors[1].1));
+        assert!(doors_connected(&p, a, b), "doors {a:?} and {b:?} are not connected");
+        // Corridors are line-art now: no Wall tiles stamped in the gutter — every
+        // Wall belongs to some room's structural ring.
+        let in_a_room = |x: usize, y: usize| {
+            p.rooms.iter().any(|r| {
+                x >= r.bounds.x && x <= r.bounds.right() && y >= r.bounds.y && y <= r.bounds.bottom()
+            })
+        };
+        for y in 0..p.h {
+            for x in 0..p.w {
+                if p.get(x, y) == Tile::Wall {
+                    assert!(in_a_room(x, y), "stray Wall at ({x},{y}) outside every room box");
                 }
             }
         }
+    }
+
+    #[test]
+    fn distorted_edge_between_placed_rooms_is_a_real_connection_not_stubs() {
+        // A layout-level distorted edge (wrong-side geometry: the edge says N but
+        // the destination sits two columns east) still gets a routed polyline —
+        // it must realize as a real corridor with plain doors, not a stub pair.
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (2, 0));
+        g.add_edge(1, Direction::N, 2);
+        let idx = g.connections().iter().position(|c| c.origin == 1).unwrap();
+        g.set_conn_distorted(idx, true);
+        let p = realize_layer(&g, MAIN_LAYER);
+        assert!(p.conns.iter().any(|c| c.distorted), "the edge stays flagged distorted");
+        let doors = door_tiles(&p);
+        assert!(!doors.is_empty(), "distorted edge still gets doors");
+        assert!(
+            doors.iter().all(|&(_, _, _, k)| !matches!(k, DoorKind::Stub(_))),
+            "distorted edge must not degrade to stubs: {doors:?}"
+        );
+        let (a, b) = ((doors[0].0, doors[0].1), (doors[1].0, doors[1].1));
+        assert!(doors_connected(&p, a, b), "distorted edge's doors must be connected");
+    }
+
+    #[test]
+    fn corridor_dry_run_refuses_to_tunnel_through_a_room() {
+        // The lane router avoids occupied cells, so a genuinely blocked route is
+        // hard to force through the public API — drive `realize_corridor`'s
+        // dry-run directly: a third room's box sits squarely on the straight line
+        // between the two doors. It must refuse, undoing every write (the caller
+        // then emits the stub pair).
+        let mut g = Grid::new(40, 11);
+        let ba = RoomBox { id: 1, x0: 0, y0: 2, x1: 6, y1: 8 };
+        let bb = RoomBox { id: 2, x0: 30, y0: 2, x1: 36, y1: 8 };
+        let bc = RoomBox { id: 3, x0: 14, y0: 2, x1: 22, y1: 8 };
+        for bx in [&ba, &bb, &bc] {
+            for y in bx.y0..=bx.y1 {
+                for x in bx.x0..=bx.x1 {
+                    let edge = x == bx.x0 || x == bx.x1 || y == bx.y0 || y == bx.y1;
+                    let t = if edge { Tile::Wall } else { Tile::Floor { room: bx.id } };
+                    g.set(x, y, t);
+                }
+            }
+        }
+        let c = RoutedConnector {
+            origin: 1,
+            dest: 2,
+            distorted: true,
+            exit: Side::Right,
+            entry: Side::Left,
+            points: vec![(0, 0), (2, 0), (4, 0)], // straight E run in doubled coords
+            segs: vec![],
+            exit_slot: 0,
+            entry_slot: 0,
+            reciprocal: true,
+            exit_dir: Direction::E,
+            entry_dir: Some(Direction::W),
+            entry_corner: None,
+            merge: false,
+            secondary_exit: vec![],
+            secondary_entry: vec![],
+        };
+        let tracks = Tracks {
+            x_track: BTreeMap::new(),
+            col_w: BTreeMap::new(),
+            gutter_x: BTreeMap::new(),
+            y_track: BTreeMap::new(),
+            row_h: BTreeMap::new(),
+            gutter_y: BTreeMap::new(),
+        };
+        let before = g.tiles.clone();
+        assert!(
+            !realize_corridor(&mut g, &c, 0, &ba, &bb, &tracks),
+            "a route through room 3's box must be refused"
+        );
+        assert_eq!(g.tiles, before, "a refused corridor must leave the grid untouched");
+    }
+
+    #[test]
+    fn merge_connector_keeps_its_single_sided_stub() {
+        // An extra edge between an already-connected pair collapses into a merge
+        // stub: a Stub door on the origin only, no second line to the destination.
+        let mut g = MapGraph::new();
+        grid_room(&mut g, 1, (0, 0));
+        grid_room(&mut g, 2, (2, 0));
+        g.add_edge(1, Direction::E, 2);
+        g.add_edge(2, Direction::W, 1);
+        g.add_edge(1, Direction::SE, 2);
+        let p = realize_layer(&g, MAIN_LAYER);
+        let stubs: Vec<_> = door_tiles(&p)
+            .into_iter()
+            .filter(|&(_, _, _, k)| matches!(k, DoorKind::Stub(_)))
+            .collect();
+        assert_eq!(stubs.len(), 1, "one merge edge → exactly one single-sided stub: {stubs:?}");
     }
 
     #[test]
@@ -1136,6 +1277,17 @@ mod tests {
                 }),
             };
             assert!(ok, "connection {c:?} has no door, corridor, stub, or feature");
+        }
+        // Distorted edges are real connections now: routed like any other, so in
+        // this graph (no blocked routes) none of their doors may be stubs.
+        for &(_, _, conn, kind) in &doors {
+            if p.conns[conn as usize].distorted {
+                assert!(
+                    !matches!(kind, DoorKind::Stub(_)),
+                    "distorted edge {:?} degraded to a stub",
+                    p.conns[conn as usize]
+                );
+            }
         }
     }
 

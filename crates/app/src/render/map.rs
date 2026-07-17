@@ -831,10 +831,10 @@ fn draw_tidy_progress(
 
 /// Direction bits a connector enters/leaves a cell on. Two perpendicular bits → a turn;
 /// all four (from two crossing connectors) → `┼`.
-const DIR_N: u8 = 1;
-const DIR_E: u8 = 2;
-const DIR_S: u8 = 4;
-const DIR_W: u8 = 8;
+pub(crate) const DIR_N: u8 = 1;
+pub(crate) const DIR_E: u8 = 2;
+pub(crate) const DIR_S: u8 = 4;
+pub(crate) const DIR_W: u8 = 8;
 
 /// The cell-edge midpoints a chain glyph reaches, as direction bits — `None` for a glyph
 /// `diagonal_chain` never emits.
@@ -855,8 +855,9 @@ fn chain_glyph_bits(ch: char, path: &crate::symbols::PathGlyphs) -> Option<u8> {
     })
 }
 
-/// Box-drawing glyph for a set of direction bits.
-fn glyph_for(mask: u8, path: &crate::symbols::PathGlyphs) -> Option<char> {
+/// Box-drawing glyph for a set of direction bits. Shared with the tile-map
+/// rasterizer, which resolves corridor line-art through the same table.
+pub(crate) fn glyph_for(mask: u8, path: &crate::symbols::PathGlyphs) -> Option<char> {
     Some(match mask {
         m if m == DIR_E | DIR_W => path.ew,
         m if m == DIR_N | DIR_S => path.ns,
