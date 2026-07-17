@@ -1564,9 +1564,17 @@ mod tests {
     ///
     /// Positions may still shift when tracks resize or gutters open — the goal
     /// is catching gross reshuffles, not pinning exact coordinates.
+    ///
+    /// The VECTOR pipeline (`vector::realize_layer_vector`) is driven on the
+    /// same walk with LOOSER assertions — no panic, per-observation
+    /// determinism, full room coverage, and a door tile for every realized
+    /// connection. Its continuous solver legitimately re-flows geometry as
+    /// the map grows, so the tile-space size/order stability checks stay
+    /// exclusive to the classic realization.
     #[test]
     fn exploration_walk_keeps_tile_plans_stable() {
         use crate::mapper::Mapper;
+        use crate::vector::realize_layer_vector;
         use Direction::{Down, Up, E, N, NE, S, SW, W};
         let walk: &[(RoomId, &str, Option<Direction>)] = &[
             (1, "West of House", None),
@@ -1663,6 +1671,33 @@ mod tests {
                 assert!(
                     plan.rooms.iter().any(|r| r.id == rid),
                     "placed room {rid} missing from the tile plan after entering {name}"
+                );
+            }
+            // Vector pipeline: determinism + coverage (geometry may re-flow).
+            let vscale = crate::vector::VECTOR_SCALE_BOXES;
+            let vplan = realize_layer_vector(&m.graph, MAIN_LAYER, vscale);
+            assert_eq!(
+                vplan,
+                realize_layer_vector(&m.graph, MAIN_LAYER, vscale),
+                "vector realization must be deterministic after entering {name}"
+            );
+            assert_eq!(
+                vplan.rooms.len(),
+                cells.len(),
+                "vector plan must keep every placed room after entering {name}"
+            );
+            let door_conns: BTreeSet<u16> = vplan
+                .tiles
+                .iter()
+                .filter_map(|t| match t {
+                    Tile::Door { conn, .. } => Some(*conn),
+                    _ => None,
+                })
+                .collect();
+            for (ci, c) in vplan.conns.iter().enumerate() {
+                assert!(
+                    door_conns.contains(&(ci as u16)),
+                    "vector conn {ci} ({c:?}) lost its door after entering {name}"
                 );
             }
             if let Some((pp, pc, pn, px)) = &prev {

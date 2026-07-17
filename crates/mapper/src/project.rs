@@ -547,6 +547,36 @@ fn realize_path(
     }
 }
 
+/// Stamp one chamber polygon's edges (including the closing edge) as
+/// `Wall { kind: Path }` tiles, sampling each scaled segment at one step per
+/// tile of its longer axis. Only Void is claimed, so rooms, corridors, doors,
+/// and painted passage walls all survive. Deterministic.
+fn stamp_chamber(g: &mut Grid, poly: &[Vec2], s: f32, off: (i32, i32)) {
+    if poly.len() < 2 {
+        return;
+    }
+    let pts: Vec<(i32, i32)> = poly
+        .iter()
+        .map(|&p| {
+            let (x, y) = proj(p, s);
+            (x + off.0, y + off.1)
+        })
+        .collect();
+    for k in 0..pts.len() {
+        let a = pts[k];
+        let b = pts[(k + 1) % pts.len()];
+        let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for t in 0..=steps {
+            let f = t as f32 / steps as f32;
+            let x = (a.0 as f32 + (b.0 - a.0) as f32 * f).round() as i32;
+            let y = (a.1 as f32 + (b.1 - a.1) as f32 * f).round() as i32;
+            if matches!(g.get(x, y), Tile::Void) {
+                g.set(x, y, Tile::Wall { kind: WallKind::Path });
+            }
+        }
+    }
+}
+
 /// Project the continuous model onto a [`TilePlan`] at `scale` chars per model
 /// unit vertically (and `2 * scale` horizontally, correcting terminal cell
 /// aspect). `graph_cells` supplies each room's logical layout cell purely for
@@ -557,6 +587,20 @@ fn realize_path(
 /// same model and cells always yield the identical plan; rooms are never
 /// dropped and no input can panic the projection.
 pub fn project(model: &MapModel, graph_cells: &BTreeMap<RoomId, (i32, i32)>, scale: f32) -> TilePlan {
+    project_with_chambers(model, graph_cells, scale, &[])
+}
+
+/// [`project`] plus maze chamber outlines: each polygon (global model coords,
+/// closed implicitly) is stamped after the passage paint pass as
+/// `Wall { kind: Path }` tiles along its scaled edges, claiming only Void —
+/// member rooms, corridors, and doors are never overwritten. The polygons also
+/// participate in the bounds fold so an outline always fits the plan.
+pub fn project_with_chambers(
+    model: &MapModel,
+    graph_cells: &BTreeMap<RoomId, (i32, i32)>,
+    scale: f32,
+    chambers: &[Vec<Vec2>],
+) -> TilePlan {
     if model.rooms.is_empty() {
         return TilePlan::default();
     }
@@ -593,6 +637,12 @@ pub fn project(model: &MapModel, graph_cells: &BTreeMap<RoomId, (i32, i32)>, sca
     }
     for p in &model.paths {
         for &q in &p.points {
+            let (x, y) = proj(q, s);
+            fold(x, y);
+        }
+    }
+    for poly in chambers {
+        for &q in poly {
             let (x, y) = proj(q, s);
             fold(x, y);
         }
@@ -666,6 +716,11 @@ pub fn project(model: &MapModel, graph_cells: &BTreeMap<RoomId, (i32, i32)>, sca
         }
     }
     paint_path_walls(g.w, g.h, &mut g.tiles);
+
+    // ── maze chamber outlines: Path-kind walls along each scaled polygon ──
+    for poly in chambers {
+        stamp_chamber(&mut g, poly, s, off);
+    }
 
     // ── plan assembly ──
     let out_rooms: Vec<TileRoom> = boxes

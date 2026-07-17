@@ -619,8 +619,9 @@ fn stairwell_coherence(
 
 /// Feature anchor inside/on the room rect, mirroring `tiles::stamp_features`
 /// placement: stairs sit in the top-right (up) / bottom-right (down) interior,
-/// portals sit on the right wall (in above center, out below).
-fn feature_anchor(kind: FeatureKind, center: Vec2, half: Vec2) -> Vec2 {
+/// portals sit on the right wall (in above center, out below). Shared with the
+/// vector orchestrator, which re-anchors cross-district features.
+pub(crate) fn feature_anchor(kind: FeatureKind, center: Vec2, half: Vec2) -> Vec2 {
     let (cx, cy) = center;
     let (hx, hy) = half;
     match kind {

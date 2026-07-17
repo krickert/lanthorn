@@ -1,9 +1,11 @@
 //! Headless tile-map dump: read a babelmap map-dump file (`/map-dump` format),
-//! realize one layer through `mapper::tiles::realize_layer`, rasterize it with
-//! the real tile renderer into an offscreen buffer, and print the frame. The
-//! visual iteration tool for the tile-map spike.
+//! realize one layer through the vector pipeline
+//! (`mapper::vector::realize_layer_vector`), rasterize it with the real tile
+//! renderer into an offscreen buffer, and print the frame. The visual
+//! iteration tool for the tile-map spike.
 //!
-//! Usage: `cargo run -p app --example tiles_dump -- map.txt 0`
+//! Usage: `cargo run -p app --example tiles_dump -- map.txt 0 [scale]`
+//! (`scale` = chars per model unit, default `VECTOR_SCALE_BOXES`)
 //!
 //! Only `ROOM <id> "<name>" pos=<x>,<y> … [layer=N]` and
 //! `EDGE <origin> <DIR> <dest> [distorted]` lines are read; everything else
@@ -14,7 +16,7 @@ use app::state::AppState;
 use mapper::direction::{parse_direction, Direction};
 use mapper::graph::{MapGraph, RoomId};
 use mapper::layer::LayerId;
-use mapper::tiles::realize_layer;
+use mapper::vector::{realize_layer_vector, VECTOR_SCALE_BOXES};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -57,10 +59,12 @@ fn parse_edge(line: &str) -> Option<(RoomId, Direction, RoomId, bool)> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: tiles_dump <map-dump.txt> [layer]");
+        eprintln!("usage: tiles_dump <map-dump.txt> [layer] [scale]");
         std::process::exit(2);
     };
     let layer: LayerId = args.next().map_or(0, |s| s.parse().expect("layer must be a number"));
+    let scale: f32 =
+        args.next().map_or(VECTOR_SCALE_BOXES, |s| s.parse().expect("scale must be a number"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         eprintln!("tiles_dump: {path}: {e}");
         std::process::exit(2);
@@ -93,7 +97,7 @@ fn main() {
     }
 
     let t0 = std::time::Instant::now();
-    let plan = realize_layer(&graph, layer);
+    let plan = realize_layer_vector(&graph, layer, scale);
     let elapsed = t0.elapsed();
     if plan.w == 0 || plan.h == 0 {
         println!("(layer {layer}: empty plan)");

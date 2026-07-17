@@ -290,3 +290,17 @@ themeable rasterizer in `app/render/tilemap.rs`, and a per-observation
 stability regression test. Maze/overlapping-path handling, outdoor/cave
 theming, and motion polish remain design-only — see § "Maze /
 overlapping-paths plan" in `docs/superpowers/plans/2026-07-17-tile-map-spike.md`.
+
+**Vector pipeline live (2026-07-17, V4):** tiles mode now realizes through the
+vector-first pipeline (`mapper::vector::realize_layer_vector`): district
+partition → per-district continuous room build with 2.5D levels → polyline
+routing with door fans, obstacle avoidance, and seeded meander → global
+composition → cross-district dashed stair links → char-grid projection with
+diagonal corridors and maze chamber outlines (stamped as Path walls). The
+tile-space `mapper::tiles::realize_layer` construction is kept (tests + the
+tag `tile-space-meander` preserve that lineage) but the background render job
+and the `tiles_dump` example both drive the vector path; scale comes from
+`vector::VECTOR_SCALE_BOXES`. Parallel-path offsetting (`vroute::
+offset_parallel`) is not yet applied — it moves door endpoints; re-anchoring
+is a follow-up — and maze districts still render member rooms inside their
+chamber outline (boundary-doors-only abstraction is a later zoom feature).

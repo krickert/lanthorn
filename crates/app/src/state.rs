@@ -2308,7 +2308,13 @@ impl AppState {
             let rm = mapper::render::render_layer_traced(&g, layer, &mut push);
             let plan = wants_tiles.then(|| {
                 push("tile plan");
-                mapper::tiles::realize_layer(&g, layer)
+                // Vector-first pipeline; tiles are only wanted at Boxes zoom,
+                // so the Boxes scale constant is the right one.
+                mapper::vector::realize_layer_vector(
+                    &g,
+                    layer,
+                    mapper::vector::VECTOR_SCALE_BOXES,
+                )
             });
             (rm, plan)
         });

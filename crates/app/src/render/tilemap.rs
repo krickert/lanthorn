@@ -222,9 +222,17 @@ pub fn render_tile_map(
                     // table, junctioning with other path walls and running into
                     // room walls and door openings — but only where a neighbor
                     // bounds the SAME passage (see path_walls_linked).
-                    let m = neighbor_mask(plan, tx, ty, |nx, ny| {
+                    let mut m = neighbor_mask(plan, tx, ty, |nx, ny| {
                         in_path_run(plan, nx, ny) && path_walls_linked(plan, (tx, ty), (nx, ny))
                     });
+                    if m == 0 {
+                        // No passage neighbor at all: a maze chamber outline
+                        // (vector pipeline). Join it with its fellow path
+                        // walls so the boundary draws as continuous line art.
+                        m = neighbor_mask(plan, tx, ty, |nx, ny| {
+                            matches!(plan.get(nx, ny), Tile::Wall { kind: WallKind::Path })
+                        });
+                    }
                     let ch = glyph_for(m, &state.symbols.path).unwrap_or(state.symbols.path.ew);
                     (ch, cs.tile_corridor)
                 }
