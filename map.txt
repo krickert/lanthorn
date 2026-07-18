@@ -1,0 +1,394 @@
+# babelmap map dump
+# rooms: 54, edges: 139, current: #140
+#
+# === ROOMS (id  name  pos  notes) ===
+ROOM 5 "Up a Tree" pos=-2,0 align=none
+ROOM 16 "Round Room" pos=0,-1 align=row[16,26,109,133,136,192,213] col[16,55,112,183,237] layer=1
+ROOM 20 "Maze" pos=0,0 align=row[20,57] dropped=[20→S→109] layer=3
+ROOM 22 "Rocky Ledge" pos=5,4 align=none
+ROOM 23 "Canyon View" pos=4,3 align=none dropped=[23→E→22, 23→W→230]
+ROOM 26 "Damp Cave" pos=2,-1 align=row[16,26,109,133,136,192,213] layer=1
+ROOM 28 "Kitchen" pos=0,3 align=row[28,79,89,134]
+ROOM 33 "Forest" pos=3,1 align=row[33,91,175,247] col[33,134,230]
+ROOM 34 "Cellar" pos=-3,1 align=col[34,133,258] layer=1
+ROOM 53 "Maze" pos=1,2 align=none dropped=[53→NE→165] layer=3
+ROOM 55 "Mirror Room" pos=0,1 align=col[16,55,112,183,237] dropped=[55→W→152, 55→E→184] layer=1
+ROOM 57 "Maze" pos=1,0 align=row[20,57] dropped=[57→N→201] layer=3
+ROOM 68 "West of House" pos=-2,3 align=none dropped=[68→W→91]
+ROOM 71 "Stream View" pos=0,-4 align=row[71,129,186] layer=1
+ROOM 78 "Canyon Bottom" pos=5,5 align=none dropped=[78→N→131]
+ROOM 79 "Living Room" pos=-1,3 align=row[28,79,89,134]
+ROOM 89 "Behind House" pos=2,3 align=row[28,79,89,134] dropped=[89→N→143, 89→S→217]
+ROOM 91 "Forest" pos=-4,1 align=row[33,91,175,247] dropped=[91→S→230, 91→N→167]
+ROOM 109 "Maze" pos=3,-2 align=row[16,26,109,133,136,192,213] dropped=[109→E→133, 109→S→20, 109→W→201] layer=3
+ROOM 112 "Chasm" pos=0,-3 align=col[16,55,112,183,237] layer=1
+ROOM 117 "Dam Base" pos=3,-3 align=none dropped=[117→N→186] layer=1
+ROOM 126 "Dam Lobby" pos=2,-5 align=col[126,186] dropped=[126→N→233, 126→E→233] layer=1
+ROOM 128 "Gallery" pos=-2,3 align=row[128,258] col[128,229] layer=1
+ROOM 129 "Reservoir South" pos=1,-4 align=row[71,129,186] layer=1
+ROOM 131 "End of Rainbow" pos=6,4 align=none
+ROOM 133 "The Troll Room" pos=-3,-1 align=row[16,26,109,133,136,192,213] col[34,133,258] dropped=[133→W→109] layer=1
+ROOM 134 "Clearing" pos=3,3 align=row[28,79,89,134] col[33,134,230]
+ROOM 136 "East-West Passage" pos=-2,-1 align=row[16,26,109,133,136,192,213] layer=1
+ROOM 140 "Maze" pos=-1,1 align=row[140,165] layer=3
+ROOM 143 "North of House" pos=1,2 align=col[143,167,247] dropped=[143→E→89, 143→W→68]
+ROOM 148 "Dead End" pos=1,-1 align=row[148,227] layer=3
+ROOM 152 "Winding Passage" pos=-1,2 align=row[152,184] dropped=[152→N→55] layer=1
+ROOM 154 "Dead End" pos=2,-3 align=none layer=3
+ROOM 165 "Maze" pos=0,1 align=row[140,165] dropped=[165→E→53] layer=3
+ROOM 167 "Clearing" pos=1,0 align=col[143,167,247] dropped=[167→W→91, 167→E→33]
+ROOM 170 "Deep Canyon" pos=1,-3 align=none dropped=[170→E→186] layer=1
+ROOM 174 "White Cliffs Beach" pos=3,0 align=col[174,192] layer=1
+ROOM 175 "Forest" pos=6,1 align=row[33,91,175,247] dropped=[175→N→33, 175→S→33]
+ROOM 178 "Maze" pos=0,2 align=none dropped=[178→S→165] layer=3
+ROOM 183 "North-South Passage" pos=0,-2 align=col[16,55,112,183,237] layer=1
+ROOM 184 "Cave" pos=4,2 align=row[152,184] dropped=[184→N→55] layer=1
+ROOM 186 "Dam" pos=2,-4 align=row[71,129,186] col[126,186] dropped=[186→E→117, 186→S→170] layer=1
+ROOM 192 "White Cliffs Beach" pos=3,-1 align=row[16,26,109,133,136,192,213] col[174,192] layer=1
+ROOM 195 "Attic" pos=0,2 align=none
+ROOM 201 "Maze" pos=2,-1 align=none dropped=[201→N→109, 201→W→57, 201→E→154] layer=3
+ROOM 213 "Loud Room" pos=1,-1 align=row[16,26,109,133,136,192,213] layer=1
+ROOM 217 "South of House" pos=1,4 align=none dropped=[217→S→230, 217→E→89]
+ROOM 227 "Maze" pos=0,-1 align=row[148,227] dropped=[227→N→57] layer=3
+ROOM 229 "Studio" pos=-2,2 align=col[128,229] layer=1
+ROOM 230 "Forest" pos=3,5 align=col[33,134,230] dropped=[230→W→91]
+ROOM 233 "Maintenance Room" pos=1,-6 align=none dropped=[233→W→126, 233→S→126] layer=1
+ROOM 237 "Narrow Passage" pos=0,0 align=col[16,55,112,183,237] layer=1
+ROOM 247 "Forest Path" pos=1,1 align=row[33,91,175,247] col[143,167,247]
+ROOM 258 "East of Chasm" pos=-3,3 align=row[128,258] col[34,133,258] layer=1
+#
+# === EDGES (origin DIR dest) ===
+EDGE 68 NE 143
+EDGE 143 SE 89
+EDGE 89 SW 217
+EDGE 217 NE 89
+EDGE 217 NW 68
+EDGE 68 SE 217
+EDGE 89 NW 143
+EDGE 143 SW 68
+EDGE 89 E 134
+EDGE 134 E 23
+EDGE 23 D 22
+EDGE 22 D 78
+EDGE 78 N 131  distorted
+EDGE 131 SW 78
+EDGE 78 U 22
+EDGE 22 U 23
+EDGE 23 E 22  distorted
+EDGE 23 W 230  distorted
+EDGE 230 W 91  distorted
+EDGE 91 S 230  distorted
+EDGE 91 E 247
+EDGE 247 E 33
+EDGE 33 E 175
+EDGE 175 W 33
+EDGE 33 W 247
+EDGE 247 W 91
+EDGE 230 N 134
+EDGE 134 S 230
+EDGE 91 N 167  distorted
+EDGE 167 W 91  distorted
+EDGE 134 N 33
+EDGE 33 S 134
+EDGE 167 S 247
+EDGE 247 S 143
+EDGE 143 N 247
+EDGE 143 E 89  distorted
+EDGE 89 N 143  distorted
+EDGE 89 W 28
+EDGE 28 W 79
+EDGE 79 E 28
+EDGE 28 E 89
+EDGE 89 S 217  distorted
+EDGE 217 S 230  distorted
+EDGE 134 W 89
+EDGE 217 E 89  distorted
+EDGE 247 U 5
+EDGE 5 D 247
+EDGE 247 N 167
+EDGE 143 W 68  distorted
+EDGE 68 W 91  distorted
+EDGE 28 U 195
+EDGE 195 D 28
+EDGE 28 OUT 89
+EDGE 89 IN 28
+EDGE 79 D 34
+EDGE 34 S 258
+EDGE 258 E 128
+EDGE 128 W 258
+EDGE 258 N 34
+EDGE 34 N 133
+EDGE 175 N 33  distorted
+EDGE 175 S 33  distorted
+EDGE 167 E 33  distorted
+EDGE 128 N 229
+EDGE 229 S 128
+EDGE 229 U 28
+EDGE 133 W 109  distorted
+EDGE 109 E 133  distorted
+EDGE 133 E 136
+EDGE 136 E 16
+EDGE 16 W 136
+EDGE 136 W 133
+EDGE 109 S 20  distorted
+EDGE 20 E 57
+EDGE 57 W 20
+EDGE 20 S 109  distorted
+EDGE 109 W 201  distorted
+EDGE 201 N 109  distorted
+EDGE 201 W 57  distorted
+EDGE 57 N 201  distorted
+EDGE 201 E 154  distorted
+EDGE 154 S 201
+EDGE 16 N 183
+EDGE 183 N 112
+EDGE 112 S 183
+EDGE 183 S 16
+EDGE 183 NE 170
+EDGE 170 E 186  distorted
+EDGE 186 W 129
+EDGE 129 W 71
+EDGE 71 E 129
+EDGE 129 E 186
+EDGE 129 SW 112
+EDGE 112 NE 129
+EDGE 186 N 126
+EDGE 126 N 233  distorted
+EDGE 233 W 126  distorted
+EDGE 233 S 126  distorted
+EDGE 126 E 233  distorted
+EDGE 126 S 186
+EDGE 186 E 117  distorted
+EDGE 117 N 186  distorted
+EDGE 186 S 170  distorted
+EDGE 170 SW 183
+EDGE 16 E 213
+EDGE 16 S 237
+EDGE 237 S 55
+EDGE 55 W 152  distorted
+EDGE 152 E 184
+EDGE 184 W 152
+EDGE 184 N 55  distorted
+EDGE 55 N 237
+EDGE 55 E 184  distorted
+EDGE 152 N 55  distorted
+EDGE 237 N 16
+EDGE 26 E 192
+EDGE 192 S 174
+EDGE 174 N 192
+EDGE 192 W 26
+EDGE 57 U 227
+EDGE 227 E 148
+EDGE 148 W 227
+EDGE 227 N 57  distorted
+EDGE 20 D 201
+EDGE 133 S 34
+EDGE 227 SW 140
+EDGE 140 D 227
+EDGE 140 E 165
+EDGE 165 S 178
+EDGE 178 S 165  distorted
+EDGE 165 E 53  distorted
+EDGE 109 ? 16
+EDGE 213 W 16
+EDGE 213 E 26
+EDGE 26 W 213
+EDGE 213 U 170
+EDGE 170 D 213
+EDGE 53 NE 165  distorted
+EDGE 165 W 140
+#
+# === PORTALS (origin glyph #target name) ===
+PORTAL 23 ↓ #22 Rocky Ledge
+PORTAL 22 ↓ #78 Canyon Bottom
+PORTAL 78 ↑ #22 Rocky Ledge
+PORTAL 22 ↑ #23 Canyon View
+PORTAL 247 ↑ #5 Up a Tree
+PORTAL 5 ↓ #247 Forest Path
+PORTAL 28 ↑ #195 Attic
+PORTAL 195 ↓ #28 Kitchen
+PORTAL 28 ⊗ #89 Behind House
+PORTAL 89 ⊙ #28 Kitchen
+PORTAL 79 ↓ #34 Cellar
+PORTAL 229 ↑ #28 Kitchen
+PORTAL 57 ↑ #227 Maze
+PORTAL 20 ↓ #201 Maze
+PORTAL 140 ↓ #227 Maze
+PORTAL 109 ? #16 Round Room
+PORTAL 213 ↑ #170 Deep Canyon
+PORTAL 170 ↓ #213 Loud Room
+#
+# === MAP (#id = room, lines = connectors, ▶◀▲▼ = exits) ===
+# --- layer 0 (Main) ---
+                                                    ╭─────────╮                              ╭─────────╮
+                                                    │Up a Tree│                              │Clearing │
+                                                    │         │                            ┌─◀         ▶─────────────────────┐
+                                                    │   #5    │                            │ │  #167   │                     │
+                                                    ╰────↓────╯                            │ ╰────▼────╯                     │
+                                                         ┊                                 │      │                          │
+                               ┌─────────────────────────┊─────────────────────────────────┘      │                          │                                ┌───────┐
+                               │                         ┊                                        │                          │                                │       │
+                               │                         └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐│                          │                                │       │
+                          ╭────▲────╮                                                        ╭───↑▲────╮                ╭─────────╮                           │  ╭────▲────╮
+                          │ Forest  │                                                        │ Forest  │                │ Forest  │                           │  │ Forest  │
+                          │         ▶────────────────────────────────────────────────────────◀  Path   ▶────────────────◀         ▶───────────────────────────┴─┬◀         │
+                          │   #91   │─┐                                                      │  #247   │                │   #33   │                             ││  #175   │
+                          ╰────▼────╯ │                                                      ╰────▼────╯                ╰────▼────╯                             │╰────▼────╯
+                               │      │                                                           │                          │                                  │     │
+                               │      │                                                           │                          │                                  └─────┘
+                               │      │                                        ╭─────────╮   ╭────▲────╮                     │
+                               │      │                                        │  Attic  │   │North of │                     │
+                               │      │                                        │         │ ┌─◀  House  │                     │
+                               │      │                                        │  #195   │ │ │  #143   ▶                     │
+                               │      │                                        ╰────↓────╯ │🮣↙─────────↘🮢                    │
+                               │      │                                             ┊      ├🮠           🮡🮢                   │
+                               │      └────────────┐            ┌───────────────────┊──────┘             🮡🮢                  │
+                               │                   │           🮣🮠                   ┊                     🮡🮢                 │
+                               │                   │╭─────────↗🮠  ╔═════════╗  ╭────↑────╮                 ↖▲────────╮  ╭────▲────╮  ╭─────────╮
+                               │                   ││ West of │   ║ Living  ║  │ Kitchen │                 │ Behind  │  │Clearing │  │ Canyon  │
+                               │                   └◀  House  │   ║  Room   ▶──◀        ⊗▶─────────────────◀⊙ House  ▶──◀         ▶──│  View   ▶───────┐
+                               │                    │   #68   │   ║  ↓#79   ║  │   #28   │                 │   #89   │  │  #134   │ ┌◀   #23   │       │
+                               │                    ╰─────────↘🮢  ╚═════════╝  ╰─────────╯                🮣↙▼────────╯  ╰────▼────╯ │╰────↓────╯       │
+                               │                               🮡🮢                                        🮣🮠                  │      │     ┊            │
+                               │                                └──────────────────────────┐            🮣🮠                   │      │     └┄┄┄┄┄┄┄┄┄┄┄┐│
+                               │                                                           🮡🮢          🮣🮠                    │      │                 ┊│
+                               │                                                            🮡↖─────────↗                     │      │             ╭───↑─────╮    ╭─────────╮
+                               │                                                             │South of ▶                     │      │             │  Rocky  │    │ End of  │
+                               │                                                             │  House  │                     │      │             │  Ledge  │    │ Rainbow │
+                               │                                                             │  #217   │                     │      │             │   #22   │    │  #131   │
+                               │                                                             ╰────▼────╯                     │      │             ╰────↓────╯   🮣↙─────────╯
+                               │                                                                  │                          │      │                  ┊      🮣─🮠
+                               │                                                                  └─────────────────────────┐│      │                  ┊┌─────┘
+                               │                                                                                            ││      │                  ┊│
+                               │                                                                                        ╭────▲────╮ │             ╭────↑▲───╮
+                               │                                                                                        │ Forest  │ │             │ Canyon  │
+                               └────────────────────────────────────────────────────────────────────────────────────────◀         │─┘             │ Bottom  │
+                                                                                                                        │  #230   │               │   #78   │
+                                                                                                                        ╰─────────╯               ╰─────────╯
+# --- layer 1 (Cellar) ---
+                                                                               ╭─────────╮
+                                                                               │Maintenan│
+                                                                               │  Room   │
+                                                                               │  #2◀3   │
+                                                                               ╰────▼────╯
+                                                                                    │
+                                                                                    └────────────┐
+                                                                                            ╭────▲────╮
+                                                                                            │Dam ▶obby│
+                                                                                            │         │
+                                                                                            │  #126   │
+                                                                                            ╰────▼────╯
+                                                                                                 │
+                                                                                                 │
+                                                                 ╭─────────╮   ╭─────────╮  ╭────▲────╮
+                                                                 │ Stream  │   │Reservoir│  │   Dam   │
+                                                                 │  View   ▶───◀  South  ▶──◀         ▶───────┐
+                                                                 │   #71   │   │  #129   │  │  #186   │       │
+                                                                 ╰─────────╯  🮣↙─────────╯  ╰────▼────╯       │
+                                                                             🮣🮠                  │            │
+                                                                            🮣🮠                   │            │
+                                                                           🮣🮠                    │            │
+                                                                 ╭─────────↗   ╭─────────╮       │       ╭────▲────╮
+                                                                 │  Chasm  │   │  Deep   │       │       │Dam Base │
+                                                                 │         │   │ Canyon  ▶───────┘       │         │
+                                                                 │  #112   │   │  #170   │               │  #117   │
+                                                                 ╰────▼────╯   ↙────↓────╯               ╰─────────╯
+                                                                      │       🮣🮠    ┊
+                                                                      │      🮣🮠     ┊
+                                                                      │     🮣🮠      ┊
+                                                                 ╭────▲────↗🮠       ┊
+                                                                 │North-Sou│        ┊
+                                                                 │ Passage │        ┊
+                                                                 │  #183   │        ┊
+                                                                 ╰────▼────╯        ┊
+                                                                      │             ┊
+                                                                      │             ┊
+                          ╔═════════╗  ╭─────────╮               ╭────▲────╮   ╭────↑────╮  ╭─────────╮  ╭─────────╮
+                          ║The Troll║  │East-West│               │  Round  │   │Loud Room│  │Damp Cave│  │  White  │
+                          ║◀ Room   ▶──◀ Passage ▶───────────────◀  Room   ▶───◀         ▶──◀         ▶──◀ Cliffs  │
+                          ║  #133   ║  │  #136   │               │   #16   │   │  #213   │  │   #26   │  │  #192   │
+                          ╚════▼════╝  ╰─────────╯               ╰────▼────╯   ╰─────────╯  ╰─────────╯  ╰────▼────╯
+                               │                                      │                                       │
+                               │                                      │                                       │
+                               │                                 ╭────▲────╮                             ╭────▲────╮
+                               │                                 │ Narrow  │                             │  White  │
+                               │                                 │ Passage │                             │ Cliffs  │
+                               │                                 │  #237   │                             │  #174   │
+                               │                                 ╰────▼────╯                             ╰─────────╯
+                               │                                      │
+                               │                                      │
+                          ╭────▲────╮                            ╭────▲────╮
+                          │ Cellar  │                            │ Mirror  │
+                          │         │                    ┌───────◀  Room   ▶───────────────────────────────────────────────┐
+                          │   #34   │                    │       │   #55   │                                               │
+                          ╰────▼────╯                    │       ╰─────────╯                                               │
+                               │                         │                                                                 │
+                               │                         │                                                                 │
+                               │       ╔═════════╗  ╭────▲────╮                                                       ╭────▲────╮
+                               │       ║ Studio↑ ║  │ Winding │                                                       │  Cave   │
+                               │       ║         ║  │ Passage ▶───────────────────────────────────────────────────────◀         │
+                               │       ║  #229   ║  │  #152   │                                                       │  #184   │
+                               │       ╚════▼════╝  ╰─────────╯                                                       ╰─────────╯
+                               │            │
+                               │            │
+                          ╭────▲────╮  ╭────▲────╮
+                          │ East of │  │ Gallery │
+                          │  Chasm  ▶──◀         │
+                          │  #258   │  │  #128   │
+                          ╰─────────╯  ╰─────────╯
+# --- layer 3 (Maze) ---
+                                                                         ╭─────────╮
+                                                                         │Dead End │
+                                                                         │         │
+                                                                         │  #154   │
+                                                                         ╰────▼────╯
+                                                                              │
+                                                                              └──────┐
+                                                                                     │╔═════════╗
+                                                                                     │║  Maze   ║
+                                                                              ┌──────┼◀        ▶║
+                                                                              │      │║  #109   ║
+                                                                              │      │╚════▼════╝
+                                                                              │      │     │
+                                      ┌┄┄┄┄┄┄┄┄┐       ┌──────────────────────┼──────┼─────┘
+                                      ┊        ┊       │                      │      │
+                                      ┊        ┊┌──────┼─┐                    │      │
+                                      ┊    ╭────▲────╮ │ │╭─────────╮    ╭────▲────╮ │
+                                      ┊    │  Maze   │ │ ││Dead End │    │  Maze   │ │
+                                      ┊    │         ▶─┼─┼◀         │ ┌──◀         ▶─┘
+                                      ┊    │  #227   │ │ ││  #148   │ │  │  #201   │
+                                      ┊   🮣↙─────────╯ │ │╰─────────╯ │  ╰─────────╯
+                                      ┊ 🮣─🮠     ┊      │ │            │       ┊
+                                      ┊ │       └┄┄┄┄┄┄┄┄│┄┄┄┄┐       │ ┌┄┄┄┄┄┘
+                                      ┊ │              │ │    ┊       │ ┊
+                                      ┊ │              │ │    ┊┌──────┘ ┊
+                                      ┊ │  ╭─────────╮ │ │╭───↑▲────╮   ┊
+                                      ┊ │  │  Maze   │ │ ││  Maze   │   ┊
+                                      ┊ │  │         ▶─┼─┼◀         │   ┊
+                                      ┊ │  │   #20   │ │ ││   #57   │   ┊
+                                      ┊ │  ╰────▼↓───╯ │ │╰─────────╯   ┊
+                                      ┊ │       │┊     │ │     │        ┊
+                                      ┊ │       └┊─────┘ │     │        ┊
+                                      ┊🮣🮠        ┊       │     │        ┊
+                                      ┊🮠         └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+                                     🮣┊                  │     │
+                                     │┊                  └─────┘
+                          ┏━━━━━━━━━┓🮠┊    ╭─────────╮
+                          ┃  Maze   ┃ ┊    │  Maze   │
+                          ┃         ▶──────◀         ▶─┐
+                          ┃  #140   ┃ ┊    │  #165   │ │
+                          ┗━━━━↓━━━━┛ ┊    ╰────▼────╯ │
+                               ┊      ┊         │      │
+                               └┄┄┄┄┄┄┘         └──────┼─┐
+                                                       │ │
+                                                       └─┼───────────┐
+                                           ╭─────────╮   │╭─────────↗🮠
+                                           │  Maze   │   ││  Maze   │
+                                           │         │   ││         │
+                                           │  #178   │   ││   #53   │
+                                           ╰────▼────╯   │╰─────────╯
+                                                │        │
+                                                └────────┘
+#
+# Annotate problems below — lines starting with # are comments:
+#
