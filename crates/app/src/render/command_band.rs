@@ -14,8 +14,9 @@
 //!   survives only as the fallback for a story with no readable grammar, and a
 //!   column that is not the story's own labels itself ([`VerbSource`]).
 //! * The object columns are **live**: they are refreshed from the engine's
-//!   object tree every frame (`loop_tick::refresh_command_band_objects`), not
-//!   scraped from the transcript and snapshotted at open.
+//!   object tree every turn the VM runs (`loop_tick::refresh_command_band`,
+//!   gated on `AppState::turn_epoch` — SQ-1175), not scraped from the
+//!   transcript and snapshotted at open.
 //! * It is **not a modal**. The story prompt stays live, paste keeps working,
 //!   graphical v6 stays on the pixel path, and only clicks inside the band's
 //!   own rect are taken from the game.
@@ -708,7 +709,17 @@ fn draw_divider(buf: &mut Buffer, x: u16, area: Rect, style: Style) {
 ///
 /// Returns `true` when the lists actually changed (→ repaint).
 pub fn refresh_objects(state: &mut AppState, session: &dyn crate::engine::Engine) -> bool {
-    if state.overlays.command_band.is_none() {
+    let Some(band) = state.overlays.command_band.as_ref() else {
+        return false;
+    };
+    // Objects only move when the VM runs, and every path that runs it bumps
+    // `turn_epoch` (the three turn finishers via `begin_turn`, and a host
+    // restore in `apply_archive_state`). An unchanged epoch means the walk
+    // below — location detection, the room/carried object reads, a typeable
+    // name per object — would recompute exactly what the band already holds,
+    // which is what the ~20 Hz loop tick was doing on every pass (SQ-1175).
+    let epoch = state.turn_epoch;
+    if band.objects_epoch == Some(epoch) {
         return false;
     }
     let player = state
@@ -728,7 +739,7 @@ pub fn refresh_objects(state: &mut AppState, session: &dyn crate::engine::Engine
         let carried = player.map(|p| intro.visible_contents(p));
         (here, carried)
     });
-    let (here, carried, seen) = {
+    let (here, carried) = {
         let vocab = state.vocab.get(session);
         let typeable = |v: &[crate::engine::ObjectWords]| -> Vec<String> {
             let mut out: Vec<String> = Vec::with_capacity(v.len());
@@ -744,14 +755,6 @@ pub fn refresh_objects(state: &mut AppState, session: &dyn crate::engine::Engine
             }
             out
         };
-        // The words the story has PRINTED that name a THING, newest first —
-        // already cut down once a turn by `input::refresh_seen_words`, which is
-        // where the expensive half of that question lives (it asks the story's
-        // own objects). Nothing is filtered here, so this costs a clone.
-        //
-        // SQ-1135: every engine gets this block now, not just the ones with no
-        // object tree.
-        let seen: Vec<String> = state.seen_nouns.clone();
         match &objects {
             Some((here, carried)) => (
                 typeable(here),
@@ -759,11 +762,18 @@ pub fn refresh_objects(state: &mut AppState, session: &dyn crate::engine::Engine
                     Some(c) => typeable(c),
                     None => state.inventory_fallback.clone(),
                 },
-                seen,
             ),
-            None => (Vec::new(), state.inventory_fallback.clone(), seen),
+            None => (Vec::new(), state.inventory_fallback.clone()),
         }
     };
+    // The words the story has PRINTED that name a THING, newest first — already
+    // cut down once a turn by `input::refresh_seen_words`, which is where the
+    // expensive half of that question lives (it asks the story's own objects).
+    // Read in place and cloned only when it actually changed (SQ-1175).
+    //
+    // SQ-1135: every engine gets this block now, not just the ones with no
+    // object tree.
+    let seen = &state.seen_nouns;
     // The header claims only what is true of every row (SQ-1135). Read off the
     // LISTS rather than off which engine answered, so a story whose tree says the
     // room is empty labels its column honestly too.
@@ -781,16 +791,22 @@ pub fn refresh_objects(state: &mut AppState, session: &dyn crate::engine::Engine
     };
 
     let Some(band) = state.overlays.command_band.as_mut() else { return false };
+    // Recorded whether or not the lists changed: "nothing changed this turn" is
+    // as much an answer as a new list, and re-asking every tick until the next
+    // turn is the cost SQ-1175 removes.
+    band.objects_epoch = Some(epoch);
     if band.here == here
         && band.carried == carried
-        && band.here_seen == seen
+        && band.here_seen == *seen
         && band.here_source == source
     {
         return false;
     }
     band.here = here;
     band.carried = carried;
-    band.here_seen = seen;
+    if band.here_seen != *seen {
+        band.here_seen = seen.clone();
+    }
     band.here_source = source;
     true
 }

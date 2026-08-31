@@ -309,11 +309,19 @@ pub struct CommandBandState {
     /// in the same frame overwrites that one global slot while the band is
     /// still on screen underneath it.
     pub col_viewport: std::cell::Cell<[usize; BAND_COLS]>,
-    /// Objects in the current room, refreshed every frame from the engine.
+    /// Objects in the current room, refreshed from the engine whenever the VM
+    /// has run (see [`Self::objects_epoch`]).
     /// The object tree's answer, and empty for an engine that has none.
     pub here: Vec<String>,
-    /// Objects the player carries, refreshed every frame from the engine.
+    /// Objects the player carries, refreshed alongside [`Self::here`].
     pub carried: Vec<String>,
+    /// The [`AppState::turn_epoch`] the object columns were last refreshed at,
+    /// `None` for a fresh open (SQ-1175). Objects only move when the VM runs,
+    /// and every turn finisher (and a host restore) bumps the epoch — so a
+    /// matching epoch means `refresh_objects` has nothing new to read, and the
+    /// ~20 Hz loop tick skips the whole object-tree walk (on v4+ the location
+    /// detection behind it Z-decodes every short name in the game).
+    pub objects_epoch: Option<u64>,
     /// The nouns the story has PRINTED, most recently first — the second block
     /// of the noun columns, under whatever the object tree could say (SQ-1135).
     ///

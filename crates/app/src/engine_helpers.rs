@@ -262,6 +262,12 @@ pub(crate) fn apply_archive_state(
     mapper: &mut mapper::mapper::Mapper,
     state: &mut app::state::AppState,
 ) {
+    // A restore swaps the world out from under everything derived from it, so it
+    // is a turn boundary like any other (SQ-1175): the epoch bump is what tells
+    // the epoch-gated readers (the command band's object columns) to re-read the
+    // engine, and `begin_turn` also retires anything the previous world was
+    // still waiting on (a pending vocab offer, a lit reveal).
+    state.begin_turn();
     if let Some(scr) = ac.screen.clone() {
         if let Some(z) = zvm_session_opt_mut(session) {
             app::session::restore_screen(z, scr);
