@@ -2293,28 +2293,42 @@ impl Machine {
     /// 1..=256 zero bytes is `0x00` followed by `(count-1)`; non-zero diff bytes
     /// are literal (spec §1.8 / Quetzal).
     fn compress_ram(&self) -> Vec<u8> {
-        let ramstart = self.mem.ramstart();
-        let memsize = self.mem.mem_size();
-        let mut diff = Vec::with_capacity((memsize - ramstart) as usize);
-        for a in ramstart..memsize {
-            let cur = self.mem.read8(a).unwrap_or(0) as u8;
-            diff.push(cur ^ self.mem.orig_byte(a));
+        // Slices, not a bounds-checked `read8` per byte: this runs on the
+        // player's thread for every host snapshot (a probe question, the
+        // per-turn auto-save), and the per-byte `Option` call was the whole
+        // cost (SQ-1177). Same diff, same RLE, byte-identical output —
+        // `compress_ram_matches_the_per_byte_reference` holds the two side
+        // by side.
+        let ramstart = self.mem.ramstart() as usize;
+        let memsize = self.mem.mem_size() as usize;
+        let cur = &self.mem.raw_bytes()[ramstart..memsize];
+        let orig = self.mem.orig_bytes();
+        let mut diff = vec![0u8; memsize - ramstart];
+        // `orig` covers [0, EXTSTART) and is zero by definition above it, so
+        // the diff is an XOR over the overlap and the current bytes verbatim
+        // past it. `ramstart <= EXTSTART <= memsize` always; the clamps keep
+        // this correct rather than panicking if that ever moved.
+        let overlap = orig.len().clamp(ramstart, memsize) - ramstart;
+        diff.copy_from_slice(cur);
+        for (d, o) in diff[..overlap].iter_mut().zip(&orig[ramstart..]) {
+            *d ^= *o;
         }
         let mut out = Vec::new();
-        out.extend_from_slice(&memsize.to_be_bytes());
+        out.extend_from_slice(&(memsize as u32).to_be_bytes());
         let mut i = 0;
         while i < diff.len() {
             if diff[i] == 0 {
-                let mut run = 1usize;
-                while i + run < diff.len() && diff[i + run] == 0 && run < 256 {
-                    run += 1;
-                }
+                // A zero run: up to 256 zeros become `00 (run-1)`.
+                let cap = (i + 256).min(diff.len());
+                let run = diff[i..cap].iter().take_while(|&&b| b == 0).count();
                 out.push(0);
                 out.push((run - 1) as u8);
                 i += run;
             } else {
-                out.push(diff[i]);
-                i += 1;
+                // A literal stretch: copy whole, up to the next zero.
+                let end = i + diff[i..].iter().take_while(|&&b| b != 0).count();
+                out.extend_from_slice(&diff[i..end]);
+                i = end;
             }
         }
         out
@@ -6193,6 +6207,63 @@ mod tests {
             assert_eq!(d ^ m.mem.orig_byte(a), want, "RAM byte {a:#x} must round-trip through the diff");
         }
         assert!(diff.iter().any(|&b| b != 0), "the fixture actually dirtied RAM, so the test is not vacuous");
+    }
+
+    /// The slice-based `compress_ram` (SQ-1177) must be byte-identical to the
+    /// per-byte original it replaced — the CMem body is an on-disk format, and
+    /// "faster" is only allowed to mean faster. The reference below IS the old
+    /// implementation, verbatim: `read8`/`orig_byte` a byte at a time, then the
+    /// one-zero-at-a-time RLE.
+    #[test]
+    fn compress_ram_matches_the_per_byte_reference() {
+        fn reference(m: &Machine) -> Vec<u8> {
+            let ramstart = m.mem.ramstart();
+            let memsize = m.mem.mem_size();
+            let mut diff = Vec::with_capacity((memsize - ramstart) as usize);
+            for a in ramstart..memsize {
+                let cur = m.mem.read8(a).unwrap_or(0) as u8;
+                diff.push(cur ^ m.mem.orig_byte(a));
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(&memsize.to_be_bytes());
+            let mut i = 0;
+            while i < diff.len() {
+                if diff[i] == 0 {
+                    let mut run = 1usize;
+                    while i + run < diff.len() && diff[i + run] == 0 && run < 256 {
+                        run += 1;
+                    }
+                    out.push(0);
+                    out.push((run - 1) as u8);
+                    i += run;
+                } else {
+                    out.push(diff[i]);
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        // A machine that has run, so the diff holds real dirt…
+        let mut m = conformance_machine();
+        assert_eq!(m.compress_ram(), reference(&m), "the fixture's own dirt");
+
+        // …then every shape the encoder can meet: a literal stretch, a zero run
+        // longer than one marker can carry (>256), single zeros between
+        // literals, RAM grown past the original ENDMEM (where the diff base is
+        // zeros rather than image bytes), and a literal on the very last byte.
+        let ramstart = m.mem.ramstart();
+        for (i, b) in [0xAA, 0xBB, 0xCC, 0x00, 0xDD].into_iter().enumerate() {
+            m.mem.write_byte_raw(ramstart + 0x40 + i as u32, b);
+        }
+        assert!(m.mem.set_mem_size(m.mem.mem_size() + 512), "growable");
+        m.mem.write_byte_raw(m.mem.mem_size() - 300, 0x11); // zero run > 256 after it
+        m.mem.write_byte_raw(m.mem.mem_size() - 1, 0x22); // run ends on a literal
+        assert_eq!(m.compress_ram(), reference(&m), "adversarial run shapes");
+
+        // And the trailing-zero-run shape, which the loop above just removed.
+        m.mem.write_byte_raw(m.mem.mem_size() - 1, 0x00);
+        assert_eq!(m.compress_ram(), reference(&m), "a zero run to the very end");
     }
 
     #[test]

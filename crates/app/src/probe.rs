@@ -370,7 +370,11 @@ fn signature(reply: &str, command: &str) -> Vec<String> {
 /// One question, on its way to the worker.
 struct Job {
     token: u64,
-    save: crate::engine::EngineSave,
+    /// Shared, not cloned: a return search sends one direction at a time from
+    /// ONE snapshot, and a per-job copy of the whole save blob was the
+    /// player's thread paying twelve times for one moment (SQ-1177). The
+    /// worker only ever reads it.
+    save: std::sync::Arc<crate::engine::EngineSave>,
     baseline: WorldPrint,
     commands: Vec<String>,
 }
@@ -405,7 +409,7 @@ pub struct Answer {
 /// thread; everything after them is the worker's.
 #[derive(Clone, Debug)]
 pub struct ProbeSnapshot {
-    save: crate::engine::EngineSave,
+    save: std::sync::Arc<crate::engine::EngineSave>,
     baseline: WorldPrint,
 }
 
@@ -531,6 +535,16 @@ impl ShadowProbe {
     /// because both are questions about the LIVE engine and it may not cross a
     /// thread. Everything after them is the worker's.
     pub fn ask(&mut self, live: &dyn Engine, commands: &[String]) -> Option<u64> {
+        // Refuse BEFORE snapshotting (SQ-1177). The checks are free and the
+        // snapshot is the expensive half — `save_state` is ~102 ms on
+        // Counterfeit Monkey in a debug build — and the busy case is exactly
+        // the slow-game turn where paying it for a guaranteed `None` hurts
+        // most. `ask_from` repeats the checks because it is public and has
+        // callers of its own.
+        if !self.is_armed() || self.is_busy() || commands.is_empty() || commands.len() > MAX_PROBES
+        {
+            return None;
+        }
         self.ask_from(&self.snapshot(live)?, commands)
     }
 
@@ -553,10 +567,27 @@ impl ShadowProbe {
     /// mid-file-operation, and the shadow would resume into an I/O request
     /// nobody can answer.
     pub fn snapshot(&self, live: &dyn Engine) -> Option<ProbeSnapshot> {
+        self.snapshot_from(live, || std::sync::Arc::new(live.save_state()))
+    }
+
+    /// [`snapshot`](Self::snapshot), from a host save something else already
+    /// paid for — the turn path takes ONE `save_state` per turn and shares it
+    /// between history, the auto-save and this seam (SQ-1178's `TurnSave`).
+    ///
+    /// `save` is a closure rather than a value so the guards still come first:
+    /// an unarmed seam or a suspended VM must refuse before anything pays for
+    /// a snapshot, exactly as [`ask`](Self::ask) refuses before taking one
+    /// (SQ-1177). A caller holding an already-materialised Arc loses nothing —
+    /// its closure is a clone.
+    pub fn snapshot_from(
+        &self,
+        live: &dyn Engine,
+        save: impl FnOnce() -> std::sync::Arc<crate::engine::EngineSave>,
+    ) -> Option<ProbeSnapshot> {
         if !self.is_armed() || live.is_saveload_pending() {
             return None;
         }
-        Some(ProbeSnapshot { save: live.save_state(), baseline: WorldPrint::of(live) })
+        Some(ProbeSnapshot { save: save(), baseline: WorldPrint::of(live) })
     }
 
     /// [`ask`](Self::ask), from a snapshot already taken. See
@@ -569,7 +600,7 @@ impl ShadowProbe {
         let token = self.next_token.wrapping_add(1);
         let job = Job {
             token,
-            save: from.save.clone(),
+            save: std::sync::Arc::clone(&from.save),
             baseline: from.baseline,
             commands: commands.to_vec(),
         };
@@ -871,6 +902,106 @@ mod tests {
         assert!(!blind.differs_from(WorldPrint(Some(1))));
         assert!(WorldPrint(Some(1)).differs_from(WorldPrint(Some(2))));
         assert!(!WorldPrint(Some(1)).differs_from(WorldPrint(Some(1))));
+    }
+
+    /// A stand-in whose only job is to count what a refusal costs. Everything
+    /// a refused `ask` has no business touching is `unreachable!`.
+    struct CountingEngine {
+        saves: std::cell::Cell<u32>,
+    }
+
+    impl Engine for CountingEngine {
+        fn submit(&mut self, _command: &str) -> crate::session::TurnResult {
+            unreachable!("a refused ask types nothing")
+        }
+        fn submit_key(&mut self, _key: crate::engine::KeyInput) -> Option<crate::session::TurnResult> {
+            unreachable!("a refused ask types nothing")
+        }
+        fn take_transcript(&mut self) -> String {
+            String::new()
+        }
+        fn drain_screen_clear(&mut self) -> bool {
+            false
+        }
+        fn pending_input(&self) -> crate::session::InputKind {
+            crate::session::InputKind::Line
+        }
+        fn resume_save(&mut self, _wrote_ok: bool) -> crate::session::TurnResult {
+            unreachable!("not exercised by this test")
+        }
+        fn resume_restore(&mut self, _data: Option<&[u8]>) -> crate::session::TurnResult {
+            unreachable!("not exercised by this test")
+        }
+        fn has_quit(&self) -> bool {
+            false
+        }
+        fn screen(&self) -> crate::engine::ScreenModel {
+            unreachable!("not exercised by this test")
+        }
+        fn save_state(&self) -> crate::engine::EngineSave {
+            self.saves.set(self.saves.get() + 1);
+            crate::engine::EngineSave::new("mock", 1, Vec::new())
+        }
+        fn restore_state(
+            &mut self,
+            _save: &crate::engine::EngineSave,
+        ) -> Result<(), crate::engine::EngineError> {
+            unreachable!("not exercised by this test")
+        }
+        fn restore_game_save(&mut self, _bytes: &[u8]) -> Result<(), crate::engine::EngineError> {
+            unreachable!("not exercised by this test")
+        }
+        fn aux_data(&self) -> &std::collections::BTreeMap<String, Vec<u8>> {
+            unreachable!("not exercised by this test")
+        }
+        fn set_aux_data(&mut self, _data: std::collections::BTreeMap<String, Vec<u8>>) {
+            unreachable!("not exercised by this test")
+        }
+        fn aux_dirty(&self) -> bool {
+            false
+        }
+        fn clear_aux_dirty(&mut self) {}
+        fn current_location(&self) -> Option<crate::engine::LocationInfo> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// SQ-1177: a busy probe must say no BEFORE paying for the snapshot. The
+    /// busy turn is exactly the slow-game turn — the previous question is
+    /// still running because the story answers slowly — so charging the
+    /// player's thread a full `save_state` for a guaranteed `None` was the
+    /// worst possible moment for it.
+    #[test]
+    fn a_busy_probe_refuses_before_paying_for_a_snapshot() {
+        let mut p = ShadowProbe::default();
+        p.arm(ShadowRecipe::default());
+        assert!(p.is_armed(), "armed, so busyness is the only refusal in play");
+        p.inflight = Some(1); // a question is out with the worker
+        assert!(p.is_busy());
+        let live = CountingEngine { saves: std::cell::Cell::new(0) };
+        assert_eq!(p.ask(&live, &["north".to_string()]), None, "busy refuses");
+        assert_eq!(live.saves.get(), 0, "and the refusal must cost no save_state");
+    }
+
+    /// The guards hold on the shared-save seam too: an unarmed probe refuses
+    /// before materialising the snapshot it was offered (SQ-1178).
+    #[test]
+    fn snapshot_from_refuses_before_materialising_the_save() {
+        let p = ShadowProbe::default();
+        let live = CountingEngine { saves: std::cell::Cell::new(0) };
+        let took = std::cell::Cell::new(false);
+        let snap = p.snapshot_from(&live, || {
+            took.set(true);
+            std::sync::Arc::new(live.save_state())
+        });
+        assert!(snap.is_none(), "unarmed refuses");
+        assert!(!took.get(), "and never asked for the save it would not use");
     }
 
     #[test]
