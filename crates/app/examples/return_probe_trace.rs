@@ -101,7 +101,10 @@ fn main() {
             );
         }
 
-        app::return_probe::arm_return_search(&mut state, &mapper, &*session, cmd, before);
+        app::return_probe::arm_return_search(
+            &mut state, &mapper, &*session, cmd, before,
+            &mut app::engine::TurnSave::default(),
+        );
         if state.return_search.is_none() {
             println!("    NO SEARCH ARMED");
             continue;

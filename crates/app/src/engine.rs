@@ -706,6 +706,36 @@ impl EngineSave {
     }
 }
 
+/// One host snapshot per finished turn, taken lazily and shared by everything
+/// that wants the post-turn state (SQ-1178).
+///
+/// With history and auto-save on, one turn used to pay [`Engine::save_state`]
+/// three times over — the history capture, the per-turn archive write, and the
+/// return probe's snapshot — for one identical moment: nothing between the
+/// turn being applied and the next command mutates the VM (the word
+/// refreshers, inventory tracking and world prints all read through
+/// `&dyn Engine`). At ~102 ms per call on Counterfeit Monkey in a debug
+/// build, that was the biggest per-turn cost on Glulx.
+///
+/// Lazy, not eager, because every consumer is gated — history and auto-save by
+/// config, the return probe by a crossing the map has no way back from — and a
+/// turn none of them fires on must keep costing nothing. The first
+/// [`get`](Self::get) pays; the rest share the same blob.
+///
+/// One value lives per finished turn, as a local in the turn finisher — never
+/// across turns, because the next command invalidates it.
+#[derive(Default)]
+pub struct TurnSave(Option<std::sync::Arc<EngineSave>>);
+
+impl TurnSave {
+    /// This turn's snapshot, taking it on first use.
+    pub fn get(&mut self, session: &dyn Engine) -> std::sync::Arc<EngineSave> {
+        std::sync::Arc::clone(
+            self.0.get_or_insert_with(|| std::sync::Arc::new(session.save_state())),
+        )
+    }
+}
+
 /// An engine operation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {

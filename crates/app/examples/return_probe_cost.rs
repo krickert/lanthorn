@@ -219,7 +219,10 @@ fn measure(name: &str, file: &str, walk: &[&str]) {
     };
     let before_probes = state.probe.probes;
     let before_spent = state.probe.spent;
-    app::return_probe::arm_return_search(&mut state, &mapper, &*session, cmd, room_before);
+    app::return_probe::arm_return_search(
+        &mut state, &mapper, &*session, cmd, room_before,
+        &mut app::engine::TurnSave::default(),
+    );
     let found = app::return_probe::settle_return_search(&mut state, &mut mapper);
     println!(
         "{:22} in play: `{cmd}` → {:>2} command(s), {:>9.1?}, found {}",

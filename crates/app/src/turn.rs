@@ -203,9 +203,16 @@ pub(crate) fn finish_command_turn(
         state.push_trail(here);
     }
 
+    // ONE host snapshot for everything this finished turn wants one for — the
+    // return probe here, the history capture and the auto-save in
+    // `post_turn_bookkeeping` below (SQ-1178). Valid for all three because
+    // nothing from here to the next command mutates the VM: every call into
+    // the session in between reads through `&dyn Engine`.
+    let mut turn_save = app::engine::TurnSave::default();
+
     // Look for the way back, in a silent copy of the game (SQ-0785). Off by default; arms only
     // for a crossing the map has no return path for, and ends any search a move has outrun.
-    app::return_probe::arm_return_search(state, mapper, &*session, cmd, room_before);
+    app::return_probe::arm_return_search(state, mapper, &*session, cmd, room_before, &mut turn_save);
 
     // Bump the graph generation ONLY when the turn actually changed the map's
     // routed geometry (a room or connection added/removed). This invalidates the
@@ -239,7 +246,7 @@ pub(crate) fn finish_command_turn(
     // ── Post-turn bookkeeping (history / inventory / auto-save) ──
     post_turn_bookkeeping(
         state, mapper, &mut *session, &result, cmd,
-        rooms_before, conns_before, ifid, arc_file,
+        rooms_before, conns_before, ifid, arc_file, &mut turn_save,
     );
     persist_aux_after_turn(session, state, game_dir);
     persist_vfs_after_turn(session, state, game_dir);
@@ -403,6 +410,7 @@ fn post_turn_bookkeeping(
     conns_before: usize,
     ifid: &str,
     arc_file: &std::path::Path,
+    turn_save: &mut app::engine::TurnSave,
 ) {
     // ── Rewind/replay capture (opt-in) ────────────────────────────
     // Skip the quit turn: the VM has terminated, so its snapshot has
@@ -410,11 +418,14 @@ fn post_turn_bookkeeping(
     if state.config.record_turn_history && !result.quit {
         let map_changed = mapper.graph.rooms().count() != rooms_before
             || mapper.graph.connections().len() != conns_before;
+        // The record owns its bytes — it outlives the turn and is serialized
+        // into the archive — so it copies them out of the shared turn snapshot
+        // (SQ-1178): a memcpy, where a second `save_state` was the cost.
         app::history::record_turn(
             &mut state.history,
             state.turns,
             cmd,
-            session.save_state().bytes,
+            turn_save.get(&*session).bytes.clone(),
             mapper,
             map_changed,
             &result.transcript,
@@ -500,7 +511,11 @@ fn post_turn_bookkeeping(
         // (SQ-0516); empty for non-v6 sessions, leaving the archive layout unchanged.
         let (v6_pics, v6_display, v6_ground, v6_diags) = crate::engine_helpers::v6_save_payload(session);
         for d in &v6_diags { state.note_v6_save(d); }
-        if let Err(e) = app::archive::save_archive_meta_pics(arc_file, mapper, &session.save_state(), zvm_session_opt(session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref()) {
+        // The same turn snapshot history and the return probe read (SQ-1178):
+        // the word refreshers and inventory tracking above read through
+        // `&dyn Engine`, so the VM here is byte-identical to the VM there.
+        let shared = turn_save.get(&*session);
+        if let Err(e) = app::archive::save_archive_meta_pics(arc_file, mapper, &shared, zvm_session_opt(session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref()) {
             state.push_notice(&format!("[Auto-save failed: {}]", e));
         }
     }
@@ -610,7 +625,9 @@ pub(crate) fn finish_resumed_turn(
     state.graph_gen = state.graph_gen.wrapping_add(1);
     // The resumed half of a turn can be a crossing too, and it is certainly a place a search
     // can be outrun (SQ-0785). It names no direction, so the fallback order applies.
-    app::return_probe::arm_return_search(state, mapper, session, "", room_before);
+    // The snapshot it takes is the one `post_turn_bookkeeping` below shares (SQ-1178).
+    let mut turn_save = app::engine::TurnSave::default();
+    app::return_probe::arm_return_search(state, mapper, session, "", room_before, &mut turn_save);
     state.set_viewed_layer(None);
     if let Some(snap) = &result.location {
         let rid = snap.number as mapper::graph::RoomId;
@@ -635,7 +652,7 @@ pub(crate) fn finish_resumed_turn(
         open_filename_modal(req, session, state);
     } else {
         let arc_file = default_state_path(game_dir);
-        post_turn_bookkeeping(state, mapper, &mut *session, &result, "", rooms_before, conns_before, ifid, &arc_file);
+        post_turn_bookkeeping(state, mapper, &mut *session, &result, "", rooms_before, conns_before, ifid, &arc_file, &mut turn_save);
     }
     should_exit
 }
@@ -899,8 +916,11 @@ pub(crate) fn apply_game_driven_result(
         state.graph_gen = state.graph_gen.wrapping_add(1);
     }
     // A game-driven turn can move the player too — a timer, a menu selection, a teleport — so it
-    // both arms a search and ends one that has been outrun (SQ-0785).
-    app::return_probe::arm_return_search(state, mapper, session, "", room_before);
+    // both arms a search and ends one that has been outrun (SQ-0785). This path deliberately
+    // skips `post_turn_bookkeeping`, so there is nobody to share the turn snapshot with.
+    app::return_probe::arm_return_search(
+        state, mapper, session, "", room_before, &mut app::engine::TurnSave::default(),
+    );
     // Select and recenter on the current room if it changed.
     if let Some(snap) = &result.location {
         let rid = snap.number as mapper::graph::RoomId;
@@ -1730,7 +1750,7 @@ mod tests {
         let mapper = mapper::mapper::Mapper::default();
         let result = game_driven_result(None);
 
-        super::post_turn_bookkeeping(&mut state, &mapper, &mut sess, &result, "look", 0, 0, "TEST-IFID", &arc_file);
+        super::post_turn_bookkeeping(&mut state, &mapper, &mut sess, &result, "look", 0, 0, "TEST-IFID", &arc_file, &mut app::engine::TurnSave::default());
 
         assert!(
             state.overlays.confirm_overwrite_save.is_none(),
