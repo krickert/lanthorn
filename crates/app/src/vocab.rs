@@ -871,12 +871,19 @@ impl StoryVocabulary {
     /// such word wins, so `bottled` never stands in for `bottle`; a key the prose
     /// spells exactly is already whole; and a key the prose has never carried is
     /// offered as stored, because a truncated key is still a word that works.
+    ///
+    /// Only the NEWEST [`SPELLING_LOOKBACK`] transcript lines are read
+    /// (SQ-1180). This runs per candidate of a rejected word, and lowercasing
+    /// every word of an unbounded transcript per candidate grows without limit
+    /// over a session; the spelling on offer is about what the player has been
+    /// reading, and a word last printed hundreds of lines ago is offered as
+    /// stored — still typeable — exactly as one the prose never carried.
     fn spell_out(&self, stored: &str, prose: &[String]) -> Option<String> {
         if self.key_len == 0 || stored.chars().count() != self.key_len {
             return Some(stored.to_string());
         }
         let mut best: Option<String> = None;
-        for line in prose {
+        for line in prose.iter().rev().take(SPELLING_LOOKBACK) {
             // Split on the hyphen too: `lantern-bearer` is a compound of the
             // story's prose, not a spelling of the key, and it would otherwise
             // outrank the word itself.
@@ -1250,6 +1257,17 @@ fn absent_nouns(v: &StoryVocabulary, engine: &dyn Engine, prose: &[String], avoi
 
 /// How many transcript lines back count as "what the player can see".
 const PROSE_LOOKBACK: usize = 40;
+
+/// How many transcript lines back [`StoryVocabulary::spell_out`] reads for a
+/// truncated key's full spelling (SQ-1180).
+///
+/// Five times [`PROSE_LOOKBACK`]: the spelling question reaches further than
+/// "on screen right now" — the player may be retyping a word from a room
+/// description a few screens up — but not into the whole session, whose
+/// transcript this scan lowercased word by word, per candidate, per rejection.
+/// Two hundred lines is several screenfuls of prose; a word the story has not
+/// printed in that long is offered as stored, which the parser accepts anyway.
+const SPELLING_LOOKBACK: usize = 200;
 
 /// Which command in a `run` answered a candidate, and which pair of controls (if
 /// any) judges it. Indices into the run's steps, in the order they were typed.
@@ -1689,6 +1707,24 @@ mod tests {
             vec!["lantern"],
             "the shortest spelling wins, so `lanterns` never stands in for `lantern`"
         );
+    }
+
+    /// The spelling scan reads the newest [`SPELLING_LOOKBACK`] lines and no
+    /// more (SQ-1180): a sighting the session has since scrolled that far past
+    /// resolves as stored, exactly like one the prose never carried, while the
+    /// same sighting inside the window still answers.
+    #[test]
+    fn the_spelling_scan_reads_the_newest_lines_and_stops() {
+        let v = pocket_zork();
+        let mut prose = vec!["A battery-powered brass lantern is on the trophy case.".to_string()];
+        prose.extend(vec!["Time passes.".to_string(); SPELLING_LOOKBACK]);
+        assert_eq!(
+            v.offer("lanturn", Position::Inside, &[], &prose),
+            vec!["lanter"],
+            "a sighting pushed past the lookback no longer spells the key out"
+        );
+        prose.push("The lantern flickers in the draught.".to_string());
+        assert_eq!(v.offer("lanturn", Position::Inside, &[], &prose), vec!["lantern"]);
     }
 
     /// A transposition is one keystroke, and the commonest typo there is — and
