@@ -663,6 +663,18 @@ pub struct GameSession {
     /// tallies every property of every object once, and the answer describes the
     /// compiler's layout, which no turn can change.
     parse_names: std::cell::OnceCell<Option<zvm::objects::ParseNames>>,
+    /// The [`parse_names`](Self::parse_names) walk folded into the one set the
+    /// bulk callers query — "does ANY object answer to this word" (SQ-1176).
+    ///
+    /// A cache, not a `OnceCell`, because unlike its neighbours it holds LIVE
+    /// data: the words sit in dynamic memory and a game can rewrite them, so
+    /// the entry is dropped whenever the VM runs ([`drain_turn`] is the funnel
+    /// every VM-stepping path drains through, and `restore_state` swaps memory
+    /// without stepping). Within a turn the screen is fixed, so one build
+    /// serves every reveal press and the seen-words sweep alike.
+    ///
+    /// [`drain_turn`]: GameSession::drain_turn
+    object_word_set: std::cell::RefCell<Option<std::sync::Arc<grammar_model::ObjectWordSet>>>,
     /// PC at which the disasm cache was last runtime-confirmed; the per-turn
     /// fold is skipped while the VM is parked at the same PC (nav/scroll calls).
     last_confirmed_pc: std::cell::Cell<Option<u32>>,
@@ -1095,6 +1107,7 @@ impl GameSession {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -1714,6 +1727,13 @@ impl GameSession {
         pending_io: Option<PendingIo>,
         timed_out: bool,
     ) -> TurnResult {
+        // The VM ran, so dynamic memory may have changed under the cached
+        // object-word set — a game CAN rewrite an object's parse-name property
+        // mid-play, and a stale set would keep answering for the old words.
+        // Every VM-stepping path drains through here (submit, timed interrupts,
+        // the game's own @restore/@restart), so this is the per-turn
+        // invalidation the cache's soundness rests on (SQ-1176).
+        self.object_word_set.take();
         // A mid-turn @restart re-booted the VM: drop the app-side v6 chrome the
         // VM's own screen reset cannot reach — the rasterized picture-canvas
         // cache and the window-0 char counters — so the reboot's fresh boot art
@@ -4861,6 +4881,10 @@ impl Engine for GameSession {
         self.machine
             .restore_file(&save.bytes)
             .map_err(|e| EngineError::BadSave(format!("{e:?}")))?;
+        // The restore swapped dynamic memory wholesale, and this path does not
+        // drain a turn — drop the cached object-word set here as `drain_turn`
+        // does, or it keeps answering for the session we just left (SQ-1176).
+        self.object_word_set.take();
         // The restored memory brings NO screen with it — Quetzal archives none by
         // design — so whatever is in the upper window belongs to the moment we
         // just left, not to the one we just restored. Leaving it there lets a
@@ -4903,6 +4927,9 @@ impl Engine for GameSession {
     fn restore_game_save(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
         self.machine.complete_restore_success(bytes)
             .map_err(|e| EngineError::BadSave(format!("{e:?}")))?;
+        // Memory was swapped without draining a turn — same duty as in
+        // `restore_state` above (SQ-1176).
+        self.object_word_set.take();
         // complete_restore_success lands mid-way through the game's save verb
         // (just past the @save descriptor), not at a read. Run forward to the
         // next read so the machine is re-armed at a clean prompt — otherwise the
@@ -5180,9 +5207,25 @@ impl Introspect for GameSession {
 
     fn all_object_words(&self) -> Option<Vec<crate::engine::ObjectWords>> {
         // `ParseNames::detect` is cached in `parse_names`; the walk itself is
-        // one pass over the object table and runs once a TURN, from
-        // `input::refresh_seen_words`, never per frame.
+        // one pass over the object table. The bulk any-object callers go
+        // through `object_word_set` below instead, which caches the walk for
+        // the rest of the turn.
         Some(self.parse_names()?.all(&self.machine.mem))
+    }
+
+    fn object_word_set(&self) -> Option<std::sync::Arc<grammar_model::ObjectWordSet>> {
+        // Whether the story keeps parse names at all is a compile-time layout
+        // fact (`parse_names` is a `OnceCell`), so a `None` needs no cache.
+        let names = self.parse_names()?;
+        if let Some(set) = self.object_word_set.borrow().as_ref() {
+            return Some(std::sync::Arc::clone(set));
+        }
+        // One walk of the object table per TURN, not per token: `drain_turn`
+        // drops the entry whenever the VM runs, because the words live in
+        // dynamic memory and a game can rewrite them (see the field's doc).
+        let set = std::sync::Arc::new(grammar_model::ObjectWordSet::build(&names.all(&self.machine.mem)));
+        *self.object_word_set.borrow_mut() = Some(std::sync::Arc::clone(&set));
+        Some(set)
     }
 
     fn children_of(&self, parent: u16) -> std::collections::BTreeSet<u16> {
@@ -7170,6 +7213,60 @@ mod tests {
         assert_eq!(pending, InputKind::Line, "a quit reports the neutral Line input mode");
     }
 
+    /// The cached object-word set is one build per TURN — and not one per
+    /// session, which is the soundness line: a game CAN rewrite an object's
+    /// parse-name property in dynamic memory, and the set must see it on the
+    /// next turn (SQ-1176).
+    ///
+    /// Driven on the committed `minizork.z3` fixture, whose lantern (object
+    /// 102) files its words under property 17 — pinned by
+    /// `zvm/tests/parse_names.rs` against the game's own parser.
+    #[test]
+    fn the_object_word_set_is_cached_for_a_turn_and_dropped_when_the_vm_runs() {
+        use crate::engine::Introspect as _;
+        use std::sync::Arc;
+
+        let story = zvm::fixtures::load("minizork.z3").expect("committed fixture");
+        let mut sess = GameSession::new(story, true, false, None).expect("minizork boots");
+
+        let first = sess.object_word_set().expect("minizork has parse names");
+        assert!(
+            first.contains("lantern") && first.contains("mailbox") && !first.contains("verbose"),
+            "the set answers as any(refers_to) answers on the real story"
+        );
+        let again = sess.object_word_set().expect("still answerable");
+        assert!(Arc::ptr_eq(&first, &again), "within a turn, one build serves every caller");
+
+        // The game rewrites its world under the cache: point the lantern's
+        // first parse word (the slot holding `lamp`) at the dictionary entry
+        // for a word no object answers to today.
+        let chosen = zvm::grammar::dictionary_words(&sess.machine.mem)
+            .into_iter()
+            .find(|w| w.text.chars().all(char::is_alphabetic) && !first.contains(&w.text))
+            .expect("minizork has verbs no object answers to");
+        let prop = zvm::objects::get_prop_addr(&sess.machine.mem, 102, 17);
+        assert_ne!(prop, 0, "the lantern keeps its words in property 17");
+        sess.machine.mem.write_word(u32::from(prop), chosen.address as u16);
+
+        // Within the same turn the cache is deliberately stale — the screen the
+        // player is reading has not changed either.
+        let stale = sess.object_word_set().expect("still answerable");
+        assert!(
+            Arc::ptr_eq(&first, &stale) && !stale.contains(&chosen.text),
+            "within a turn the cached build stands"
+        );
+
+        // A turn runs; the next build must read the rewritten memory.
+        sess.submit("look");
+        let fresh = sess.object_word_set().expect("still answerable");
+        assert!(
+            fresh.contains(&chosen.text),
+            "after a turn the set sees the rewritten parse word {:?}",
+            chosen.text
+        );
+        assert!(!Arc::ptr_eq(&first, &fresh), "and it is a fresh build, not the stale one");
+    }
+
     /// A valid 2x2 red PNG, encoded via the `image` crate (mirrors
     /// `graphics.rs`'s private test helper of the same shape).
     fn png_bytes_2x2_red() -> Vec<u8> {
@@ -7204,6 +7301,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7275,6 +7373,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7341,6 +7440,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7400,6 +7500,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7488,6 +7589,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7550,6 +7652,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7591,6 +7694,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7645,6 +7749,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7738,6 +7843,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7789,6 +7895,7 @@ mod tests {
             disasm_cache: std::cell::RefCell::new(None),
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),

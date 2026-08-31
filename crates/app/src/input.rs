@@ -3234,7 +3234,10 @@ pub fn refresh_seen_words(state: &mut AppState, engine: &dyn crate::engine::Engi
     // object table, so never per frame) — see
     // [`Introspect::all_object_words`](crate::engine::Introspect::all_object_words)
     // for why the dictionary's noun bit cannot do this job on every story.
-    let objects = engine.introspect().and_then(|i| i.all_object_words());
+    // As the folded any-object SET, not the `Vec<ObjectWords>`: `is_thing`
+    // below never asks WHICH object answers, and walking the vec re-truncated
+    // the story's whole vocabulary for every fresh word (SQ-1176).
+    let objects = engine.introspect().and_then(|i| i.object_word_set());
     // Newest first: walk the batch backwards and keep the first sighting of each
     // word, which is its LAST printing.
     let (fresh, fresh_nouns): (Vec<String>, Vec<String>) = {
@@ -3255,7 +3258,7 @@ pub fn refresh_seen_words(state: &mut AppState, engine: &dyn crate::engine::Engi
         // `brick`), so no role reading can separate them — which is the second
         // reason the objects are the better question where they exist.
         let is_thing = |w: &str| match &objects {
-            Some(objs) => objs.iter().any(|o| o.refers_to(w)),
+            Some(set) => set.contains(w),
             None => vocab.is_some_and(|v| v.roles(w).is_some_and(|r| r.noun && !r.preposition)),
         };
         let mut out: Vec<String> = Vec::new();

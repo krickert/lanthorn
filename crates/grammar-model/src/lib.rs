@@ -62,7 +62,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// The parser's built-in noun slots.
 ///
@@ -787,6 +787,66 @@ impl ObjectWords {
     }
 }
 
+/// "Does ANY object answer to this word?" — [`ObjectWords::refers_to`] asked of
+/// a whole story at once, as one membership set.
+///
+/// The bulk callers — a reveal that lights every word on screen, a per-turn
+/// sweep of freshly printed prose — ask that question tokens × objects × words
+/// times, and `refers_to` allocates a lowercased copy of the query *and* a
+/// truncated copy of every stored word on every call. Building this set pays
+/// the truncation once per stored word; a query then costs one lowercase and
+/// one truncation per distinct truncation rule (one rule per engine in
+/// practice), not one per object.
+///
+/// It answers only the ANY question. A caller that needs to know *which*
+/// object a word names still walks the objects with `refers_to`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectWordSet {
+    /// One entry per distinct truncation rule among the objects it was built
+    /// from — [`ObjectWords::truncated_at`] is per object, so a query must be
+    /// truncated the way each stored word was, not once globally. Every object
+    /// of one engine shares one rule (six characters on a v1–3 Z-machine, nine
+    /// on v4+, the header's word length on Scott Adams), so this holds a single
+    /// entry in practice and `contains` stays O(1).
+    keys: Vec<(Option<usize>, HashSet<String>)>,
+}
+
+impl ObjectWordSet {
+    /// Fold a story's objects into the set. Nouns and adjectives both count,
+    /// exactly as [`ObjectWords::refers_to`] counts them: each stored word is
+    /// kept truncated by its own object's rule, verbatim otherwise.
+    pub fn build<'a>(objects: impl IntoIterator<Item = &'a ObjectWords>) -> ObjectWordSet {
+        let mut keys: Vec<(Option<usize>, HashSet<String>)> = Vec::new();
+        for o in objects {
+            let set = match keys.iter().position(|(n, _)| *n == o.truncated_at) {
+                Some(i) => &mut keys[i].1,
+                None => {
+                    keys.push((o.truncated_at, HashSet::new()));
+                    &mut keys.last_mut().expect("just pushed").1
+                }
+            };
+            for w in o.words.iter().chain(o.adjectives.words()) {
+                set.insert(o.truncate(w));
+            }
+        }
+        ObjectWordSet { keys }
+    }
+
+    /// True exactly when `objects.iter().any(|o| o.refers_to(word))` would be
+    /// true of the objects this set was built from: the query is trimmed and
+    /// lowercased once, then truncated per stored rule and looked up.
+    pub fn contains(&self, word: &str) -> bool {
+        if self.keys.is_empty() {
+            return false;
+        }
+        let lower = word.trim().to_lowercase();
+        self.keys.iter().any(|(rule, set)| match rule {
+            Some(n) => set.contains(&lower.chars().take(*n).collect::<String>()),
+            None => set.contains(&lower),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,6 +1023,44 @@ mod tests {
             None
         );
         assert_eq!(o.describe(), "brass lantern [lamp, lanter, light]");
+    }
+
+    /// The set is `any(refers_to)` and nothing more — same truncation, same
+    /// lowercasing, adjectives counted, and mixed rules kept apart.
+    #[test]
+    fn the_word_set_answers_exactly_as_any_object_refers_to_answers() {
+        let zork = ObjectWords {
+            id: 102,
+            printed_name: "brass lantern".into(),
+            words: vec!["lamp".into(), "lanter".into(), "light".into()],
+            property: Some(18),
+            truncated_at: Some(6),
+            adjectives: Adjectives::Unavailable,
+        };
+        // A second rule in the same set, and an adjective list that counts.
+        let scott = ObjectWords::new(9, "a jewelled crown".into(), vec!["crown".into()], None, Some(3))
+            .with_adjectives(vec!["jewelled".into()], 2);
+        let objects = [zork, scott];
+        let set = ObjectWordSet::build(&objects);
+
+        for probe in
+            ["lanter", "lantern", "LAMP", "lan", "sword", "crown", "crowns", "cro", "cr", "jewelled", "jew", "  light "]
+        {
+            assert_eq!(
+                set.contains(probe),
+                objects.iter().any(|o| o.refers_to(probe)),
+                "set and refers_to disagree on {probe:?}"
+            );
+        }
+        // And the spot answers those comparisons encode, so a shared wrong
+        // answer cannot slip through the equivalence loop.
+        assert!(set.contains("lantern") && set.contains("crowns") && set.contains("jewelled"));
+        // The rules stay apart: `lan` is short of the six-character rule and
+        // must not match through the three-character one.
+        assert!(!set.contains("sword") && !set.contains("lan"));
+
+        assert!(!ObjectWordSet::default().contains("anything"));
+        assert!(!ObjectWordSet::build([].into_iter()).contains("lamp"));
     }
 
     #[test]

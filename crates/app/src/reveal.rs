@@ -240,10 +240,15 @@ pub fn arm(state: &mut AppState, engine: &dyn Engine) -> Armed {
     // (SQ-1150): it is the second tier's input, so a story whose objects answer
     // must not be turned away for want of one, and the `NoVocabulary` below then
     // means exactly what it says — neither tier could be asked.
-    let words = match engine.introspect().and_then(|i| i.all_object_words()) {
-        Some(objs) => tokens
+    // `object_word_set`, not `all_object_words` + a `refers_to` walk: this asks
+    // only "does ANY object answer", for every token on screen, and the walk
+    // re-truncated the story's whole vocabulary per token (SQ-1176). Same
+    // answers — the set is `any(refers_to)` by construction — and `None` still
+    // means the question could not be asked, never a story with no names.
+    let words = match engine.introspect().and_then(|i| i.object_word_set()) {
+        Some(set) => tokens
             .iter()
-            .filter(|t| objs.iter().any(|o| o.refers_to(t)))
+            .filter(|t| set.contains(t))
             .cloned()
             .collect::<BTreeSet<String>>(),
         None => {

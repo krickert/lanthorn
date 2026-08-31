@@ -20,7 +20,7 @@ use crate::session::{FilenameReq, InputKind, TurnResult};
 /// [`Introspect`] names it without depending on `grammar-model` directly.
 /// [`Adjectives`] travels with it: it says whether the story could be asked for
 /// an object's adjectives at all, which is a different claim from having none.
-pub use grammar_model::{Adjectives, ObjectWords};
+pub use grammar_model::{Adjectives, ObjectWordSet, ObjectWords};
 
 // ── Neutral key input ───────────────────────────────────────────────────────
 
@@ -516,6 +516,25 @@ pub trait Introspect {
     /// reports "this story names no things" about one it never managed to read.
     fn all_object_words(&self) -> Option<Vec<ObjectWords>> {
         None
+    }
+    /// [`all_object_words`](Introspect::all_object_words) folded into the one
+    /// question its bulk callers ask — **does ANY object answer to this word**
+    /// — as a set with O(1) membership (SQ-1176).
+    ///
+    /// The reveal asks it for every token on screen and `refresh_seen_words`
+    /// for every freshly printed word, each against every object's every word;
+    /// walking `Vec<ObjectWords>` with `refers_to` re-truncates the whole
+    /// vocabulary per token. The set truncates each stored word once. A caller
+    /// that needs to know *which* object answers still wants the `Vec`.
+    ///
+    /// `None` means exactly what it means on `all_object_words`: the question
+    /// could not be asked. An empty set is a story that was asked and holds no
+    /// parse names. The `Arc` lets an engine hand out one cached build — the
+    /// words are static story data in practice, though a game CAN rewrite them,
+    /// so an implementation that caches must invalidate whenever the VM runs
+    /// (see `GameSession::object_word_set`).
+    fn object_word_set(&self) -> Option<std::sync::Arc<ObjectWordSet>> {
+        self.all_object_words().map(|objs| std::sync::Arc::new(ObjectWordSet::build(&objs)))
     }
     /// The object handles whose parent is `parent` (drives inventory tracking).
     fn children_of(&self, parent: u16) -> std::collections::BTreeSet<u16>;
