@@ -486,9 +486,12 @@ pub fn v6_status_room_candidates(machine: &Machine) -> Vec<String> {
 ///    None rather than inventing a room.
 fn detect_location_v6(machine: &Machine) -> Option<Location> {
     let cands = v6_status_candidates(machine);
-    // 1. PlayerParent across all candidates.
+    // 1. PlayerParent across all candidates. The avatar set does not depend on
+    //    the candidate, and `player_candidates` walks the whole object table
+    //    decoding every short name — hoist it out of the loop (SQ-1183).
+    let players = player_candidates(machine);
     for cand in &cands {
-        for player in player_candidates(machine) {
+        for &player in &players {
             if let Some(room) = nearest_matching_ancestor(machine, player, &cand.name) {
                 return Some(Location::PlayerParent(room));
             }
