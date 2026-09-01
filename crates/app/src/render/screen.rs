@@ -987,7 +987,7 @@ fn render_node(
                                             fill_pane_page(fill, bg, buf);
                                             gr.draw_chrome_band_stretched(
                                                 picker,
-                                                &canvas,
+                                                canvas,
                                                 dest,
                                                 crop,
                                                 crate::render::graphics::BandSlot::Art,
@@ -1046,7 +1046,7 @@ fn render_node(
                                             // `art_tiles` is the identity on a side flank,
                                             // and on every backend that does not tile.
                                             for t in art_tiles(*role, *r) {
-                                                gr.draw_chrome_band(picker, &canvas, &scale, area, t, buf);
+                                                gr.draw_chrome_band(picker, canvas, &scale, area, t, buf);
                                             }
                                         }
                                     }
@@ -1075,7 +1075,7 @@ fn render_node(
                                 match ink {
                                     BorderInk::Band(crop) => gr.draw_chrome_band_stretched(
                                         picker,
-                                        &canvas,
+                                        canvas,
                                         *ext,
                                         *crop,
                                         crate::render::graphics::BandSlot::DividerExtension,
@@ -1105,7 +1105,7 @@ fn render_node(
                             if let Some(ms) = &menu {
                                 for strip in &frame.menu_strips {
                                     match strip {
-                                        ChromeStrip::Art(_, r) => gr.draw_chrome_band(picker, &canvas, ms, area, *r, buf),
+                                        ChromeStrip::Art(_, r) => gr.draw_chrome_band(picker, canvas, ms, area, *r, buf),
                                         ChromeStrip::Text(r, runs) => {
                                             let refs: Vec<&crate::engine::PxText> = runs.iter().collect();
                                             draw_chrome_text_strip(
@@ -6992,10 +6992,10 @@ fn menu_band_rows(menu: &[&crate::engine::PxText], cell: zvm::screen::V6Cell) ->
 /// leave run-less gaps inside the band (Art strips redrawing squashed slices of the
 /// frame's edge, SQ-0548) and, where the spread runs past the band's last row, drop
 /// the runs that landed outside it — the menu's own last line.
-fn menu_band_strips<'a>(
+fn menu_band_strips(
     bands: &[Rect],
     story: &crate::engine::PositionedWindow,
-    runs: &[&'a crate::engine::PxText],
+    runs: &[&crate::engine::PxText],
 ) -> Vec<ChromeStrip> {
     let menu = menu_band_runs(runs, story);
     bands.iter().map(|b| ChromeStrip::Text(*b, menu.iter().map(|t| (*t).clone()).collect())).collect()
