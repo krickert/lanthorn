@@ -104,6 +104,20 @@ impl Memory {
         self.orig.get(addr as usize).copied().unwrap_or(0)
     }
 
+    /// The whole current memory map as one slice — the fast path for whole-RAM
+    /// operations (`CMem` compression), where a bounds-checked `read8` per byte
+    /// is pure call overhead (SQ-1177).
+    pub(crate) fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The original image `[0, EXTSTART)` as one slice — the diff base
+    /// [`Self::orig_byte`] reads one byte at a time. Bytes at and above EXTSTART
+    /// are zero by definition and are NOT in this slice.
+    pub(crate) fn orig_bytes(&self) -> &[u8] {
+        &self.orig
+    }
+
     /// Write one byte directly, bypassing the ROM/range checks. The caller
     /// guarantees `addr` is in range; used only by save-state restore to lay
     /// down the reconstructed RAM image.

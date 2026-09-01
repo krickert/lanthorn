@@ -162,6 +162,7 @@ impl Play {
             &*self.session,
             cmd,
             room_before,
+            &mut app::engine::TurnSave::default(),
         );
         app::return_probe::settle_return_search(&mut self.state, &mut self.mapper)
     }
@@ -315,6 +316,7 @@ fn an_aborted_search_keeps_what_it_answered_and_the_next_one_resumes() {
         &*p.session,
         "north",
         Some(west),
+        &mut app::engine::TurnSave::default(),
     );
     assert!(app::return_probe::pump_return_search(&mut p.state), "one attempt went out");
     let answer = p.state.probe.settle().expect("the shadow answered it");
@@ -330,7 +332,7 @@ fn an_aborted_search_keeps_what_it_answered_and_the_next_one_resumes() {
     let r = p.session.submit("east");
     let room_before = p.mapper.graph.current();
     app::session::apply_turn(&mut p.mapper, "east", &r, &mut p.death);
-    app::return_probe::arm_return_search(&mut p.state, &p.mapper, &*p.session, "east", room_before);
+    app::return_probe::arm_return_search(&mut p.state, &p.mapper, &*p.session, "east", room_before, &mut app::engine::TurnSave::default());
     assert_ne!(p.mapper.graph.current(), Some(north), "the move really left the room");
 
     // Come back, and the search picks up where it stopped.
@@ -338,7 +340,7 @@ fn an_aborted_search_keeps_what_it_answered_and_the_next_one_resumes() {
     let room_before = p.mapper.graph.current();
     app::session::apply_turn(&mut p.mapper, "north", &r, &mut p.death);
     assert_eq!(p.mapper.graph.current(), Some(north), "back at North of House");
-    app::return_probe::arm_return_search(&mut p.state, &p.mapper, &*p.session, "north", room_before);
+    app::return_probe::arm_return_search(&mut p.state, &p.mapper, &*p.session, "north", room_before, &mut app::engine::TurnSave::default());
     if let Some(s) = &p.state.return_search {
         assert!(
             !mapper::direction::PROBE_DIRS.is_empty() && s.remaining() < 12,
@@ -369,6 +371,7 @@ fn a_busy_shadow_makes_the_search_wait_rather_than_give_up() {
         &*p.session,
         "north",
         Some(west),
+        &mut app::engine::TurnSave::default(),
     );
 
     // Somebody else's question is out with the worker.
@@ -444,7 +447,7 @@ fn a_search_that_finds_nothing_leaves_the_map_as_it_was() {
         m.graph.mark_probed(2, d);
     }
     let conns = m.graph.connections().to_vec();
-    app::return_probe::arm_return_search(&mut p.state, &m, &*p.session, "north", Some(1));
+    app::return_probe::arm_return_search(&mut p.state, &m, &*p.session, "north", Some(1), &mut app::engine::TurnSave::default());
     assert!(
         p.state.return_search.is_none(),
         "every candidate already walked leaves nothing to ask, and nothing is recorded"

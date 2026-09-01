@@ -223,6 +223,7 @@ pub fn arm_return_search(
     live: &dyn Engine,
     cmd: &str,
     room_before: Option<RoomId>,
+    turn_save: &mut crate::engine::TurnSave,
 ) {
     let here = mapper.graph.current();
     // A move ends any search that was running: the room it was asking about is
@@ -251,8 +252,10 @@ pub fn arm_return_search(
         return;
     }
     // The one snapshot the whole search runs from, and the one thing here the
-    // player's thread pays for. Taken now rather than per attempt.
-    let Some(from) = state.probe.snapshot(live) else { return };
+    // player's thread pays for. Taken now rather than per attempt — and shared
+    // with this turn's history capture and auto-save (SQ-1178), so arming a
+    // search costs no extra save_state when either of those already paid.
+    let Some(from) = state.probe.snapshot_from(live, || turn_save.get(live)) else { return };
     queue.reverse(); // popped from the back, so the best candidate goes last
     state.return_search = Some(ReturnSearch { origin, here, queue, attempt: None, from });
 }
@@ -434,7 +437,7 @@ mod tests {
         let mut m = Mapper::default();
         walked(&mut m);
         let mut state = armed_state();
-        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1));
+        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1), &mut crate::engine::TurnSave::default());
         let s = state.return_search.as_ref().expect("a gap to close");
         assert_eq!((s.here(), s.origin()), (2, 1));
         assert_eq!(s.remaining(), 12, "all twelve, best first");
@@ -443,7 +446,7 @@ mod tests {
         m.observe(1, "Behind House", Some(Direction::E));
         m.observe(2, "Kitchen", Some(Direction::In));
         let mut state = armed_state();
-        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1));
+        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1), &mut crate::engine::TurnSave::default());
         assert!(state.return_search.is_none(), "no gap, no probe");
     }
 
@@ -456,11 +459,11 @@ mod tests {
         walked(&mut m);
         let mut state = armed_state();
 
-        arm_return_search(&mut state, &m, &blind(), "look", Some(2));
+        arm_return_search(&mut state, &m, &blind(), "look", Some(2), &mut crate::engine::TurnSave::default());
         assert!(state.return_search.is_none(), "the player did not cross anything");
 
         m.observe_relocation(3, "Forest");
-        arm_return_search(&mut state, &m, &blind(), "north", Some(2));
+        arm_return_search(&mut state, &m, &blind(), "north", Some(2), &mut crate::engine::TurnSave::default());
         assert!(state.return_search.is_none(), "a relocation walked no passage");
     }
 
@@ -473,13 +476,13 @@ mod tests {
 
         let mut off = armed_state();
         off.config.return_probe = false;
-        arm_return_search(&mut off, &m, &blind(), "enter window", Some(1));
+        arm_return_search(&mut off, &m, &blind(), "enter window", Some(1), &mut crate::engine::TurnSave::default());
         assert!(off.return_search.is_none());
 
         let mut unarmed = AppState::default();
         unarmed.config.return_probe = true;
         assert!(!unarmed.probe.is_armed());
-        arm_return_search(&mut unarmed, &m, &blind(), "enter window", Some(1));
+        arm_return_search(&mut unarmed, &m, &blind(), "enter window", Some(1), &mut crate::engine::TurnSave::default());
         assert!(unarmed.return_search.is_none());
     }
 
@@ -490,14 +493,14 @@ mod tests {
         let mut m = Mapper::default();
         walked(&mut m);
         let mut state = armed_state();
-        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1));
+        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1), &mut crate::engine::TurnSave::default());
         assert!(state.return_search.is_some());
 
-        arm_return_search(&mut state, &m, &blind(), "take lamp", Some(2));
+        arm_return_search(&mut state, &m, &blind(), "take lamp", Some(2), &mut crate::engine::TurnSave::default());
         assert!(state.return_search.is_some(), "a still turn leaves it alone");
 
         m.observe(3, "Attic", Some(Direction::Up));
-        arm_return_search(&mut state, &m, &blind(), "up", Some(2));
+        arm_return_search(&mut state, &m, &blind(), "up", Some(2), &mut crate::engine::TurnSave::default());
         let s = state.return_search.as_ref().expect("a fresh search from the new room");
         assert_eq!((s.here(), s.origin()), (3, 2), "the old one is gone, not resumed");
     }
@@ -512,7 +515,7 @@ mod tests {
         m.graph.mark_probed(2, Direction::Out); // an earlier search got this far
         m.graph.mark_probed(2, Direction::N);
         let mut state = armed_state();
-        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1));
+        arm_return_search(&mut state, &m, &blind(), "enter window", Some(1), &mut crate::engine::TurnSave::default());
         let s = state.return_search.as_ref().expect("still worth asking");
         assert_eq!(s.remaining(), 10, "the two already walked are not offered again");
     }
