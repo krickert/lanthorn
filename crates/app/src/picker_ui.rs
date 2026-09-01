@@ -1647,7 +1647,10 @@ pub(crate) fn run_story_picker(
         // draw is at the top of the loop, and once the result is cached
         // `cover_busy` goes false — without this the loop would block on `read()`
         // and the new cover wouldn't appear until the next input event.
-        if cover_arrived || fetch_arrived || hint_arrived || search_arrived || url_arrived {
+        // `index_grew` too (SQ-none): a find's matches and the gallery's scope
+        // widen as folders are indexed, and a header that counts them must
+        // repaint without waiting for a key.
+        if cover_arrived || fetch_arrived || hint_arrived || search_arrived || url_arrived || index_grew {
             list.finalize_if_done();
             continue;
         }
