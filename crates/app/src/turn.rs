@@ -412,6 +412,13 @@ fn post_turn_bookkeeping(
     arc_file: &std::path::Path,
     turn_save: &mut app::engine::TurnSave,
 ) {
+    // A background archive write from an earlier turn can fail after this
+    // turn has already moved on (SQ-1184) — surface it now rather than lose
+    // it, on whichever later tick first calls back in here.
+    for msg in state.archive_worker.drain_failures() {
+        state.push_notice(&format!("[Auto-save failed: {}]", msg));
+    }
+
     // ── Rewind/replay capture (opt-in) ────────────────────────────
     // Skip the quit turn: the VM has terminated, so its snapshot has
     // no replayable state — recording it just adds a junk final turn.
@@ -430,6 +437,10 @@ fn post_turn_bookkeeping(
             map_changed,
             &result.transcript,
         );
+        // Bound retained turns (SQ-1185): `TurnRecord::save` is a full VM
+        // snapshot, so left uncapped this grows without limit over an
+        // arbitrarily long session.
+        app::history::cap_history(&mut state.history, state.config.history_turns);
     }
 
     // ── Inventory tracking ────────────────────────────────────────
@@ -486,8 +497,14 @@ fn post_turn_bookkeeping(
     // the room and are the ones a player cannot guess (SQ-1042).
     app::input::refresh_scope_words(state, session);
 
-    // Per-turn auto-save (when enabled). Non-fatal: failure is shown in the
-    // transcript status line so the player is aware but the loop continues.
+    // Per-turn auto-save (when enabled). The build-and-write happens on a
+    // background worker thread (SQ-1184): everything gathered here is either
+    // an `Arc` clone (this turn's engine snapshot, every inline image, every
+    // retained history turn) or a small owned copy, never the JSON-serialize
+    // + Deflate + PNG-encode work that used to run on this thread every turn.
+    // A write failure is non-fatal and is drained (and shown) at the top of
+    // THIS function on a later turn, since it can only be known after this
+    // call returns.
     // Engine-neutral: the save routes through Engine::save_state (Quetzal for
     // zvm, the gvm snapshot for Glulx); screen.json is written for zvm only.
     if state.config.auto_save {
@@ -509,15 +526,27 @@ fn post_turn_bookkeeping(
         };
         // v6 graphics canvases ride along so a resumed v6 story's pictures redraw
         // (SQ-0516); empty for non-v6 sessions, leaving the archive layout unchanged.
+        // Must run here, on the main thread: it needs `&mut dyn Engine`.
         let (v6_pics, v6_display, v6_ground, v6_diags) = crate::engine_helpers::v6_save_payload(session);
         for d in &v6_diags { state.note_v6_save(d); }
         // The same turn snapshot history and the return probe read (SQ-1178):
         // the word refreshers and inventory tracking above read through
         // `&dyn Engine`, so the VM here is byte-identical to the VM there.
-        let shared = turn_save.get(&*session);
-        if let Err(e) = app::archive::save_archive_meta_pics(arc_file, mapper, &shared, zvm_session_opt(session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref()) {
-            state.push_notice(&format!("[Auto-save failed: {}]", e));
-        }
+        let save = turn_save.get(&*session);
+        let screen = zvm_session_opt(session).map(|z| z.machine.screen.clone());
+        let job = app::archive_worker::ArchiveJob {
+            path: arc_file.to_path_buf(),
+            mapper_graph: mapper.graph.clone(),
+            save,
+            screen,
+            aux: session.aux_data().clone(),
+            meta,
+            session: app::archive::SessionRecord::of(state).snapshot(),
+            pictures: v6_pics,
+            display: v6_display,
+            ground: v6_ground,
+        };
+        state.archive_worker.enqueue(job);
     }
 }
 
@@ -1751,11 +1780,15 @@ mod tests {
         let result = game_driven_result(None);
 
         super::post_turn_bookkeeping(&mut state, &mapper, &mut sess, &result, "look", 0, 0, "TEST-IFID", &arc_file, &mut app::engine::TurnSave::default());
+        // The write now happens on the background archive worker (SQ-1184);
+        // flush before asserting on disk.
+        state.archive_worker.flush();
 
         assert!(
             state.overlays.confirm_overwrite_save.is_none(),
             "the auto-save path must never open the overwrite-confirm overlay"
         );
+        assert!(state.archive_worker.drain_failures().is_empty(), "the auto-save must succeed");
         let after = std::fs::read(&arc_file).unwrap();
         assert_ne!(after, before, "the auto-save actually wrote over the existing slot, silently");
 

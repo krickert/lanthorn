@@ -786,6 +786,11 @@ impl CommandBandConfig {
 
 fn default_command_prefix() -> char { '/' }
 fn default_undo_levels() -> usize { 16 }
+/// Rewind/replay history cap (SQ-1185): generous enough that the feature still
+/// reaches "further back than the game's own UNDO" (`docs/features/saves.md`),
+/// while bounding the per-turn VM snapshots the archive keeps in memory across
+/// an arbitrarily long session.
+fn default_history_turns() -> usize { 500 }
 
 /// Fallback screen size used only before the story pane has been measured (the
 /// engine boots before the first frame) and by the Glulx factory, whose real
@@ -1347,6 +1352,12 @@ pub struct Config {
     /// the archive and keeps per-turn blobs in memory).
     #[serde(default)]
     pub record_turn_history: bool,
+    /// How many of the most recent turns `record_turn_history` retains before
+    /// evicting the oldest (SQ-1185) — bounds memory on a long session rather
+    /// than growing without limit. No "unbounded" setting: a value below 1 is
+    /// clamped to 1, since the whole point of this key is a guaranteed bound.
+    #[serde(default = "default_history_turns")]
+    pub history_turns: usize,
     /// When true (default), auto-skip the InvisiClues "your screen is only N
     /// characters wide…" banner that izm hint files print at startup, landing the
     /// player straight on the topic menu. Set false to see the banner and dismiss
@@ -2045,6 +2056,7 @@ impl Default for Config {
             prompt_save_on_quit: true,
             prompt_load_on_launch: true,
             record_turn_history: false,
+            history_turns: default_history_turns(),
             hint_skip_screen_warning: true,
             guidance: true,
             guidance_probe: true,
@@ -2179,6 +2191,7 @@ pub fn resolve(cli: &Cli) -> Config {
             cfg.prompt_save_on_quit = from_file.prompt_save_on_quit;
             cfg.prompt_load_on_launch = from_file.prompt_load_on_launch;
             cfg.record_turn_history = from_file.record_turn_history;
+            cfg.history_turns = from_file.history_turns;
             cfg.hint_skip_screen_warning = from_file.hint_skip_screen_warning;
             cfg.guidance = from_file.guidance;
             cfg.guidance_probe = from_file.guidance_probe;
@@ -2549,6 +2562,7 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
         cfg.font_check_pending == def.font_check_pending,
     );
     doc.put("record_turn_history", cfg.record_turn_history.into(), cfg.record_turn_history == def.record_turn_history);
+    doc.put("history_turns", (cfg.history_turns as i64).into(), cfg.history_turns == def.history_turns);
     // Three one-run sources reach this key and `put` skips all three the same way:
     // a discovered garglk.ini, this game's own sidecar, and two-colour ARTWORK,
     // which has no colours to give and so declares the interpreter colourless for
@@ -2736,6 +2750,18 @@ mod tests {
         assert!(!Config::default().record_turn_history);
         let cfg: Config = toml::from_str("record_turn_history = true\n").unwrap();
         assert!(cfg.record_turn_history);
+    }
+
+    /// SQ-1185: the history cap defaults generously (deep enough that the
+    /// feature still reaches "further back than the game's own UNDO"), an
+    /// absent key reads as that default, and a set value round-trips.
+    #[test]
+    fn history_turns_defaults_to_500_and_round_trips() {
+        assert_eq!(Config::default().history_turns, 500);
+        let absent: Config = toml::from_str("").unwrap();
+        assert_eq!(absent.history_turns, 500, "an absent key is the default, not 0");
+        let cfg: Config = toml::from_str("history_turns = 50\n").unwrap();
+        assert_eq!(cfg.history_turns, 50);
     }
 
     #[test]
@@ -3434,6 +3460,7 @@ use_defaults = false
             prompt_save_on_quit: true,
             prompt_load_on_launch: true,
             record_turn_history: false,
+            history_turns: default_history_turns(),
             hint_skip_screen_warning: true,
             guidance: true,
             guidance_probe: true,

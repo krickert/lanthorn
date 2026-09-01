@@ -328,6 +328,11 @@ pub(crate) fn dispatch_slash_outcome(
                 // SQ-0588: the display list travels with this save too — this is
                 // the interactive Save State path, and an archive written
                 // without it restores art that can never be recoloured.
+                // Land any in-flight background per-turn auto-save first (SQ-1184):
+                // this writes the same default slot, so an explicit /save that
+                // reports "saved" must not race a background write for an
+                // earlier turn onto the same file.
+                state.archive_worker.flush();
                 let (v6_pics, v6_display, v6_ground, v6_diags) = crate::engine_helpers::v6_save_payload(&mut *session);
                 for d in &v6_diags { state.note_v6_save(d); }
                 let (location, score) = crate::engine_helpers::save_summary(&*session, state);

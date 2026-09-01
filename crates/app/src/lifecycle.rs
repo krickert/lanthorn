@@ -39,6 +39,12 @@ pub(crate) fn exit_auto_save(
     // does not kill the process mid-write and lose it (SQ-0651 / partial SQ-0644).
     // Held for the whole snapshot+write; cleared on drop, unwind included.
     let _writing = crate::ExitSaveGuard::new();
+    // Land any in-flight background auto-save write (SQ-1184) BEFORE this
+    // function does its own synchronous write to the same path — otherwise a
+    // background write still catching up on the last turn could finish AFTER
+    // this one and overwrite the exit save with a stale turn, or the two
+    // could interleave onto the file. See `archive_worker::ArchiveWorker::flush`.
+    state.archive_worker.flush();
     let (location, score) = crate::engine_helpers::save_summary(session, state);
     let exit_meta = app::archive::Meta {
         format_version: app::archive::CURRENT_FORMAT_VERSION,
@@ -92,6 +98,9 @@ pub(crate) fn quit_dialog_save(
     if session.is_saveload_pending() {
         return None;
     }
+    // See the matching comment in `exit_auto_save` (SQ-1184): this writes the
+    // same path a background per-turn auto-save may still be catching up on.
+    state.archive_worker.flush();
     let (location, score) = crate::engine_helpers::save_summary(session, state);
     let meta = app::archive::Meta {
         format_version: app::archive::CURRENT_FORMAT_VERSION,
@@ -333,5 +342,75 @@ mod tests {
 
         assert!(!arc_file.exists(), "quit-dialog save must not write while a save/restore is pending");
         let _ = std::fs::remove_file(&arc_file);
+    }
+
+    /// SQ-1184: `exit_auto_save` must FLUSH any in-flight background per-turn
+    /// auto-save before doing its own synchronous write to the same path — or a
+    /// slow background write for an EARLIER turn can land AFTER the exit write
+    /// and silently overwrite it with stale data, exactly the "quit loses the
+    /// last turn" bug the flush exists to prevent.
+    ///
+    /// Falsifies deterministically rather than by luck: the background job
+    /// below carries several MB of incompressible bytes so its Deflate pass
+    /// takes measurably longer than `exit_auto_save`'s own tiny synchronous
+    /// write. Comment out the `state.archive_worker.flush()` call in
+    /// `exit_auto_save` and this test reliably fails with `turns == 999` (the
+    /// stale job landing last) instead of `0` (the exit write).
+    #[test]
+    fn exit_auto_save_flushes_a_pending_background_write_before_its_own_write() {
+        let dir = app::scratch_dir("lifecycle-exit-flush");
+        let arc_file = dir.join("default.lanthorn");
+
+        let mut engine = SnapshotableEngine::new();
+        let mut state = app::state::AppState::default();
+        state.config.auto_save = true;
+        state.turns = 0; // exit_auto_save's own write carries this turn count
+        let mapper = mapper::mapper::Mapper::default();
+
+        // Several MB of incompressible bytes: a real Deflate pass, not a
+        // near-instant run of zeros, so this job reliably outlasts
+        // exit_auto_save's own write when NOT flushed first.
+        let mut noise = vec![0u8; 6 * 1024 * 1024];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        let mut aux = std::collections::BTreeMap::new();
+        aux.insert("noise".to_string(), noise);
+        let stale_job = app::archive_worker::ArchiveJob {
+            path: arc_file.clone(),
+            mapper_graph: mapper::mapper::Mapper::default().graph,
+            save: std::sync::Arc::new(app::engine::EngineSave::new("test", 1, vec![9, 9, 9])),
+            screen: None,
+            aux,
+            meta: app::archive::Meta {
+                format_version: app::archive::CURRENT_FORMAT_VERSION,
+                ifid: None,
+                name: None,
+                turns: 999, // the STALE marker this test must NOT see win
+                saved_at: String::new(),
+                location: None,
+                score: None,
+                trigger: app::archive::SaveTrigger::HostState,
+            },
+            session: app::archive::SessionRecord::empty().snapshot(),
+            pictures: Vec::new(),
+            display: None,
+            ground: None,
+        };
+        state.archive_worker.enqueue(stale_job);
+
+        super::exit_auto_save(&mut engine, &mapper, &state, "ZCODE-1", &arc_file);
+
+        let meta = app::archive::read_archive_meta(&arc_file).expect("archive readable");
+        assert_eq!(
+            meta.turns, 0,
+            "exit's own write must be the one left on disk, not the stale background job (SQ-1184)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
