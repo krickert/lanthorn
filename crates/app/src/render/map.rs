@@ -566,14 +566,15 @@ fn derived_tables<'a>(rm: &RenderMap, state: &'a AppState, zoom: Zoom) -> Derive
                 &o.as_ref().expect("populated above").2
             }))
         }
-        None => DerivedSource::Fresh(build_derived(rm, zoom)),
+        None => DerivedSource::Fresh(Box::new(build_derived(rm, zoom))),
     }
 }
 
 /// Where [`derived_tables`] found its answer; derefs to the tables either way.
 enum DerivedSource<'a> {
     Cached(std::cell::Ref<'a, MapDerived>),
-    Fresh(MapDerived),
+    // Boxed so the enum stays pointer-sized either way (clippy: large_enum_variant).
+    Fresh(Box<MapDerived>),
 }
 
 impl std::ops::Deref for DerivedSource<'_> {
