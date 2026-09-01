@@ -756,7 +756,9 @@ know which side you're on).
 
 ## Story picker
 Point lanthorn at a directory instead of a story file
-(`lanthorn path/to/stories/`) and it opens a picker of your whole library. Each
+(`lanthorn path/to/stories/`) and it opens a picker of your whole library, one
+folder at a time: sub-folders are rows at the top of the list, `Enter` on one
+descends, and `Backspace` (or the `..` row) comes back up. Each
 row shows the title (or filename), and a right-hand **TYPE** column names the
 engine and version at a glance — `Z5`, `Z5 (blorb)`, `Z6 (ADF)`, `G3.1.2`,
 `Scott`, or `Scott (blorb)` — so all three engines are told apart on sight. Two
@@ -1012,6 +1014,36 @@ what "detected" means and how to name an archive the detector can't see.
 
 `↑`/`↓`/`j`/`k`/PgUp/PgDn/Home/End navigate, `Enter` or a click opens the story,
 `q`/`Esc` quits back to the shell.
+
+### Folders, and finding a story anywhere in them
+
+A library of two thousand files gets sorted into folders, and the picker follows
+them. It lists **one folder at a time**: the sub-folders first (in the
+`story_folder` colour, `folder` in the TYPE column, and a `..` row above them
+when you are below the root), then that folder's stories. `Enter` or a
+double-click on a folder row opens it, `Backspace` goes up one, and the
+selection lands back on the folder you just left. Downloads (`U`, `/`) land in
+the folder on screen. Everything else is unchanged: sorting keeps the folders
+on top under every column, and a fetch sweep (`r`) covers the folder's stories
+and skips its folders.
+
+**`Ctrl+F` finds a story anywhere under the root.** It opens a type-to-filter
+field in the footer over an **in-memory index of the whole library** that the
+picker starts building the moment it opens, one folder at a time on its own
+thread, so the folder view is up in one directory's time and the index catches
+up behind it (the header says `indexing, N so far` until it has, and a query
+typed early widens as folders arrive). Every word you type has to occur,
+case-insensitively, in a story's title, author, filename or folder, so
+`german z5` and `nelson curses` both do what they look like. An empty query
+lists the whole library flat. Matches carry their folder after the title,
+muted; `↑`/`↓` move through them while you type, `Enter` opens the selected
+one, and `Esc` puts the folder view back where it was. Both keys are bindable
+(`find-story`, `parent-folder`) like every other browser command.
+
+One caveat: a story's saves and fetched metadata live under a directory named
+from its **filename**, so two *different* games that share a filename in two
+folders share that directory too. Keep filenames unique across the library, as
+the IF Archive's own layout does.
 
 **Shift-Enter** opens the story's **launch options** instead of launching it —
 the boot-time choices lanthorn can only honour *before* a game starts: which
