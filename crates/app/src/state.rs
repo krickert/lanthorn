@@ -3000,8 +3000,11 @@ pub struct AppState {
     pub persist_debug_trace: bool,
 
     /// Per-turn rewind/replay history. Filled when `config.record_turn_history`
-    /// is on; persisted into the `.lanthorn` archive. Empty otherwise.
-    pub history: Vec<crate::history::TurnRecord>,
+    /// is on; persisted into the `.lanthorn` archive. Empty otherwise. `Arc`-
+    /// wrapped (SQ-1184) so handing a snapshot to the background archive
+    /// writer is a pointer-copy per turn, not a copy of every retained VM
+    /// snapshot.
+    pub history: Vec<std::sync::Arc<crate::history::TurnRecord>>,
 
 
     /// A game `create_by_prompt` awaiting a host filename (its modal is open).
@@ -3263,6 +3266,12 @@ pub struct AppState {
     /// Session-only; starts closed. Deliberately NOT an overlay: the map above
     /// it stays fully interactive and the story prompt keeps the keyboard.
     pub room_dock: crate::anim::PanelSlide,
+
+    /// Background archive writer (SQ-1184): the per-turn auto-save builds and
+    /// writes the `.lanthorn` archive off the main thread. Lazily spawns its
+    /// thread on first use, so the hundreds of tests that build `AppState`
+    /// and never touch persistence pay nothing for it.
+    pub archive_worker: crate::archive_worker::ArchiveWorker,
 }
 
 impl Default for AppState {
@@ -3466,6 +3475,7 @@ impl Default for AppState {
             inv_dock: crate::anim::PanelSlide::closed(),
             band_dock: crate::anim::PanelSlide::closed(),
             room_dock: crate::anim::PanelSlide::closed(),
+            archive_worker: crate::archive_worker::ArchiveWorker::new(),
         }
     }
 }

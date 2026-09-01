@@ -310,6 +310,7 @@ mod v6_palette_guard {
 
 pub mod anim;
 pub mod archive;
+pub mod archive_worker;
 pub mod assets;
 pub mod assist;
 pub mod cell_dump;

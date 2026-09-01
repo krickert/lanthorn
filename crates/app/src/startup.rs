@@ -1532,7 +1532,7 @@ pub(crate) fn boot_story(
     // Load mapper (and optionally restore the game save) from the archive.
     let mut startup_transcript: app::state::LoadedTranscript = None;
     // Rewind/replay history carried from the archive when the game is auto-restored.
-    let mut startup_history: Vec<app::history::TurnRecord> = Vec::new();
+    let mut startup_history: Vec<std::sync::Arc<app::history::TurnRecord>> = Vec::new();
     // Command history (Up/Down recall) carried from the archive, always loaded.
     let mut startup_command_history: Vec<String> = Vec::new();
     // Turn counter carried from the archive when the game is auto-restored, so a

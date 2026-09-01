@@ -671,7 +671,8 @@ pub struct ArchiveContents {
     /// restore site so a restored transcript renders its embedded art (SQ-0518).
     pub transcript_images: Vec<Option<crate::inline_image::InlineImage>>,
     /// Per-turn rewind/replay history (empty for archives without `history/`).
-    pub history: Vec<crate::history::TurnRecord>,
+    /// `Arc`-wrapped to match `AppState::history` (SQ-1184) — see there.
+    pub history: Vec<std::sync::Arc<crate::history::TurnRecord>>,
     /// Saved Z-machine screen state (None for archives without `screen.json`).
     /// Applied on the host-mediated restore paths so the upper window is restored.
     /// For v6 stories this also carries the full 8-window table (`screen.v6`).
@@ -734,7 +735,8 @@ pub struct SessionRecord<'a> {
     /// Per-turn rewind/replay records. Empty is a legitimate value — the capture
     /// is opt-in (`record_turn_history`) — which is exactly why an omission here
     /// could not be told apart from a player who had it switched off.
-    pub history: &'a [crate::history::TurnRecord],
+    /// `Arc`-wrapped to match `AppState::history` (SQ-1184) — see there.
+    pub history: &'a [std::sync::Arc<crate::history::TurnRecord>],
     pub command_history: &'a [String],
 }
 
@@ -758,6 +760,58 @@ impl<'a> SessionRecord<'a> {
     pub fn empty() -> Self {
         SessionRecord { transcript: &[], kinds: &[], runs: &[], para: &[], images: &[], history: &[], command_history: &[] }
     }
+
+    /// An owned clone of this session (SQ-1184), for handing to the background
+    /// archive worker: it builds and writes after the borrow this was taken
+    /// from is gone, so it needs its own copy.
+    ///
+    /// Defined once, here, alongside the field list itself — the same cure the
+    /// module doc for this type prescribes for `SessionRecord` positionally
+    /// losing a field (SQ-1090): a future field added to `SessionRecord` is
+    /// cloned here too, by construction, rather than by a second hand-maintained
+    /// list a caller could omit from.
+    pub fn snapshot(&self) -> OwnedSessionRecord {
+        OwnedSessionRecord {
+            transcript: self.transcript.to_vec(),
+            kinds: self.kinds.to_vec(),
+            runs: self.runs.to_vec(),
+            para: self.para.to_vec(),
+            images: self.images.to_vec(),
+            history: self.history.to_vec(),
+            command_history: self.command_history.to_vec(),
+        }
+    }
+}
+
+/// Owned counterpart to [`SessionRecord`] (SQ-1184): every field cloned out of
+/// the borrow so it can cross a thread boundary. `images` and `history` clone
+/// cheaply (an `Arc` clone per element) — `transcript`/`kinds`/`runs`/`para` are
+/// plain `Vec` clones and stay O(transcript length) on the calling thread; see
+/// `archive_worker` for why that is the accepted cost here.
+pub struct OwnedSessionRecord {
+    pub transcript: Vec<String>,
+    pub kinds: Vec<crate::state::TranscriptKind>,
+    pub runs: Vec<Vec<crate::state::StyleRun>>,
+    pub para: Vec<crate::state::ParaFmt>,
+    pub images: Vec<Option<crate::inline_image::InlineImage>>,
+    pub history: Vec<std::sync::Arc<crate::history::TurnRecord>>,
+    pub command_history: Vec<String>,
+}
+
+impl OwnedSessionRecord {
+    /// Borrow this back out as a [`SessionRecord`], for feeding to
+    /// [`build_archive_bytes`].
+    pub fn as_borrowed(&self) -> SessionRecord<'_> {
+        SessionRecord {
+            transcript: &self.transcript,
+            kinds: &self.kinds,
+            runs: &self.runs,
+            para: &self.para,
+            images: &self.images,
+            history: &self.history,
+            command_history: &self.command_history,
+        }
+    }
 }
 
 /// Write a `.lanthorn` archive containing the current map and VM save.
@@ -778,7 +832,7 @@ pub fn save_archive(
     transcript_kinds: &[crate::state::TranscriptKind],
     transcript_runs: &[Vec<crate::state::StyleRun>],
     transcript_para: &[crate::state::ParaFmt],
-    history: &[crate::history::TurnRecord],
+    history: &[std::sync::Arc<crate::history::TurnRecord>],
     command_history: &[String],
 ) -> io::Result<()> {
     save_archive_meta(path, mapper, save, screen, aux, Meta {
@@ -811,7 +865,7 @@ pub fn save_archive_meta(
     transcript_kinds: &[crate::state::TranscriptKind],
     transcript_runs: &[Vec<crate::state::StyleRun>],
     transcript_para: &[crate::state::ParaFmt],
-    history: &[crate::history::TurnRecord],
+    history: &[std::sync::Arc<crate::history::TurnRecord>],
     command_history: &[String],
 ) -> io::Result<()> {
     // No pictures, no display list and no painted ground: the non-v6 entry point.
@@ -872,6 +926,30 @@ pub fn save_archive_meta_pics(
     display: Option<&DisplayListDto>,
     ground: Option<&[u8]>,
 ) -> io::Result<()> {
+    let bytes = build_archive_bytes(mapper, save, screen, aux, &meta, session, pictures, display, ground, None)?;
+    crate::storage::atomic_write(path, &bytes)
+}
+
+/// Build the `.lanthorn` archive ZIP in memory, without writing to disk.
+///
+/// The shared builder behind [`save_archive_meta_pics`] (every synchronous
+/// caller, `png_cache: None`) and the background archive worker (SQ-1184,
+/// `crate::archive_worker`), which calls this off the main thread with
+/// `Some` cache so a stable inline image reuses its prior PNG encode instead
+/// of re-compressing every turn — see [`PngBlobCache`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_archive_bytes(
+    mapper: &Mapper,
+    save: &EngineSave,
+    screen: Option<&zvm::screen::ScreenState>,
+    aux: &BTreeMap<String, Vec<u8>>,
+    meta: &Meta,
+    session: &SessionRecord<'_>,
+    pictures: &[(u8, Vec<u8>)],
+    display: Option<&DisplayListDto>,
+    ground: Option<&[u8]>,
+    mut png_cache: Option<&mut PngBlobCache>,
+) -> io::Result<Vec<u8>> {
     let SessionRecord {
         transcript,
         kinds: transcript_kinds,
@@ -909,7 +987,7 @@ pub fn save_archive_meta_pics(
 
     // meta.json
     let meta_json =
-        serde_json::to_string_pretty(&meta).expect("Meta is always serializable");
+        serde_json::to_string_pretty(meta).expect("Meta is always serializable");
     zip.start_file(ENTRY_META, options)?;
     zip.write_all(meta_json.as_bytes())?;
 
@@ -925,7 +1003,7 @@ pub fn save_archive_meta_pics(
     // pixels of each `Some` entry are PNG-encoded into a sibling blob keyed by
     // the filtered line index (SQ-0518).
     let mut images: Vec<Option<InlineImageDto>> = Vec::new();
-    let mut image_blobs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut image_blobs: Vec<(usize, std::sync::Arc<Vec<u8>>)> = Vec::new();
     for (i, (line, &k)) in transcript.iter().zip(transcript_kinds.iter()).enumerate() {
         if matches!(k, TranscriptKind::Story | TranscriptKind::Input) {
             let fi = lines.len(); // this line's index within the filtered vecs
@@ -935,21 +1013,30 @@ pub fn save_archive_meta_pics(
             para.push(transcript_para.get(i).copied().unwrap_or_default());
             match transcript_images.get(i).and_then(|o| o.as_ref()) {
                 Some(img) => {
-                    let mut png = Vec::new();
-                    if image::DynamicImage::ImageRgba8((*img.pixels).clone())
-                        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-                        .is_ok()
-                    {
-                        image_blobs.push((fi, png));
-                        images.push(Some(InlineImageDto {
-                            align: img.align,
-                            scaled: img.scaled,
-                            margin_px: img.margin_px,
-                        }));
-                    } else {
-                        // PNG encode failed (never expected for a valid RgbaImage);
-                        // drop the picture rather than desync the parallel vecs.
-                        images.push(None);
+                    // Cached by `Arc::as_ptr` when a cache is passed (the
+                    // background worker, SQ-1184) — an image's encoded bytes
+                    // never change while its `Arc` lives, so a stable image
+                    // reuses its prior encode instead of re-compressing every
+                    // turn. Every synchronous caller passes `None` and encodes
+                    // fresh, exactly as before.
+                    let encoded = match png_cache.as_deref_mut() {
+                        Some(cache) => cache.encode(&img.pixels),
+                        None => encode_rgba_png(&img.pixels).map(std::sync::Arc::new),
+                    };
+                    match encoded {
+                        Some(png) => {
+                            image_blobs.push((fi, png));
+                            images.push(Some(InlineImageDto {
+                                align: img.align,
+                                scaled: img.scaled,
+                                margin_px: img.margin_px,
+                            }));
+                        }
+                        None => {
+                            // PNG encode failed (never expected for a valid RgbaImage);
+                            // drop the picture rather than desync the parallel vecs.
+                            images.push(None);
+                        }
                     }
                 }
                 None => images.push(None),
@@ -969,7 +1056,7 @@ pub fn save_archive_meta_pics(
             .compression_method(zip::CompressionMethod::Stored);
         for (fi, png) in &image_blobs {
             zip.start_file(format!("{ENTRY_TRANSCRIPT_IMG_PREFIX}{fi:04}.png"), stored)?;
-            zip.write_all(png)?;
+            zip.write_all(png.as_slice())?;
         }
     }
 
@@ -1051,8 +1138,58 @@ pub fn save_archive_meta_pics(
         zip.write_all(png)?;
     }
 
-    let bytes = zip.finish()?.into_inner();
-    crate::storage::atomic_write(path, &bytes)
+    Ok(zip.finish()?.into_inner())
+}
+
+/// PNG-encode `pixels`, with no cache — the plain path every synchronous
+/// archive caller uses (identical to the pre-SQ-1184 inline behavior). Shared
+/// by [`build_archive_bytes`]'s no-cache branch and [`PngBlobCache::encode`]'s
+/// miss path, so the two can never disagree on how a blob is produced.
+fn encode_rgba_png(pixels: &image::RgbaImage) -> Option<Vec<u8>> {
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(pixels.clone())
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
+}
+
+/// PNG-blob cache for inline transcript images, keyed by `Arc::as_ptr` —
+/// mirrors `render::inline_image::InlineImageRender`'s cache discipline
+/// (SQ-1184): an image's encoded PNG bytes never change while its
+/// `Arc<RgbaImage>` lives, so a stable image reuses its prior encode instead
+/// of re-compressing every turn. The cached value pins the source `Arc`
+/// alongside the bytes, exactly like the render-side cache, so the pointer key
+/// can never ABA-collide with a later image that reuses a freed address.
+///
+/// Lives on the archive worker (`crate::archive_worker`) rather than
+/// `AppState`: only the worker thread ever calls [`build_archive_bytes`] with
+/// `Some` here, so there is nothing for a synchronous caller to share or
+/// invalidate.
+#[derive(Default)]
+pub struct PngBlobCache {
+    cache: std::collections::HashMap<usize, (std::sync::Arc<image::RgbaImage>, std::sync::Arc<Vec<u8>>)>,
+}
+
+impl PngBlobCache {
+    /// The PNG bytes for `pixels`, encoding and caching on a miss.
+    fn encode(&mut self, pixels: &std::sync::Arc<image::RgbaImage>) -> Option<std::sync::Arc<Vec<u8>>> {
+        let key = std::sync::Arc::as_ptr(pixels) as usize;
+        if let Some((pinned, png)) = self.cache.get(&key) {
+            if std::sync::Arc::ptr_eq(pinned, pixels) {
+                return Some(std::sync::Arc::clone(png));
+            }
+        }
+        let arc_png = std::sync::Arc::new(encode_rgba_png(pixels)?);
+        self.cache.insert(key, (std::sync::Arc::clone(pixels), std::sync::Arc::clone(&arc_png)));
+        Some(arc_png)
+    }
+
+    /// Evict entries for images no longer live, so a picture that stops
+    /// appearing in the transcript doesn't pin its PNG bytes forever. Mirrors
+    /// `InlineImageRender::retain_live`.
+    pub fn retain_live(&mut self, live: &std::collections::HashSet<usize>) {
+        self.cache.retain(|k, _| live.contains(k));
+    }
 }
 
 /// Read a `.lanthorn` archive.
@@ -1214,7 +1351,7 @@ pub fn load_archive(path: &Path) -> io::Result<ArchiveContents> {
         }
         Err(_) => None,
     };
-    let history: Vec<crate::history::TurnRecord> = match history_index {
+    let history: Vec<std::sync::Arc<crate::history::TurnRecord>> = match history_index {
         Some(index) => {
             let mut out = Vec::with_capacity(index.len());
             for e in index {
@@ -1241,13 +1378,13 @@ pub fn load_archive(path: &Path) -> io::Result<ArchiveContents> {
                     }
                     String::from_utf8(b).unwrap_or_default()
                 };
-                out.push(crate::history::TurnRecord {
+                out.push(std::sync::Arc::new(crate::history::TurnRecord {
                     turn: e.turn,
                     command: e.command,
                     save,
                     map_snapshot,
                     transcript,
-                });
+                }));
             }
             out
         }
@@ -1418,7 +1555,7 @@ mod tests {
         transcript: &[String],
         kinds: &[crate::state::TranscriptKind],
         runs: &[Vec<crate::state::StyleRun>],
-        history: &[crate::history::TurnRecord],
+        history: &[std::sync::Arc<crate::history::TurnRecord>],
         cmds: &[String],
     ) -> io::Result<()> {
         save_archive(path, mapper, &zvm_es(machine), Some(&machine.screen), &machine.aux_data,
@@ -1642,10 +1779,10 @@ mod tests {
         let mapper = small_mapper();
         let map_json = mapper::persist::to_json(&mapper);
         let history = vec![
-            TurnRecord { turn: 1, command: "look".into(), save: vec![1, 2, 3],
-                map_snapshot: Some(map_json.clone()), transcript: "West of House".into() },
-            TurnRecord { turn: 2, command: "wait".into(), save: vec![4, 5, 6, 7],
-                map_snapshot: None, transcript: "Time passes.".into() },
+            std::sync::Arc::new(TurnRecord { turn: 1, command: "look".into(), save: vec![1, 2, 3],
+                map_snapshot: Some(map_json.clone()), transcript: "West of House".into() }),
+            std::sync::Arc::new(TurnRecord { turn: 2, command: "wait".into(), save: vec![4, 5, 6, 7],
+                map_snapshot: None, transcript: "Time passes.".into() }),
         ];
 
         let path = temp_archive_path("history-rt");
@@ -2686,5 +2823,61 @@ mod tests {
         let ac = load_archive(&path).expect("load");
         let _ = std::fs::remove_file(&path);
         assert!(ac.aux.is_empty());
+    }
+
+    // ── PngBlobCache (SQ-1184) ──────────────────────────────────────────────
+
+    fn solid_image(w: u32, h: u32, rgba: [u8; 4]) -> std::sync::Arc<image::RgbaImage> {
+        let mut img = image::RgbaImage::new(w, h);
+        for p in img.pixels_mut() {
+            *p = image::Rgba(rgba);
+        }
+        std::sync::Arc::new(img)
+    }
+
+    #[test]
+    fn png_blob_cache_reuses_bytes_for_the_same_arc() {
+        let mut cache = PngBlobCache::default();
+        let img = solid_image(4, 4, [10, 20, 30, 255]);
+
+        let first = cache.encode(&img).expect("encode succeeds");
+        let second = cache.encode(&img).expect("encode succeeds again");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the same Arc<RgbaImage> must hand back the identical cached PNG Arc, not a fresh encode"
+        );
+    }
+
+    #[test]
+    fn png_blob_cache_encodes_separately_for_distinct_images() {
+        let mut cache = PngBlobCache::default();
+        let a = solid_image(4, 4, [10, 20, 30, 255]);
+        let b = solid_image(4, 4, [200, 100, 50, 255]);
+
+        let png_a = cache.encode(&a).expect("encode a");
+        let png_b = cache.encode(&b).expect("encode b");
+        assert!(!std::sync::Arc::ptr_eq(&png_a, &png_b), "distinct images cache distinct bytes");
+        assert_ne!(*png_a, *png_b, "different pixels encode to different PNG bytes");
+        assert_eq!(cache.cache.len(), 2);
+    }
+
+    #[test]
+    fn png_blob_cache_retain_live_evicts_absent_keeps_present() {
+        let mut cache = PngBlobCache::default();
+        let a = solid_image(2, 2, [1, 2, 3, 255]);
+        let b = solid_image(2, 2, [4, 5, 6, 255]);
+        let key_a = std::sync::Arc::as_ptr(&a) as usize;
+        let key_b = std::sync::Arc::as_ptr(&b) as usize;
+        cache.encode(&a);
+        cache.encode(&b);
+        assert_eq!(cache.cache.len(), 2);
+
+        // Only `a` is still "live" (present in the latest session snapshot).
+        let live: std::collections::HashSet<usize> = [key_a].into_iter().collect();
+        cache.retain_live(&live);
+
+        assert_eq!(cache.cache.len(), 1, "b's entry is evicted");
+        assert!(cache.cache.contains_key(&key_a), "a's entry survives");
+        assert!(!cache.cache.contains_key(&key_b));
     }
 }

@@ -1,6 +1,17 @@
 //! Per-turn rewind/replay history: a `TurnRecord` per played turn (Quetzal save
 //! + optional map snapshot + transcript), plus pure helpers used by the capture
 //!   loop (`main.rs`), the archive (`archive.rs`), and the replay modal.
+//!
+//! Stored as `Arc<TurnRecord>` rather than bare `TurnRecord` (SQ-1184): the
+//! per-turn auto-save hands its snapshot of `state.history` to a background
+//! writer thread, and with `save: Vec<u8>` holding a full VM snapshot per
+//! turn — "megabytes per turn on big Glulx games" — cloning the whole
+//! history Vec-of-values every turn just to cross the thread boundary would
+//! itself be an unbounded per-turn cost, the same shape of bug that handoff
+//! exists to fix. `Vec<Arc<TurnRecord>>` makes it an O(turns) copy of
+//! pointers, never of snapshot bytes.
+
+use std::sync::Arc;
 
 use mapper::mapper::Mapper;
 
@@ -20,7 +31,7 @@ pub struct TurnRecord {
 /// (cheap room/connection-count delta); the map snapshot is serialized and
 /// stored only when it changed.
 pub fn record_turn(
-    history: &mut Vec<TurnRecord>,
+    history: &mut Vec<Arc<TurnRecord>>,
     turn: u32,
     command: &str,
     save: Vec<u8>,
@@ -29,18 +40,18 @@ pub fn record_turn(
     transcript: &str,
 ) {
     let map_snapshot = map_changed.then(|| mapper::persist::to_json(mapper));
-    history.push(TurnRecord {
+    history.push(Arc::new(TurnRecord {
         turn,
         command: command.to_string(),
         save,
         map_snapshot,
         transcript: transcript.to_string(),
-    });
+    }));
 }
 
 /// Return the latest `map_snapshot` at-or-before `turn` (the map as it stood
 /// then), or `None` if no record at-or-before `turn` carries a snapshot.
-pub fn map_at_turn(history: &[TurnRecord], turn: u32) -> Option<&str> {
+pub fn map_at_turn(history: &[Arc<TurnRecord>], turn: u32) -> Option<&str> {
     history
         .iter()
         .filter(|r| r.turn <= turn)
@@ -59,7 +70,7 @@ pub struct ResumePlan {
 
 /// Compute the resume plan for turn index `idx`. Does NOT mutate `history`
 /// (the caller truncates to `[0..=idx]` after restoring).
-pub fn resume_plan(history: &[TurnRecord], idx: usize) -> ResumePlan {
+pub fn resume_plan(history: &[Arc<TurnRecord>], idx: usize) -> ResumePlan {
     let rec = &history[idx];
     ResumePlan {
         save: rec.save.clone(),
@@ -71,7 +82,7 @@ pub fn resume_plan(history: &[TurnRecord], idx: usize) -> ResumePlan {
 /// Rebuild the on-screen transcript from records `[0..=idx]`: each record
 /// contributes an echoed `> command` (Input) followed by its turn output (Story).
 pub fn rebuild_transcript(
-    history: &[TurnRecord],
+    history: &[Arc<TurnRecord>],
     idx: usize,
 ) -> (Vec<String>, Vec<crate::state::TranscriptKind>) {
     use crate::state::TranscriptKind;
@@ -174,6 +185,7 @@ mod tests {
         assert_eq!(kinds[1], TranscriptKind::Story);
     }
 
+
     /// Integration-flavored capture test: drive a real GameSession and prove the
     /// spec invariants (non-empty save + transcript; snapshot only on map-change).
     /// Mirrors archive.rs's czech.z5 fixture pattern; skips if the fixture is absent.
@@ -188,7 +200,7 @@ mod tests {
 
         let mut session = GameSession::new(story, true, false, None).expect("GameSession::new");
         let mut mapper = Mapper::default();
-        let mut hist: Vec<TurnRecord> = Vec::new();
+        let mut hist: Vec<Arc<TurnRecord>> = Vec::new();
 
         for (turn, cmd) in ["look", "wait"].iter().enumerate() {
             let rooms_before = mapper.graph.rooms().count();
