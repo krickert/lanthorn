@@ -72,6 +72,21 @@ speaks plain HTTP/WebSocket here.
 `docker-compose.yml` at the repo root is a ready-made example of this mode:
 `mkdir -p stories && docker compose up -d`.
 
+### Fetching the library's metadata on the server
+
+The picker's `r` fetches titles, blurbs, ratings and cover art from IFDB into
+`/data`. On a server you want that done once, up front, for the whole library,
+which is what `--fetch` is for. With the compose file above:
+
+```sh
+docker compose run --rm lanthorn /stories --fetch missing
+```
+
+It walks `/stories` (sub-folders included), prints one line per story, and
+writes the sidecars into the shared `/data` volume, so the next browser session
+opens the picker with the metadata already there. `--fetch all` refetches
+what is cached; run `missing` again after adding games.
+
 ### What the browser mode can and cannot show
 
 xterm.js does not implement the Kitty graphics protocol, and lanthorn's

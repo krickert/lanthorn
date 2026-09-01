@@ -25,6 +25,13 @@ Absolute URLs or no link.
 is staged in [`docs/readme-next.md`](docs/readme-next.md), because the README
 describes the RELEASED build and must not describe this one until it ships.*
 
+### `--fetch`: the picker's IFDB pass, run headless
+
+`lanthorn <library> --fetch missing` walks a library (sub-folders included)
+and fetches the metadata and cover art the picker's `r` would, printing one
+line per story and exiting, so a server's library gets its sidecars built
+without anyone at the picker. `--fetch all` refetches the cached ones.
+
 ### The story picker follows your folders, and finds a story in any of them
 
 A library sorted into sub-folders used to show the picker one level of itself.

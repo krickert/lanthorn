@@ -1045,6 +1045,14 @@ from its **filename**, so two *different* games that share a filename in two
 folders share that directory too. Keep filenames unique across the library, as
 the IF Archive's own layout does.
 
+**The same fetch, with nobody at the picker.** `lanthorn ~/if-games --fetch
+missing` runs the `r` pass over the library, sub-folders included, without
+opening a terminal UI: one printed line per story, the sidecars and covers
+written where the picker writes them, exit code 0 unless a fetch failed.
+`--fetch all` is `f` for the lot. On a server this is how the sidecars get
+built in the first place; the picker then opens with titles, authors, ratings
+and covers already there.
+
 **Shift-Enter** opens the story's **launch options** instead of launching it —
 the boot-time choices lanthorn can only honour *before* a game starts: which
 picture archive to draw its art from, and which machine to present itself as.
