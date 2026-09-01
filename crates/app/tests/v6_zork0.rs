@@ -25,6 +25,8 @@ mod v6_meta_line_ground;
 mod v6_float_margin_ground;
 #[path = "suites/v6_glyphs_over_art.rs"]
 mod v6_glyphs_over_art;
+#[path = "suites/v6_hybrid_frame_gate.rs"]
+mod v6_hybrid_frame_gate;
 #[path = "suites/v6_hybrid_zork0.rs"]
 mod v6_hybrid_zork0;
 #[path = "suites/v6_mac_input_echo.rs"]

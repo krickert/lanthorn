@@ -489,6 +489,47 @@ fn scale_halo(s: f32) -> u32 {
     }
 }
 
+/// Fold the canvas pixels of the native rect `[x0, x1) × [y0, y1)` into `h` —
+/// the content half of every band freshness hash. One definition so the crop
+/// and stretch draws cannot disagree about what "the footprint's pixels"
+/// means, and so the walk has one place to be made fast.
+///
+/// SQ-1189: one hasher write per ROW over `as_raw()`, not one `Hash` call per
+/// pixel. `get_pixel().0.hash()` cost four bounds-checked sample reads plus a
+/// SipHash round per pixel — ~1M rounds for a 640x400 footprint — where the
+/// backing buffer is already one contiguous RGBA byte run per row. Semantics
+/// are equivalent by construction: the same canvas hashes the same bytes in
+/// the same order, and any changed pixel inside the footprint changes the byte
+/// stream. The footprint bounds (and their SQ-0824 halo) are unchanged — the
+/// callers still hash the coords themselves, so a moved footprint over
+/// identical bytes still misses.
+///
+/// The finer generation this cannot become: the chrome canvas is a per-frame
+/// COMPOSITE of many windows, the paint ground and the theme's pages, so no
+/// single `GraphicsWindow::version` describes it — the version-shaped gate
+/// exists one level up instead, where SQ-1187's whole-frame key skips this
+/// hash entirely on a replay frame.
+fn hash_canvas_rows(
+    h: &mut std::collections::hash_map::DefaultHasher,
+    canvas: &image::RgbaImage,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+) {
+    use std::hash::Hasher;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let w = canvas.width() as usize;
+    let raw = canvas.as_raw();
+    let len = (x1 - x0) as usize * 4;
+    for ny in y0..y1 {
+        let base = (ny as usize * w + x0 as usize) * 4;
+        h.write(&raw[base..base + len]);
+    }
+}
+
 /// Render a graphics window directly as per-cell background colours when it is a
 /// solid fill or a thin strip — the shape games use for chrome: panel dividers,
 /// colour bars, backgrounds (e.g. Kerkerkruip draws its rules as 1×N / N×1 solid
@@ -1134,6 +1175,36 @@ pub enum BandSlot {
 /// A chrome-band cache key: its [`BandSlot`] plus the cell rect it is drawn at.
 pub type BandKey = (u8, u16, u16, u16, u16);
 
+/// One band encode staged for the background worker (SQ-1188): the finished
+/// (sealed) band image, the cache key it will land under, the content hash it
+/// answers for, and the kitty id it re-transmits to (SQ-0996).
+struct PendingBand {
+    key: BandKey,
+    band: Rect,
+    hash: u64,
+    img: image::DynamicImage,
+    reuse: Option<u32>,
+}
+
+/// One band the worker finished encoding (SQ-1188). `proto` is `None` when the
+/// encode failed — the staging is then un-marked so the next frame retries.
+struct BandEncoded {
+    key: BandKey,
+    band: Rect,
+    hash: u64,
+    reuse: Option<u32>,
+    proto: Option<Protocol>,
+}
+
+/// SQ-1188: whether this backend's band encodes are worth a worker thread.
+/// Kitty and iTerm2 pay zlib-L6 + base64 per encode and sixel pays icy_sixel's
+/// quantization; half-blocks "encodes" straight into cells with no compression
+/// stage at all, so the worker would buy a frame of latency and save nothing —
+/// it (and therefore every cell-buffer test harness) stays synchronous.
+fn band_encode_offthread(picker: &Picker) -> bool {
+    !matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Halfblocks)
+}
+
 #[derive(Default)]
 pub struct GraphicsRender {
     cache: std::collections::HashMap<u32, (u64, u16, u16, Protocol)>,
@@ -1209,6 +1280,40 @@ pub struct GraphicsRender {
     /// content + scale + scaled dimensions; each band crops its sub-rect from it,
     /// so band output stays byte-identical to a per-band whole-canvas resize.
     chrome_scaled: Option<(u64, image::RgbaImage)>,
+    /// SQ-1187: the cached hybrid chrome-ring frame — canvases, strips, band
+    /// placements, viewport — replayed whole when `v6_hybrid_gen`'s key holds
+    /// still. Lives here (not on `AppState`) because this is the object whose
+    /// band caches the replay leans on, and the two must be invalidated
+    /// together on a font-size change.
+    pub(crate) hybrid: Option<crate::render::screen::HybridFrame>,
+    /// How many times the hybrid ring frame has been COMPUTED since launch
+    /// (SQ-1187). The gate's oracle: an unchanged frame replayed from cache
+    /// leaves it still, any input change bumps it. Public for the gate's
+    /// falsification suite, and cheap enough to keep forever.
+    pub hybrid_builds: u64,
+    /// SQ-1187: true while the current frame REPLAYS an unchanged hybrid
+    /// frame. The whole-frame generation key has already proven every input to
+    /// the per-band content hashes unchanged, so the three band draws reuse
+    /// their stored hashes instead of re-walking canvas pixels. Reset by
+    /// [`Self::begin_band_log`] so it can never leak across frames or into the
+    /// raster path.
+    band_replay: bool,
+    /// SQ-1188: band encodes staged this frame for the background worker —
+    /// content that changed while an older upload is still placed. Drained by
+    /// [`Self::spawn_band_jobs`] at the end of the hybrid draw.
+    band_pending: Vec<PendingBand>,
+    /// The in-flight background band-encode batch, if any (SQ-1188) — one at a
+    /// time, coalesced exactly like the raster worker's `v6_job`.
+    band_job: Option<std::thread::JoinHandle<Vec<BandEncoded>>>,
+    /// What the in-flight batch carries, `key → content hash` — so a staging
+    /// dropped while the worker runs knows whether its content is already on
+    /// the way (kept dirty) or superseded (un-marked, restaged next frame).
+    band_inflight: std::collections::HashMap<BandKey, u64>,
+    /// Bands whose cached upload LAGS the canvas: staged or in flight,
+    /// `key → the content hash on its way`. A dirty band is excluded from the
+    /// SQ-1187 replay fast path (its stored hash is known-stale) and skips
+    /// re-staging while the same content is already queued.
+    band_dirty: std::collections::HashMap<BandKey, u64>,
     /// Kitty-protocol graphics windows: one transmitted image per window,
     /// placed with an EXPLICIT r×c grid so the terminal scales the canvas to
     /// exactly the window's cell rect (SQ-0520 — see `render_kitty_virtual`).
@@ -1909,6 +2014,11 @@ impl GraphicsRender {
         self.invalidate_v6();
         self.invalidate_chrome_bands();
         self.chrome_scaled = None;
+        // The hybrid frame's generation key covers the font size, so a font
+        // change would rebuild it anyway — dropped here too so a frame fitted
+        // against the old cell can never outlive the band caches it replays
+        // (SQ-1187).
+        self.hybrid = None;
     }
 
     /// Poll the background v6 encode: if it finished, install its protocol as the
@@ -1918,9 +2028,13 @@ impl GraphicsRender {
     /// an out-of-date entry is still rendered until the next encode lands, so the
     /// pane never blanks. (SQ-0469)
     pub fn poll_v6_job(&mut self) -> bool {
+        // SQ-1188: the chrome-band worker is polled on the same tick — one
+        // caller (`AppState::poll_v6_encode_job`), two workers, either can
+        // warrant the redraw.
+        let bands = self.poll_band_job();
         let done = self.v6_job.as_ref().is_some_and(|j| j.is_finished());
         if !done {
-            return false;
+            return bands;
         }
         let job = self.v6_job.take().expect("checked above");
         if let Ok(Some(ready)) = job.join() {
@@ -2098,6 +2212,14 @@ impl GraphicsRender {
         self.band_mags.clear();
         self.ops.clear();
         self.band_ground = None;
+        self.band_replay = false;
+    }
+
+    /// SQ-1187: declare whether this frame REPLAYS an unchanged hybrid frame —
+    /// see the field. Set by the hybrid draw half right after the frame gate,
+    /// never anywhere else.
+    pub fn set_band_replay(&mut self, on: bool) {
+        self.band_replay = on;
     }
 
     /// Declare the ground this frame's chrome bands resolve their transparency
@@ -2159,6 +2281,12 @@ impl GraphicsRender {
             self.queue_protocol_delete(id);
             self.note_op(GraphicsOp::Drop { target: GraphicsTarget::Band(x, y, w, h) });
         }
+        // SQ-1188: staged and in-flight encodes answered for entries that no
+        // longer exist — cancel them (an in-flight batch is left to finish; its
+        // results find their dirty marks gone and are dropped on install).
+        self.band_pending.clear();
+        self.band_dirty.clear();
+        self.band_inflight.clear();
     }
 
     pub fn retain_chrome_bands(&mut self, live: &std::collections::HashSet<BandKey>) {
@@ -2262,7 +2390,6 @@ impl GraphicsRender {
         let sy_hi = (rel_y0 as i64 + bh as i64 - scale.off_y as i64).clamp(sy_lo, sh as i64);
 
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
         // Hash ONLY the band's own native footprint (not the whole canvas): a
         // change confined to another band's native pixels then leaves this band's
         // hash — and its cached upload — untouched (SQ-0514). The footprint is the
@@ -2286,60 +2413,82 @@ impl GraphicsRender {
             let ny0 = scaled_to_native(sy_lo as u32, nh, sh).saturating_sub(halo);
             let ny1 = (scaled_to_native(sy_hi as u32 - 1, nh, sh) + 1 + halo).min(nh);
             footprint = Some((nx0, ny0, nx1 - nx0, ny1 - ny0));
-            (nx0, nx1, ny0, ny1).hash(&mut h);
-            for ny in ny0..ny1 {
-                for nx in nx0..nx1 {
-                    chrome_canvas.get_pixel(nx, ny).0.hash(&mut h);
-                }
-            }
-        } else {
-            // Fully in the letterbox margin — no native pixels feed it.
-            0u8.hash(&mut h);
         }
-        self.band_ground.map(|p| p.0).hash(&mut h);
-        scale.s.to_bits().hash(&mut h);
-        (scale.off_x, scale.off_y).hash(&mut h);
-        (cw, ch).hash(&mut h);
-        (rel_x0, rel_y0, bw, bh).hash(&mut h);
-        let hash = h.finish();
         let key = (BandSlot::Art as u8, band.x, band.y, band.width, band.height);
-        let fresh = matches!(self.chrome_bands.get(&key), Some((v, _, _)) if *v == hash);
-        if !fresh {
+        let cached_hash = self.chrome_bands.get(&key).map(|(v, _, _)| *v);
+        // SQ-1187: on a replay frame the whole-frame generation key has already
+        // proven every input to this hash unchanged, so the stored hash IS the
+        // hash and no pixel is walked. Any frame that could have moved an input
+        // rebuilt the HybridFrame, and that frame carries `band_replay = false`.
+        let hash = match cached_hash.filter(|_| self.band_replay && !self.band_dirty.contains_key(&key)) {
+            Some(v) => v,
+            None => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                match footprint {
+                    Some((nx0, ny0, fw, fh)) => {
+                        (nx0, nx0 + fw, ny0, ny0 + fh).hash(&mut h);
+                        hash_canvas_rows(&mut h, chrome_canvas, nx0, nx0 + fw, ny0, ny0 + fh);
+                    }
+                    // Fully in the letterbox margin — no native pixels feed it.
+                    None => 0u8.hash(&mut h),
+                }
+                self.band_ground.map(|p| p.0).hash(&mut h);
+                scale.s.to_bits().hash(&mut h);
+                (scale.off_x, scale.off_y).hash(&mut h);
+                (cw, ch).hash(&mut h);
+                (rel_x0, rel_y0, bw, bh).hash(&mut h);
+                h.finish()
+            }
+        };
+        let fresh = cached_hash == Some(hash);
+        let status = if fresh {
+            self.note_op(GraphicsOp::Reuse {
+                target: GraphicsTarget::Band(key.1, key.2, key.3, key.4),
+                id: None,
+            });
+            "cache HIT"
+        } else if self.band_queued(key, hash) {
+            // SQ-1188: exactly this content is already on its way to the worker
+            // — keep placing the old upload below until the result lands.
+            "encode queued (worker)"
+        } else {
             // Copy the sub-rect under this band out of the frame-shared scaled
             // chrome into a band-sized image (letterbox area outside the scaled
             // chrome stays transparent). The whole-canvas resize happens at most
             // once per changed frame (cached in `chrome_scaled`), not per band.
             let band_img = {
                 let scaled = self.scaled_chrome(chrome_canvas, scale.s, sw, sh);
-                let mut band_img = image::RgbaImage::new(bw, bh);
-                for by in 0..bh {
-                    let sy = rel_y0 as i64 + by as i64 - scale.off_y as i64;
-                    if sy < 0 || sy as u32 >= sh {
-                        continue;
-                    }
-                    for bx in 0..bw {
-                        let sx = rel_x0 as i64 + bx as i64 - scale.off_x as i64;
-                        if sx < 0 || sx as u32 >= sw {
+                // SQ-1188: the in-bounds sx range is one contiguous byte run per
+                // row — copy rows, not pixels. `sx = rel_x0 + bx - off_x`, so bx
+                // is in-bounds on [off_x - rel_x0, off_x - rel_x0 + sw).
+                let lo = (scale.off_x as i64 - rel_x0 as i64).max(0);
+                let hi = ((scale.off_x as i64 - rel_x0 as i64) + sw as i64).min(bw as i64);
+                let mut data = vec![0u8; bw as usize * bh as usize * 4];
+                if lo < hi {
+                    let len = (hi - lo) as usize * 4;
+                    let sx0 = (rel_x0 as i64 + lo - scale.off_x as i64) as usize;
+                    let raw = scaled.as_raw();
+                    for by in 0..bh {
+                        let sy = rel_y0 as i64 + by as i64 - scale.off_y as i64;
+                        if sy < 0 || sy as u32 >= sh {
                             continue;
                         }
-                        band_img.put_pixel(bx, by, *scaled.get_pixel(sx as u32, sy as u32));
+                        let src = (sy as usize * sw as usize + sx0) * 4;
+                        let dst = (by as usize * bw as usize + lo as usize) * 4;
+                        data[dst..dst + len].copy_from_slice(&raw[src..src + len]);
                     }
                 }
-                band_img
+                image::RgbaImage::from_raw(bw, bh, data).expect("sized above")
             };
             let img = self.seal_band(band_img);
             // Under the id this band is already placed as, when it has one — see
-            // [`Self::band_encode`] (SQ-0996).
-            let reuse = self.chrome_bands.get(&key).and_then(|(_, _, id)| *id);
-            if self.band_encode(picker, img, key, band, hash, reuse).is_none() {
+            // [`Self::band_encode`] (SQ-0996); off the main thread when the old
+            // upload can cover for it (SQ-1188).
+            let Some(status) = self.stage_band_encode(picker, img, key, band, hash) else {
                 return;
-            }
-        } else {
-            self.note_op(GraphicsOp::Reuse {
-                target: GraphicsTarget::Band(key.1, key.2, key.3, key.4),
-                id: None,
-            });
-        }
+            };
+            status
+        };
         // The band image is exactly band-sized, so it places at the band's
         // top-left (no centering — the crop is already positioned).
         //
@@ -2370,7 +2519,7 @@ impl GraphicsRender {
                 self.band_log.push(format!(
                     "band {}x{}@({},{}): {} · proto {}x{} · placed {}x{} at ({},{}) · native {} · {}",
                     band.width, band.height, band.x, band.y,
-                    if fresh { "cache HIT" } else { "encoded" },
+                    status,
                     sz.width, sz.height, dest.width, dest.height, dest.x, dest.y,
                     match footprint {
                         Some((x, y, w, h)) => format!("{w}x{h}@({x},{y})"),
@@ -2468,6 +2617,126 @@ impl GraphicsRender {
         Some(())
     }
 
+    /// SQ-1188: is an encode for exactly this band content already staged or in
+    /// flight? Then the caller skips rebuilding the band image and keeps
+    /// placing the old upload until the worker's result lands.
+    fn band_queued(&self, key: BandKey, hash: u64) -> bool {
+        self.band_dirty.get(&key) == Some(&hash)
+    }
+
+    /// SQ-1188: hand a changed band to the encoder — the background worker when
+    /// this backend's encode is worth a thread AND an older upload is still
+    /// placed to keep showing; synchronously otherwise. The three outcomes are
+    /// the band log's status words.
+    ///
+    /// The synchronous cases are deliberate, not leftovers:
+    /// * **no cached upload** — a first appearance or a post-resume re-upload
+    ///   has no honest previous image to keep placed, so deferring it would
+    ///   blank the band for a frame. This is exactly `spawn_v6_encode`'s rule
+    ///   for the raster composite's first frame (SQ-0578).
+    /// * **half-blocks** — see [`band_encode_offthread`].
+    fn stage_band_encode(
+        &mut self,
+        picker: &Picker,
+        img: image::DynamicImage,
+        key: BandKey,
+        band: Rect,
+        hash: u64,
+    ) -> Option<&'static str> {
+        let reuse = self.chrome_bands.get(&key).and_then(|(_, _, id)| *id);
+        if !band_encode_offthread(picker) || !self.chrome_bands.contains_key(&key) {
+            self.band_dirty.remove(&key);
+            return self.band_encode(picker, img, key, band, hash, reuse).map(|()| "encoded");
+        }
+        self.band_dirty.insert(key, hash);
+        self.band_pending.push(PendingBand { key, band, hash, img, reuse });
+        Some("encode queued (worker)")
+    }
+
+    /// SQ-1188: hand this frame's staged band encodes to one background worker.
+    /// Called at the end of the hybrid draw, once per frame. Coalesced exactly
+    /// like the raster worker: one batch at a time, and stagings that arrive
+    /// while a batch runs are dropped and re-staged by a later frame (their
+    /// dirty marks are lifted so the re-stage actually happens — except where
+    /// the in-flight batch already carries the same content).
+    pub fn spawn_band_jobs(&mut self, picker: &Picker) {
+        let pending = std::mem::take(&mut self.band_pending);
+        if pending.is_empty() {
+            return;
+        }
+        if self.band_job.is_some() {
+            for p in pending {
+                if self.band_inflight.get(&p.key) != Some(&p.hash) {
+                    self.band_dirty.remove(&p.key);
+                }
+            }
+            return;
+        }
+        self.band_inflight = pending.iter().map(|p| (p.key, p.hash)).collect();
+        let picker = picker.clone();
+        self.band_job = Some(std::thread::spawn(move || {
+            pending
+                .into_iter()
+                .map(|p| {
+                    let size = Size::new(p.band.width, p.band.height);
+                    // The id-reuse discipline rides into the worker unchanged
+                    // (SQ-0996): the encode goes out under the id the band is
+                    // already placed as, so the placeholder cells stay stable.
+                    let proto = match p.reuse {
+                        Some(id) => picker.new_protocol_with_id(p.img, size, Resize::Fit(None), id),
+                        None => picker.new_protocol(p.img, size, Resize::Fit(None)),
+                    }
+                    .ok();
+                    BandEncoded { key: p.key, band: p.band, hash: p.hash, reuse: p.reuse, proto }
+                })
+                .collect()
+        }));
+    }
+
+    /// SQ-1188: reap the background band batch. Installs each result whose band
+    /// still expects exactly that content — a band that changed again while the
+    /// worker ran, or was evicted, drops its result on the floor (its staging
+    /// mark is lifted so the next frame re-stages the CURRENT content instead).
+    /// Returns true whenever a batch was reaped, so the caller schedules the
+    /// redraw that places the new uploads (and re-stages whatever is still
+    /// stale) — the raster worker's last-ready shape.
+    fn poll_band_job(&mut self) -> bool {
+        let done = self.band_job.as_ref().is_some_and(|j| j.is_finished());
+        if !done {
+            return false;
+        }
+        let job = self.band_job.take().expect("checked above");
+        if let Ok(results) = job.join() {
+            for r in results {
+                if self.band_dirty.get(&r.key) != Some(&r.hash) {
+                    continue; // superseded or cancelled — a newer staging owns this band
+                }
+                self.band_dirty.remove(&r.key);
+                let Some(proto) = r.proto else { continue }; // failed encode: retried by the next frame
+                let Some(entry) = self.chrome_bands.get_mut(&r.key) else { continue }; // evicted
+                let stale_id = entry.2;
+                *entry = (r.hash, proto, r.reuse);
+                self.band_encodes += 1;
+                if stale_id != r.reuse {
+                    self.queue_protocol_delete_after_place(stale_id);
+                }
+                self.note_op(GraphicsOp::Upload {
+                    target: GraphicsTarget::Band(r.key.1, r.key.2, r.key.3, r.key.4),
+                    id: r.reuse,
+                    cells: (r.band.width, r.band.height),
+                });
+            }
+        }
+        self.band_inflight.clear();
+        true
+    }
+
+    /// True while any band encode is staged or in flight (SQ-1188) — the test
+    /// harness's settle probe, mirroring [`Self::v6_encode_in_flight`].
+    pub fn band_encode_in_flight(&self) -> bool {
+        self.band_job.is_some() || !self.band_pending.is_empty() || !self.band_dirty.is_empty()
+    }
+
     /// SQ-0511: draw ONE side flank band VERTICALLY STRETCHED — sample the native
     /// `crop` sub-rect of `chrome_canvas` (x, y, w, h in game pixels) and resize it
     /// to fill the whole `band` device region (Nearest → crisp). The horizontal
@@ -2515,55 +2784,60 @@ impl GraphicsRender {
         let bh = band.height as u32 * ch;
 
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        // Hash ONLY the crop's native footprint (coords + pixels) plus the target
-        // device size — the stretch factor is (bw,bh)/(cw_n,ch_n), so both ends are
-        // covered. A change outside this native rect (e.g. the banner's Score/Moves)
-        // never alters the hash, keeping the flank's cached upload fresh (SQ-0514).
-        (slot as u8).hash(&mut h); // discriminator vs. draw_chrome_band keys on the same map
-        (cx, cy, cw_n, ch_n).hash(&mut h);
         let x1 = (cx + cw_n).min(canvas_w);
         let y1 = (cy + ch_n).min(canvas_h);
-        for ny in cy..y1 {
-            for nx in cx..x1 {
-                chrome_canvas.get_pixel(nx, ny).0.hash(&mut h);
-            }
-        }
-        self.band_ground.map(|p| p.0).hash(&mut h);
-        (bw, bh).hash(&mut h);
-        let hash = h.finish();
         let key = (slot as u8, band.x, band.y, band.width, band.height);
-        let fresh = matches!(self.chrome_bands.get(&key), Some((v, _, _)) if *v == hash);
-        if !fresh {
-            // Copy the native crop (clamped to the canvas) into its own image, then
-            // resize it to the band's device box. Transparent native pixels stay
-            // transparent, so the theme backdrop shows through gaps in the flank.
-            let mut src = image::RgbaImage::new(cw_n, ch_n);
-            for oy in 0..ch_n {
-                let ny = cy + oy;
-                if ny >= canvas_h {
-                    break;
-                }
-                for ox in 0..cw_n {
-                    let nx = cx + ox;
-                    if nx >= canvas_w {
-                        break;
-                    }
-                    src.put_pixel(ox, oy, *chrome_canvas.get_pixel(nx, ny));
-                }
+        let cached_hash = self.chrome_bands.get(&key).map(|(v, _, _)| *v);
+        // SQ-1187: on a replay frame the stored hash is the hash — see
+        // `draw_chrome_band`.
+        let hash = match cached_hash.filter(|_| self.band_replay && !self.band_dirty.contains_key(&key)) {
+            Some(v) => v,
+            None => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // Hash ONLY the crop's native footprint (coords + pixels) plus the target
+                // device size — the stretch factor is (bw,bh)/(cw_n,ch_n), so both ends are
+                // covered. A change outside this native rect (e.g. the banner's Score/Moves)
+                // never alters the hash, keeping the flank's cached upload fresh (SQ-0514).
+                (slot as u8).hash(&mut h); // discriminator vs. draw_chrome_band keys on the same map
+                (cx, cy, cw_n, ch_n).hash(&mut h);
+                hash_canvas_rows(&mut h, chrome_canvas, cx, x1, cy, y1);
+                self.band_ground.map(|p| p.0).hash(&mut h);
+                (bw, bh).hash(&mut h);
+                h.finish()
             }
-            let stretched = resize_directional(&src, bw, bh);
-            let img = self.seal_band(stretched);
-            let reuse = self.chrome_bands.get(&key).and_then(|(_, _, id)| *id);
-            if self.band_encode(picker, img, key, band, hash, reuse).is_none() {
-                return;
-            }
-        } else {
+        };
+        let fresh = cached_hash == Some(hash);
+        let status = if fresh {
             self.note_op(GraphicsOp::Reuse {
                 target: GraphicsTarget::Band(key.1, key.2, key.3, key.4),
                 id: None,
             });
-        }
+            "cache HIT"
+        } else if self.band_queued(key, hash) {
+            // SQ-1188: this content is already on its way to the worker — keep
+            // placing the old upload below until the result lands.
+            "encode queued (worker)"
+        } else {
+            // Copy the native crop (clamped to the canvas) into its own image, then
+            // resize it to the band's device box. Transparent native pixels stay
+            // transparent, so the theme backdrop shows through gaps in the flank.
+            // SQ-1188: rows, not pixels — each crop row is one contiguous byte run.
+            let mut data = vec![0u8; cw_n as usize * ch_n as usize * 4];
+            let cols = (x1 - cx) as usize * 4;
+            let raw = chrome_canvas.as_raw();
+            for oy in 0..(y1 - cy) {
+                let srow = ((cy + oy) as usize * canvas_w as usize + cx as usize) * 4;
+                let drow = oy as usize * cw_n as usize * 4;
+                data[drow..drow + cols].copy_from_slice(&raw[srow..srow + cols]);
+            }
+            let src = image::RgbaImage::from_raw(cw_n, ch_n, data).expect("sized above");
+            let stretched = resize_directional(&src, bw, bh);
+            let img = self.seal_band(stretched);
+            let Some(status) = self.stage_band_encode(picker, img, key, band, hash) else {
+                return;
+            };
+            status
+        };
         // SQ-0747: a STRETCHED band goes in the band log too. It never did, and that
         // is why every `/dump-windows` capture of Journey's menu listed the right-hand
         // flank and the bottom strip and no left flank at all — the picture column is
@@ -2599,7 +2873,7 @@ impl GraphicsRender {
                 self.band_log.push(format!(
                     "band {}x{}@({},{}) [{slot:?}, stretched]: {} · proto {}x{} · placed {}x{} at ({},{}) · native {cw_n}x{ch_n}@({cx},{cy}) · {}",
                     band.width, band.height, band.x, band.y,
-                    if fresh { "cache HIT" } else { "encoded" },
+                    status,
                     sz.width, sz.height, dest.width, dest.height, dest.x, dest.y,
                     resample_note(cw_n, ch_n, bw, bh),
                 ));
@@ -2673,17 +2947,35 @@ impl GraphicsRender {
         }
 
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (slot as u8).hash(&mut h);
-        (src.width(), src.height()).hash(&mut h);
-        src.as_raw().hash(&mut h);
-        (bw, bh).hash(&mut h);
-        self.band_ground.map(|p| p.0).hash(&mut h);
-        (dx, dy, dw, dh).hash(&mut h);
-        let hash = h.finish();
         let key = (slot as u8, band.x, band.y, band.width, band.height);
-        let fresh = matches!(self.chrome_bands.get(&key), Some((v, _, _)) if *v == hash);
-        if !fresh {
+        let cached_hash = self.chrome_bands.get(&key).map(|(v, _, _)| *v);
+        // SQ-1187: on a replay frame the stored hash is the hash — see
+        // `draw_chrome_band`.
+        let hash = match cached_hash.filter(|_| self.band_replay && !self.band_dirty.contains_key(&key)) {
+            Some(v) => v,
+            None => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (slot as u8).hash(&mut h);
+                (src.width(), src.height()).hash(&mut h);
+                src.as_raw().hash(&mut h);
+                (bw, bh).hash(&mut h);
+                self.band_ground.map(|p| p.0).hash(&mut h);
+                (dx, dy, dw, dh).hash(&mut h);
+                h.finish()
+            }
+        };
+        let fresh = cached_hash == Some(hash);
+        let status = if fresh {
+            self.note_op(GraphicsOp::Reuse {
+                target: GraphicsTarget::Band(key.1, key.2, key.3, key.4),
+                id: None,
+            });
+            "cache HIT"
+        } else if self.band_queued(key, hash) {
+            // SQ-1188: this content is already on its way to the worker — keep
+            // placing the old upload below until the result lands.
+            "encode queued (worker)"
+        } else {
             let scaled = resize_directional(src, dw, dh);
             // The band is `dest` and transparent everywhere else. When `dest` IS the
             // band — every pane where the letterbox leaves no margin beside this
@@ -2696,16 +2988,11 @@ impl GraphicsRender {
                 band_img
             };
             let img = self.seal_band(scaled);
-            let reuse = self.chrome_bands.get(&key).and_then(|(_, _, id)| *id);
-            if self.band_encode(picker, img, key, band, hash, reuse).is_none() {
+            let Some(status) = self.stage_band_encode(picker, img, key, band, hash) else {
                 return;
-            }
-        } else {
-            self.note_op(GraphicsOp::Reuse {
-                target: GraphicsTarget::Band(key.1, key.2, key.3, key.4),
-                id: None,
-            });
-        }
+            };
+            status
+        };
         // Any deletes queued above (this band's own predecessor, or another band's)
         // ride out on this placement, in the same batch (SQ-0637's rule). Restored
         // to the queue when nothing was placed, or when the backend has no
@@ -2734,7 +3021,7 @@ impl GraphicsRender {
                 self.band_log.push(format!(
                     "band {}x{}@({},{}) [{slot:?}, tiled]: {} · proto {}x{} · placed {}x{} at ({},{}) · source {}x{} native px · into {dw}x{dh}px at ({dx},{dy}) of {bw}x{bh} · blank rows {}, longest run {} at {} · {}",
                     band.width, band.height, band.x, band.y,
-                    if fresh { "cache HIT" } else { "encoded" },
+                    status,
                     sz.width, sz.height, placed_at.width, placed_at.height, placed_at.x, placed_at.y,
                     src.width(), src.height(),
                     blank, run, run_at,
@@ -5350,6 +5637,12 @@ mod tests {
             let settled = draw(&mut gr, 40);
             let id = gr.chrome_band_id(key).expect("a kitty placement names its image");
 
+            // The change frame stages the encode for the worker and keeps the old
+            // upload placed (SQ-1188); the frame after the result lands is the one
+            // that carries the transmit, and it is the one whose diff is measured.
+            let _ = draw(&mut gr, 90);
+            gr.spawn_band_jobs(&picker);
+            settle_bands(&mut gr);
             let changed = draw(&mut gr, 90);
             // The DIFF first: it is the symptom, and a fix that held the id while
             // rewriting the cells anyway would sail past the id assertion below.
@@ -5624,6 +5917,201 @@ mod tests {
 
         assert_ne!(before[&top_key], after[&top_key], "the changed top band re-encodes (hash changed)");
         assert_eq!(before[&bot_key], after[&bot_key], "the disjoint bottom band stays fresh (hash unchanged)");
+    }
+
+    #[test]
+    fn hash_canvas_rows_tracks_footprint_pixels_exactly() {
+        // SQ-1189: the row-slice walk must be semantically equivalent to the
+        // per-pixel walk it replaced — same canvas → same key, any changed
+        // pixel INSIDE the footprint → changed key, any change strictly
+        // OUTSIDE it → same key.
+        use std::hash::Hasher;
+        let hash = |c: &image::RgbaImage| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            hash_canvas_rows(&mut h, c, 2, 12, 1, 9);
+            h.finish()
+        };
+        let mut canvas = image::RgbaImage::new(20, 10);
+        for (x, y, p) in canvas.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 13) as u8, (y * 7) as u8, ((x + y) * 5) as u8, 255]);
+        }
+        let base = hash(&canvas);
+        assert_eq!(base, hash(&canvas.clone()), "same canvas → same key");
+
+        let mut inside = canvas.clone();
+        inside.put_pixel(11, 8, image::Rgba([1, 2, 3, 4])); // last col/row of the footprint
+        assert_ne!(base, hash(&inside), "a changed pixel inside the footprint changes the key");
+        let mut corner = canvas.clone();
+        corner.put_pixel(2, 1, image::Rgba([9, 9, 9, 9])); // first col/row of the footprint
+        assert_ne!(base, hash(&corner), "the footprint's first pixel is covered too");
+
+        let mut outside = canvas.clone();
+        outside.put_pixel(12, 8, image::Rgba([1, 2, 3, 4])); // one column past x1
+        outside.put_pixel(1, 5, image::Rgba([1, 2, 3, 4])); // one column before x0
+        outside.put_pixel(5, 0, image::Rgba([1, 2, 3, 4])); // one row above y0
+        outside.put_pixel(5, 9, image::Rgba([1, 2, 3, 4])); // one row below y1
+        assert_eq!(base, hash(&outside), "a change strictly outside the footprint leaves the key alone");
+
+        // A degenerate footprint hashes nothing and does not panic.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        hash_canvas_rows(&mut h, &canvas, 5, 5, 2, 8);
+        hash_canvas_rows(&mut h, &canvas, 3, 9, 6, 6);
+    }
+
+    /// A kitty picker at a stated cell size — the backend whose band encodes go
+    /// to the background worker (SQ-1188).
+    fn kitty_picker(w: u16, h: u16) -> Picker {
+        #[allow(deprecated)]
+        let mut p = Picker::from_fontsize(ratatui_image::FontSize::new(w, h));
+        p.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        p
+    }
+
+    /// Reap the band worker, driving `poll_v6_job` the way the app's loop tick
+    /// does. Panics rather than hangs when nothing ever lands.
+    fn settle_bands(gr: &mut GraphicsRender) {
+        for _ in 0..500 {
+            if gr.poll_v6_job() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("band worker never landed");
+    }
+
+    /// SQ-1188: a 1:1 kitty band fixture — canvas the pane's device size, one
+    /// band covering the top row. Returns (gr, picker, chrome, scale, pane, band).
+    fn kitty_band_fixture() -> (GraphicsRender, Picker, image::RgbaImage, crate::render::v6_layout::Scale, Rect, Rect)
+    {
+        use crate::render::v6_layout::uniform_scale;
+        let picker = kitty_picker(4, 7);
+        let fs = picker.font_size();
+        let (cw, ch) = (fs.width.max(1) as u32, fs.height.max(1) as u32);
+        let (cols, rows) = (2u16, 4u16);
+        let (nw, nh) = (cols as u32 * cw, rows as u32 * ch);
+        let chrome = image::RgbaImage::from_pixel(nw, nh, image::Rgba([10, 20, 30, 255]));
+        let pane = Rect::new(0, 0, cols, rows);
+        let scale = uniform_scale((nw as u16, nh as u16), (nw, nh));
+        assert_eq!((scale.s, scale.off_x, scale.off_y), (1.0, 0, 0), "fixture must map 1:1");
+        let band = Rect::new(0, 0, cols, 1);
+        (GraphicsRender::default(), picker, chrome, scale, pane, band)
+    }
+
+    #[test]
+    fn a_changed_band_keeps_its_old_upload_until_the_worker_lands() {
+        // SQ-1188: on kitty, a band's FIRST encode is synchronous (no honest
+        // previous image), a CHANGED band's encode runs on the worker while the
+        // old upload stays placed, and the result installs via poll_v6_job.
+        let (mut gr, picker, mut chrome, scale, pane, band) = kitty_band_fixture();
+        let key = (BandSlot::Art as u8, band.x, band.y, band.width, band.height);
+        let mut buf = Buffer::empty(pane);
+
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        assert_eq!(gr.band_encodes, 1, "first appearance encodes synchronously");
+        assert!(!gr.band_encode_in_flight(), "nothing staged after a sync encode");
+        let h0 = gr.chrome_band_hashes()[&key];
+
+        chrome.put_pixel(1, 1, image::Rgba([200, 0, 0, 255]));
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        assert_eq!(gr.band_encodes, 1, "the change frame encodes nothing on this thread");
+        assert_eq!(gr.chrome_band_hashes()[&key], h0, "the OLD upload (old hash) is still what is placed");
+        assert!(gr.band_encode_in_flight(), "the encode is staged for the worker");
+        assert!(
+            gr.band_log.last().is_some_and(|l| l.contains("encode queued (worker)")),
+            "the band log says what happened: {:?}",
+            gr.band_log.last()
+        );
+
+        gr.spawn_band_jobs(&picker);
+        settle_bands(&mut gr);
+        assert_eq!(gr.band_encodes, 2, "the worker's install counts the encode");
+        assert_ne!(gr.chrome_band_hashes()[&key], h0, "the installed entry answers for the NEW content");
+        assert!(!gr.band_encode_in_flight(), "nothing left staged");
+
+        // The next frame's draw is a plain cache hit on the new content.
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        assert_eq!(gr.band_encodes, 2, "the settled band is a cache hit");
+        assert!(
+            gr.band_log.last().is_some_and(|l| l.contains("cache HIT")),
+            "the settled band logs a hit: {:?}",
+            gr.band_log.last()
+        );
+    }
+
+    #[test]
+    fn a_stale_band_result_is_dropped_when_the_band_changed_again() {
+        // SQ-1188: results are keyed by the content they answer for — a band
+        // that changed AGAIN while its encode ran drops the stale result and
+        // re-stages the current content on the next frame.
+        let (mut gr, picker, mut chrome, scale, pane, band) = kitty_band_fixture();
+        let key = (BandSlot::Art as u8, band.x, band.y, band.width, band.height);
+        let mut buf = Buffer::empty(pane);
+
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        let h0 = gr.chrome_band_hashes()[&key];
+
+        chrome.put_pixel(1, 1, image::Rgba([200, 0, 0, 255])); // content B
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        gr.spawn_band_jobs(&picker); // B's encode is now in flight
+        chrome.put_pixel(1, 1, image::Rgba([0, 200, 0, 255])); // content C, superseding B
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        gr.spawn_band_jobs(&picker); // coalesced: C is dropped and un-marked
+        settle_bands(&mut gr);
+        assert_eq!(gr.chrome_band_hashes()[&key], h0, "B's stale result must not install over a superseded band");
+        assert_eq!(gr.band_encodes, 1, "nothing installed");
+
+        // The redraw poll_v6_job's true return schedules re-stages C and lands it.
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        gr.spawn_band_jobs(&picker);
+        settle_bands(&mut gr);
+        assert_ne!(gr.chrome_band_hashes()[&key], h0, "the current content lands on the retry");
+        assert_eq!(gr.band_encodes, 2);
+    }
+
+    #[test]
+    fn an_invalidation_cancels_staged_band_encodes() {
+        // SQ-1188: a resume/font-change invalidation must not let an in-flight
+        // result resurrect an entry the invalidation just freed.
+        let (mut gr, picker, mut chrome, scale, pane, band) = kitty_band_fixture();
+        let key = (BandSlot::Art as u8, band.x, band.y, band.width, band.height);
+        let mut buf = Buffer::empty(pane);
+
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        chrome.put_pixel(1, 1, image::Rgba([200, 0, 0, 255]));
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        gr.spawn_band_jobs(&picker);
+        gr.invalidate_chrome_bands();
+        settle_bands(&mut gr);
+        assert!(!gr.chrome_band_hashes().contains_key(&key), "the result found no entry and was dropped");
+        assert!(!gr.band_encode_in_flight(), "the cancellation cleared every mark");
+    }
+
+    #[test]
+    fn halfblocks_band_encodes_stay_synchronous() {
+        // SQ-1188: half-blocks builds cells with no compression stage — the
+        // worker would buy a frame of latency and save nothing, so a changed
+        // band installs on the calling thread exactly as before (and every
+        // cell-buffer harness stays deterministic).
+        use crate::render::v6_layout::uniform_scale;
+        let picker = Picker::halfblocks();
+        let fs = picker.font_size();
+        let (cw, ch) = (fs.width.max(1) as u32, fs.height.max(1) as u32);
+        let (nw, nh) = (2 * cw, 4 * ch);
+        let mut chrome = image::RgbaImage::from_pixel(nw, nh, image::Rgba([10, 20, 30, 255]));
+        let pane = Rect::new(0, 0, 2, 4);
+        let scale = uniform_scale((nw as u16, nh as u16), (nw, nh));
+        let band = Rect::new(0, 0, 2, 1);
+        let key = (BandSlot::Art as u8, band.x, band.y, band.width, band.height);
+        let mut gr = GraphicsRender::default();
+        let mut buf = Buffer::empty(pane);
+
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        let h0 = gr.chrome_band_hashes()[&key];
+        chrome.put_pixel(1, 1, image::Rgba([200, 0, 0, 255]));
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        assert_ne!(gr.chrome_band_hashes()[&key], h0, "half-blocks installs the change immediately");
+        assert!(!gr.band_encode_in_flight(), "nothing is staged for a worker");
+        assert_eq!(gr.band_encodes, 2);
     }
 
     #[test]
@@ -5957,8 +6445,16 @@ mod tests {
         assert!(freed_ids(&gr, &buf).is_empty(), "a cache hit must not free the image it is re-placing");
         assert_eq!(gr.chrome_band_id(key), Some(first), "and it stays the same image");
 
-        // Change a pixel inside this band's native footprint → re-encode.
+        // Change a pixel inside this band's native footprint → re-encode. On
+        // kitty the encode runs on the worker (SQ-1188): the change frame keeps
+        // the old upload placed, and the next frame after the result lands is
+        // the one that transmits the new pixels — under the SAME id.
         chrome.put_pixel(1, 2, image::Rgba([255, 0, 0, 255]));
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        assert_eq!(gr.chrome_band_id(key), Some(first), "the change frame still shows the old upload's id");
+        gr.spawn_band_jobs(&picker);
+        settle_bands(&mut gr);
+        let mut buf = Buffer::empty(pane);
         gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
         assert_eq!(
             gr.chrome_band_id(key),
@@ -6009,12 +6505,18 @@ mod tests {
         gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
         let first = gr.chrome_band_id(key).expect("placed");
 
+        // The change is encoded on the worker (SQ-1188); the frame AFTER it lands
+        // is the one that transmits the replacement, so that is the frame the
+        // supersede delete is queued onto.
+        chrome.put_pixel(1, 2, image::Rgba([255, 0, 0, 255]));
+        gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
+        gr.spawn_band_jobs(&picker);
+        settle_bands(&mut gr);
         // The replacement frame gets a clean buffer, so what it carries is its own —
         // and an upload that is still covering this very rect is queued to be freed
         // on it.
         let mut buf = Buffer::empty(pane);
         gr.queue_protocol_delete_after_place(Some(first));
-        chrome.put_pixel(1, 2, image::Rgba([255, 0, 0, 255]));
         gr.draw_chrome_band(&picker, &chrome, &scale, pane, band, &mut buf);
 
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();

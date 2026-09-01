@@ -2043,6 +2043,7 @@ fn buffer_line_rects(it: &PositionedWindow, tf: &crate::native_font::TextFace) -
 
 /// A uniform (aspect-preserving) letterbox scale from native game pixels to
 /// pane device pixels, plus the device-pixel offset of the letterboxed area.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Scale {
     pub s: f32,
     pub off_x: u32,
