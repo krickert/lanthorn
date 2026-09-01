@@ -63,6 +63,7 @@ Serve-mode knobs, as environment variables:
 | `LANTHORN_WEB_CREDENTIAL` | HTTP basic auth, `user:pass` | unset (no auth) |
 | `LANTHORN_WEB_AUDIO` | `on` or `off`: the game's sound, played in the browser | `on` |
 | `LANTHORN_WEB_AUDIO_PORT` | the port that sound is served on | `7682` |
+| `LANTHORN_WEB_IMAGES` | `sixel` or `halfblocks`: how pictures are sent to the browser | `sixel` |
 
 **Do not expose an unauthenticated port beyond localhost** — a lanthorn
 session includes a story picker that can browse and download into `/stories`,
@@ -99,12 +100,16 @@ docker compose run --rm -v "$PWD/curated.tsv:/curated.tsv:ro" lanthorn /stories 
 
 ### What the browser mode can and cannot show
 
-xterm.js does not implement the Kitty graphics protocol, and lanthorn's
-capability probe discovers that honestly — graphical v6 stories and Blorb
-cover art fall back to half-block cell rendering, exactly as they do in any
-terminal without image support. Text games, the automap, mouse support, and
-the full TUI are unaffected. When graphics fidelity matters, use mode 1 (or
-SSH to the host and run mode 1 there: Kitty graphics survive SSH).
+xterm.js does not implement the Kitty graphics protocol, but ttyd's build of
+it includes the image addon, which renders **sixel**. The entrypoint turns
+that addon on (`-t enableSixel=true`) and starts each session with
+`--image-protocol sixel`, so cover art in the picker and graphical v6 stories
+show in the browser as real pictures instead of half-block cells. Sixel is a
+256-colour format per image, so a cover is close to the original but not
+photographic; `LANTHORN_WEB_IMAGES=halfblocks` restores the cell fallback.
+Text games, the automap, mouse support and the full TUI are the same either
+way. For Kitty fidelity, use mode 1 (or SSH to the host and run mode 1 there;
+Kitty graphics work over SSH).
 
 ### Sound in the browser
 

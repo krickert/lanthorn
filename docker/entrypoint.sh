@@ -12,6 +12,10 @@
 #   LANTHORN_WEB_AUDIO        on (default) or off: sound in the browser, via
 #                             lanthorn-audio-relay on its own port
 #   LANTHORN_WEB_AUDIO_PORT   that port (default 7682)
+#   LANTHORN_WEB_IMAGES       sixel (default) or halfblocks: how pictures are
+#                             sent to the browser. ttyd's xterm.js can render
+#                             sixel, so covers and v6 art show as real images;
+#                             lanthorn's auto-detection cannot see that.
 set -eu
 
 # A FIFO drained at real time, for any session with no browser listening.
@@ -48,9 +52,13 @@ if [ "${1:-}" = "serve" ]; then
     # No story args after `serve` means the picker on the library mount.
     [ "$#" -gt 0 ] || set -- /stories
 
-    # Every connection goes through the session wrapper, which strips the
-    # page's audio argument and points ALSA at the session's FIFO.
-    set -- /usr/local/bin/lanthorn-serve-session lanthorn "$@"
+    # Each connection runs through the session wrapper, which strips the
+    # page's audio argument and points ALSA at the session's FIFO. Pictures are
+    # sent as sixel unless configured otherwise: xterm.js renders it once the
+    # page addon is on (-t enableSixel below), and lanthorn's auto-detection
+    # cannot learn that from xterm.js.
+    images="${LANTHORN_WEB_IMAGES:-sixel}"
+    set -- /usr/local/bin/lanthorn-serve-session lanthorn --image-protocol "$images" "$@"
     start_sink
     if [ "${LANTHORN_WEB_AUDIO:-on}" != "off" ]; then
         audio_port="${LANTHORN_WEB_AUDIO_PORT:-7682}"
@@ -70,6 +78,7 @@ if [ "${1:-}" = "serve" ]; then
         --port "${LANTHORN_WEB_PORT:-7681}" \
         -t titleFixed=lanthorn \
         -t disableLeaveAlert=true \
+        -t enableSixel=true \
         "$@"
 fi
 

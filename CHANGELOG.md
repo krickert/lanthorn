@@ -58,6 +58,13 @@ changes what lanthorn does — all of it changes when and where.
   terminal write path is buffered — thousands of tiny locked writes per dense
   frame became a handful.
 
+### Pictures in the browser, for the served container
+
+ttyd's xterm.js renders sixel once the image addon is on; the entrypoint
+turns it on and starts each session with `--image-protocol sixel`, so cover
+art and graphical v6 stories show in the browser as pictures instead of
+half-block cells. `LANTHORN_WEB_IMAGES=halfblocks` restores the fallback.
+
 ### Sound in the browser, for the served container
 
 Mode 2 of the Docker image (ttyd in a browser) now plays the game's sound.
