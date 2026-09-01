@@ -34,6 +34,9 @@ use crate::story_info::{self, FetchedMeta};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportRow {
     pub path: PathBuf,
+    /// Which story on `path` when it is a zip or disk image holding several
+    /// (the picker's `disk_entry`); `None` for a loose file.
+    pub entry: Option<String>,
     pub ifdb_tuid: Option<String>,
     pub title: Option<String>,
     pub author: Option<String>,
@@ -53,6 +56,7 @@ pub fn parse_tsv(text: &str) -> Result<Vec<ImportRow>, String> {
     let cols: Vec<String> = header.split('\t').map(|c| c.trim().to_ascii_lowercase()).collect();
     let idx = |name: &str| cols.iter().position(|c| c == name);
     let path_col = idx("path").ok_or("the header has no `path` column")?;
+    let entry_col = idx("entry");
     let (tuid, title, author, year, genre, language, description, cover) = (
         idx("ifdb_tuid"),
         idx("title"),
@@ -76,6 +80,7 @@ pub fn parse_tsv(text: &str) -> Result<Vec<ImportRow>, String> {
         let tuid = get(tuid).and_then(|t| crate::ifdb::extract_tuid(&t));
         rows.push(ImportRow {
             path: PathBuf::from(path),
+            entry: get(entry_col),
             ifdb_tuid: tuid,
             title: get(title),
             author: get(author),
@@ -107,8 +112,8 @@ pub enum RowOutcome {
 /// Apply one row. `source` fetches by id and downloads covers (the picker's
 /// own `IfdbClient` in production; a fake in tests).
 pub fn import_row(row: &ImportRow, data_base: &Path, source: &dyn MetadataSource) -> RowOutcome {
-    let Some(entry) = crate::picker::resolve_entry(&row.path, data_base) else {
-        return RowOutcome::Skipped(format!("{} is not a story lanthorn can open", row.path.display()));
+    let Some(entry) = crate::picker::resolve_entry_from(&row.path, row.entry.as_deref(), data_base) else {
+        return RowOutcome::Skipped(format!("{} is not a story lanthorn can open", label(row)));
     };
     let game_dir = entry.game_dir(data_base);
     let ifid = entry.meta.ifid.clone();
@@ -170,6 +175,14 @@ pub fn import_row(row: &ImportRow, data_base: &Path, source: &dyn MetadataSource
     }
 
     RowOutcome::Skipped("no tuid, title or cover_url in the row".to_string())
+}
+
+/// A row's story as the log names it: the path, and the entry when there is one.
+fn label(row: &ImportRow) -> String {
+    match &row.entry {
+        Some(e) => format!("{} [{e}]", row.path.display()),
+        None => row.path.display().to_string(),
+    }
 }
 
 /// Download `url`, keep it only if it decodes as an image, save it beside the
@@ -246,7 +259,7 @@ pub fn run(tsv: &Path, data_base: &Path, source: &dyn MetadataSource, delay: std
                 format!("failed: {why}")
             }
         };
-        println!("[{}/{total}] {}  {word}", i + 1, row.path.display());
+        println!("[{}/{total}] {}  {word}", i + 1, label(row));
         if row.ifdb_tuid.is_some() || row.cover_url.is_some() {
             std::thread::sleep(delay);
         }
@@ -326,8 +339,10 @@ mod tests {
 
     #[test]
     fn the_header_names_the_columns_in_any_order_and_extras_are_ignored() {
-        let rows = parse_tsv("title\tconfidence\tpath\tifdb_tuid\tcover_url\nMy Game\thigh\t/lib/g.z5\thttps://ifdb.org/viewgame?id=abc123\t\n\t\t/lib/h.z5\t\thttps://x/y.png\n").unwrap();
+        let rows = parse_tsv("title\tconfidence\tpath\tifdb_tuid\tcover_url\tentry\nMy Game\thigh\t/lib/g.z5\thttps://ifdb.org/viewgame?id=abc123\t\t\n\t\t/lib/h.z5\t\thttps://x/y.png\tadv01.dat\n").unwrap();
         assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].entry, None);
+        assert_eq!(rows[1].entry.as_deref(), Some("adv01.dat"), "a zip member is named by its entry");
         assert_eq!(rows[0].path, PathBuf::from("/lib/g.z5"));
         assert_eq!(rows[0].title.as_deref(), Some("My Game"));
         assert_eq!(rows[0].ifdb_tuid.as_deref(), Some("abc123"), "a viewgame URL is reduced to its id");

@@ -1638,7 +1638,11 @@ fn run_headless_fetch(
                     format!("failed: {e}")
                 }
             };
-            println!("[{}/{total}] {}  ({})  {word}", self.done, p.title, p.path.display());
+            let place = match &p.disk_entry {
+                Some(e) => format!("{} [{e}]", p.path.display()),
+                None => p.path.display().to_string(),
+            };
+            println!("[{}/{total}] {}  ({place})  {word}", self.done, p.title);
         }
     }
     let mut tally = Tally::default();

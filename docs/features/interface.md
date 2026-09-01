@@ -1065,7 +1065,8 @@ and covers already there.
 --import-metadata rows.tsv` applies a tab-separated file, one row per story,
 made by a person or by an agent working from the IF Archive's descriptions,
 IFDB's search, IFWiki or a competition's archive. The header names the
-columns, in any order: `path`, then `ifdb_tuid` (the story is fetched from
+columns, in any order: `path` (and `entry`, the member name, for a story inside
+a zip or disk image holding several), then `ifdb_tuid` (the story is fetched from
 IFDB by that id, the same call the picker's `u` makes, and IFDB's record wins),
 or `title` / `author` / `year` / `genre` / `language` / `description` (written
 as a curated record: the list shows the title, the info panel the rest, and
