@@ -309,11 +309,19 @@ pub struct CommandBandState {
     /// in the same frame overwrites that one global slot while the band is
     /// still on screen underneath it.
     pub col_viewport: std::cell::Cell<[usize; BAND_COLS]>,
-    /// Objects in the current room, refreshed every frame from the engine.
+    /// Objects in the current room, refreshed from the engine whenever the VM
+    /// has run (see [`Self::objects_epoch`]).
     /// The object tree's answer, and empty for an engine that has none.
     pub here: Vec<String>,
-    /// Objects the player carries, refreshed every frame from the engine.
+    /// Objects the player carries, refreshed alongside [`Self::here`].
     pub carried: Vec<String>,
+    /// The [`AppState::turn_epoch`] the object columns were last refreshed at,
+    /// `None` for a fresh open (SQ-1175). Objects only move when the VM runs,
+    /// and every turn finisher (and a host restore) bumps the epoch — so a
+    /// matching epoch means `refresh_objects` has nothing new to read, and the
+    /// ~20 Hz loop tick skips the whole object-tree walk (on v4+ the location
+    /// detection behind it Z-decodes every short name in the game).
+    pub objects_epoch: Option<u64>,
     /// The nouns the story has PRINTED, most recently first — the second block
     /// of the noun columns, under whatever the object tree could say (SQ-1135).
     ///
@@ -2465,6 +2473,15 @@ pub struct AppState {
     /// unchanged map reuses the routed model instead of re-running `render_layer`.
     /// See [`MapRenderCache`] and [`AppState::cached_map_render`]. (SQ-0305)
     pub(crate) map_render: std::cell::RefCell<Option<MapRenderCache>>,
+    /// The scroll-independent tables `render_map` derives from the LIVE model at
+    /// the current zoom — room placement, Boxes-zoom position tables, edge kinds
+    /// — keyed `(gen, layer)` plus the zoom stored inside (SQ-1182). Cleared
+    /// whenever `map_render` is replaced, so tables derived from a superseded
+    /// model (the empty placeholder a first draw seeds, at the SAME `(gen,
+    /// layer)` as the real route that follows it) can never be served for the
+    /// new one. See `render::map::derived_tables`.
+    pub(crate) map_derived:
+        std::cell::RefCell<Option<(u64, LayerId, crate::render::map::MapDerived)>>,
     /// In-flight background map-render job (SQ-0379): rebuilds `map_render` for a
     /// new `(graph_gen, layer)` off the main thread so a re-route never blocks the
     /// interpreter. `RefCell` so it can be spawned from within the draw closure
@@ -3340,6 +3357,7 @@ impl Default for AppState {
             transcript_wrap: std::cell::RefCell::new(None),
             raster_wrap: std::cell::RefCell::new(None),
             map_render: std::cell::RefCell::new(None),
+            map_derived: std::cell::RefCell::new(None),
             render_job: std::cell::RefCell::new(None),
             render_steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             input_text_origin: std::cell::Cell::new(None),
@@ -4113,6 +4131,8 @@ impl AppState {
                     layer,
                     rm: mapper::render::render(&mapper::graph::MapGraph::new()),
                 });
+                // A new model means new derived tables (SQ-1182).
+                *self.map_derived.borrow_mut() = None;
             }
             self.spawn_render_job(layer, graph, gen);
         }
@@ -4123,7 +4143,12 @@ impl AppState {
             for r in &mut c.rm.rooms {
                 r.is_current = Some(r.id) == current;
                 if let Some(room) = graph.room(r.id) {
-                    r.label = room.label().to_string();
+                    // Compare before writing: labels rarely change, and this
+                    // runs per room per frame — the unconditional to_string was
+                    // one allocation per room per drawn frame (SQ-1182).
+                    if r.label != room.label() {
+                        r.label = room.label().to_string();
+                    }
                 }
             }
         }
@@ -4209,6 +4234,11 @@ impl AppState {
                     }
                     *self.map_render.borrow_mut() =
                         Some(MapRenderCache { gen: job.gen, layer: job.layer, rm });
+                    // The derived tables described the model this replaces — and
+                    // the first real route lands at the SAME `(gen, layer)` as
+                    // the empty placeholder it supersedes, so the key alone
+                    // cannot tell them apart (SQ-1182).
+                    *self.map_derived.borrow_mut() = None;
                     if let Ok(mut s) = self.render_steps.lock() {
                         s.clear();
                     }
@@ -6862,6 +6892,56 @@ mod tests {
             let rm = s.cached_map_render(0, &g);
             assert_eq!(rm.rooms.len(), 2, "the freshly routed model is now served");
         }
+    }
+
+    /// SQ-1182: `render_map`'s scroll-independent derived tables (room
+    /// placement, position tables, edge kinds) are cached beside the live model
+    /// and dropped whenever that model is replaced — INCLUDING the
+    /// same-`(gen, layer)` replacement of the first draw's empty placeholder by
+    /// the first real route, which the key alone cannot tell apart. That
+    /// replacement is the stale-cache hazard this pins: falsify by removing the
+    /// `map_derived` clear in `poll_render_job`, and the third block serves
+    /// placement for zero rooms against a one-room model.
+    #[test]
+    fn map_derived_tables_are_dropped_when_the_live_model_is_replaced() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut g = mapper::graph::MapGraph::new();
+        g.upsert_room(1, "A".into());
+        g.set_pos(1, (0, 0));
+        let mut s = AppState::default();
+        let area = Rect::new(0, 0, 40, 20);
+
+        // First draw: the empty placeholder is the live model, and the derived
+        // tables cached for it describe zero rooms.
+        {
+            let rm = s.cached_map_render(0, &g);
+            let mut buf = Buffer::empty(area);
+            crate::render::map::render_map(&rm, &s, area, &mut buf);
+        }
+        {
+            let d = s.map_derived.borrow();
+            let (_, _, tables) = d.as_ref().expect("the live model's tables are cached");
+            assert_eq!(tables.rooms_placed(), 0, "…derived from the placeholder");
+        }
+
+        // The routed model lands at the SAME (gen, layer): the cache must drop.
+        drain_render_job(&mut s);
+        assert!(
+            s.map_derived.borrow().is_none(),
+            "installing the routed model drops the placeholder's tables"
+        );
+
+        // The next draw derives fresh tables from the real model.
+        {
+            let rm = s.cached_map_render(0, &g);
+            let mut buf = Buffer::empty(area);
+            crate::render::map::render_map(&rm, &s, area, &mut buf);
+        }
+        let d = s.map_derived.borrow();
+        let (_, _, tables) = d.as_ref().expect("rebuilt on the next draw");
+        assert_eq!(tables.rooms_placed(), 1, "…and they describe the routed model");
     }
 
     /// SQ-0378: a step between already-placed rooms changes the current-room

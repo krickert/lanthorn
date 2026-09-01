@@ -14,10 +14,10 @@
 //! unrelated to when the player found the room — so without a persisted visit order, numbering
 //! that used id order instead would renumber every "Maze" room behind a newly-found low-id one.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::direction::{opposite, Direction};
-use crate::graph::{MapGraph, RoomId};
+use crate::graph::{Connection, MapGraph, RoomId};
 use crate::layer::LayerId;
 
 /// The twelve travel directions, in the order the matrix columns them.
@@ -94,14 +94,45 @@ impl MatrixCell {
 /// the more useful of the two facts. `↩` therefore means "the only thing this direction ever did
 /// was bring me back".
 pub fn classify(graph: &MapGraph, room: RoomId, dir: Direction) -> MatrixCell {
+    classify_with(graph, &ConnIndex::new(graph), room, dir)
+}
+
+/// The graph's connections indexed by origin room, built once per [`build`]
+/// call (SQ-1181).
+///
+/// `classify` asks "which edges leave this room" up to fifteen times per cell
+/// — the dest lookup, the reciprocal check, and one scan per return column —
+/// and a table redrawn at animation rate was paying rows x 12 x 15 full-list
+/// scans per frame. Each origin's edges keep the whole list's relative order,
+/// so the first-match answers are exactly the un-indexed ones.
+struct ConnIndex<'a> {
+    by_origin: HashMap<RoomId, Vec<&'a Connection>>,
+}
+
+impl<'a> ConnIndex<'a> {
+    fn new(graph: &'a MapGraph) -> Self {
+        let mut by_origin: HashMap<RoomId, Vec<&'a Connection>> = HashMap::new();
+        for c in graph.connections() {
+            by_origin.entry(c.origin).or_default().push(c);
+        }
+        ConnIndex { by_origin }
+    }
+
+    /// Every connection leaving `room`, in the graph's own insertion order.
+    fn from(&self, room: RoomId) -> &[&'a Connection] {
+        self.by_origin.get(&room).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// [`classify`], against a prebuilt [`ConnIndex`] — the same logic, scanning
+/// only the origin's own edges. The public per-cell `classify` delegates here
+/// with a throwaway index (one pass over the list, no worse than the single
+/// scan it always cost), so there is exactly one classification to keep right.
+fn classify_with(graph: &MapGraph, idx: &ConnIndex<'_>, room: RoomId, dir: Direction) -> MatrixCell {
     if dir == Direction::Unknown {
         return MatrixCell::Untried;
     }
-    let dest = graph
-        .connections()
-        .iter()
-        .find(|c| c.origin == room && c.dir == dir && c.dest != room)
-        .map(|c| c.dest);
+    let dest = idx.from(room).iter().find(|c| c.dir == dir && c.dest != room).map(|c| c.dest);
     let Some(dest) = dest else {
         if graph.self_loops(room).contains(&dir) {
             return MatrixCell::SelfLoop;
@@ -113,14 +144,13 @@ pub fn classify(graph: &MapGraph, room: RoomId, dir: Direction) -> MatrixCell {
     if graph.layer_of(dest) != graph.layer_of(room) {
         return MatrixCell::LeavesLayer { dest };
     }
-    if graph.connections().iter().any(|c| c.origin == dest && c.dir == opposite(dir) && c.dest == room)
-    {
+    if idx.from(dest).iter().any(|c| c.dir == opposite(dir) && c.dest == room) {
         return MatrixCell::Reciprocal { dest };
     }
     // Any other direction that comes back. Scanned in column order so the answer is stable
     // whatever order the edges were minted in.
     for back in MATRIX_DIRS {
-        if graph.connections().iter().any(|c| c.origin == dest && c.dir == back && c.dest == room) {
+        if idx.from(dest).iter().any(|c| c.dir == back && c.dest == room) {
             return MatrixCell::ReturnBy { dest, back };
         }
     }
@@ -341,13 +371,16 @@ impl Matrix {
 /// exactly the same order and a player's "the one I called 7" keeps meaning the same room.
 pub fn build(graph: &MapGraph, layer: LayerId) -> Matrix {
     let labels = labels(graph, layer);
+    // One index for the whole table (SQ-1181): rows x 12 cells all classify
+    // against it instead of each rescanning the full connection list.
+    let idx = ConnIndex::new(graph);
     let rows = rooms_by_seq(graph, layer)
         .into_iter()
         .map(|id| MatrixRow {
             room: id,
             label: labels.row_of(id).to_string(),
             tag: labels.tag_of(id).to_string(),
-            cells: MATRIX_DIRS.map(|d| classify(graph, id, d)),
+            cells: MATRIX_DIRS.map(|d| classify_with(graph, &idx, id, d)),
         })
         .collect();
     let here = graph.current().filter(|&id| graph.layer_of(id) == layer);
@@ -406,6 +439,27 @@ mod tests {
         g.add_edge(4, Direction::E, 1);
         assert_eq!(classify(&g, 4, Direction::E), MatrixCell::OneWay { dest: 1 });
         assert!(g.self_loops(4).contains(&Direction::E), "and the loop is not destroyed");
+    }
+
+    /// SQ-1181: `build` classifies against a shared per-call [`ConnIndex`];
+    /// the public per-cell `classify` builds a throwaway one. Both delegate to
+    /// the same `classify_with`, and this pins that the table really carries
+    /// the per-cell answers — the guard against the two routes ever drifting.
+    #[test]
+    fn build_cells_agree_with_per_cell_classify() {
+        let (g, l) = maze();
+        let m = build(&g, l);
+        for row in &m.rows {
+            for (i, cell) in row.cells.iter().enumerate() {
+                assert_eq!(
+                    *cell,
+                    classify(&g, row.room, MATRIX_DIRS[i]),
+                    "room {} {:?}",
+                    row.room,
+                    MATRIX_DIRS[i]
+                );
+            }
+        }
     }
 
     #[test]

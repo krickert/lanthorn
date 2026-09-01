@@ -138,7 +138,7 @@ fn zoom_box_size(zoom: Zoom) -> (u16, u16) {
 // screen = virtual + (area.origin - scroll * step).
 
 /// An integer rectangle in virtual map space (coordinates may be negative).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct VRect {
     x: i32,
     y: i32,
@@ -172,6 +172,7 @@ pub(crate) const BOX_H: i32 = 5;
 
 /// One axis of the non-uniform Boxes-zoom layout: where each room line starts (pixels)
 /// and how wide each channel after it is.
+#[derive(Debug)]
 pub struct PosTable {
     room_start: std::collections::BTreeMap<i32, i32>, // grid line index → pixel start of the box
     channel_w: std::collections::BTreeMap<i32, i32>,  // grid line index → pixel width of the gap after it
@@ -413,9 +414,11 @@ pub fn room_screen_rects(
     let scroll = state.scroll;
     let (bw, bh) = zoom_box_size(zoom);
 
-    let boxes = matches!(zoom, crate::state::Zoom::Boxes);
-    let axes = boxes.then(|| boxes_axes(&rm.plan, rm.bounds));
-    let (off_x, off_y) = match &axes {
+    // The same cached tables `render_map` draws from (SQ-1182) — this runs right
+    // after it on every drawn frame, and was rebuilding `boxes_axes` again.
+    let derived = derived_tables(rm, state, zoom);
+    let axes = &derived.axes;
+    let (off_x, off_y) = match axes {
         Some((cols, rows)) => (
             area.x as i32 - cols.room_pixel(scroll.0) + state.char_pan.0,
             area.y as i32 - rows.room_pixel(scroll.1) + state.char_pan.1,
@@ -427,7 +430,7 @@ pub fn room_screen_rects(
         }
     };
     let room_virtual = |cell: (i32, i32)| -> (i32, i32) {
-        match &axes {
+        match axes {
             Some((cols, rows)) => (cols.room_pixel(cell.0), rows.room_pixel(cell.1)),
             None => cell_to_virtual(cell, zoom),
         }
@@ -484,6 +487,105 @@ pub fn room_at_cell(
 // rather than from compile-time constants.  The constants have been removed.
 // See `room_style()` and the connector-drawing functions for usage.
 
+// ── Derived tables (SQ-1182) ─────────────────────────────────────────────────
+
+/// The scroll-independent tables one routed model implies at one zoom: every
+/// room's virtual-space rect, the Boxes-zoom position tables, and the per-edge
+/// kind classification. None depend on scroll or pan — they were nevertheless
+/// rebuilt on every drawn frame, over every room, the whole grid span and every
+/// edge, during 30 fps animation windows included.
+///
+/// All inputs are the model and the zoom, so the LIVE model's tables are cached
+/// in [`AppState::map_derived`] and rebuilt only when the model is replaced
+/// (`poll_render_job` clears the cache) or the zoom changes. Replay, tidy-anim
+/// and test models are built fresh per frame, exactly as before — they are not
+/// tracked by `graph_gen`, so nothing keyed on it may describe them.
+#[derive(Debug)]
+pub(crate) struct MapDerived {
+    /// The zoom this was derived at — part of the cache key.
+    zoom: Zoom,
+    /// Every room's virtual-space rect (step 1 of `render_map`).
+    placed: std::collections::HashMap<RoomId, VRect>,
+    /// The Boxes-zoom lane-routing position tables; `None` at other zooms.
+    axes: Option<(PosTable, PosTable)>,
+    /// Per-edge kind classification; only built (and only read) at Boxes zoom.
+    kinds: std::collections::HashMap<(RoomId, RoomId, Direction), EdgeKind>,
+}
+
+impl MapDerived {
+    /// How many rooms the placement table covers — the freshness probe the
+    /// `state.rs` cache-invalidation test reads (SQ-1182).
+    #[cfg(test)]
+    pub(crate) fn rooms_placed(&self) -> usize {
+        self.placed.len()
+    }
+}
+
+fn build_derived(rm: &RenderMap, zoom: Zoom) -> MapDerived {
+    let boxes = matches!(zoom, Zoom::Boxes);
+    let axes = boxes.then(|| boxes_axes(&rm.plan, rm.bounds));
+    let (bw, _bh) = zoom_box_size(zoom);
+    let mut placed: std::collections::HashMap<RoomId, VRect> =
+        std::collections::HashMap::with_capacity(rm.rooms.len());
+    for room in &rm.rooms {
+        let (vx, vy) = match &axes {
+            Some((cols, rows)) => (cols.room_pixel(room.cell.0), rows.room_pixel(room.cell.1)),
+            None => cell_to_virtual(room.cell, zoom),
+        };
+        placed.insert(room.id, VRect { x: vx, y: vy, w: bw as i32 });
+    }
+    let kinds = if boxes { edge_kinds(rm) } else { std::collections::HashMap::new() };
+    MapDerived { zoom, placed, axes, kinds }
+}
+
+/// The derived tables for `rm` at `zoom` — reused from [`AppState::map_derived`]
+/// when `rm` IS the live cached model, built fresh otherwise.
+///
+/// Liveness is decided by address: the production path passes a `Ref`-projected
+/// `&MapRenderCache::rm`, so pointer identity to the entry in `state.map_render`
+/// is exact — a replay graph, a tidy-animation frame or a test's local model can
+/// never alias it. The key carries the entry's own `(gen, layer)` (not
+/// `state.graph_gen`, which runs ahead of a stale model mid-reroute) plus the
+/// zoom; `poll_render_job` clears the cache whenever it installs a new model, so
+/// a same-`(gen, layer)` replacement (the empty placeholder giving way to the
+/// first real route) cannot serve tables derived from the placeholder.
+fn derived_tables<'a>(rm: &RenderMap, state: &'a AppState, zoom: Zoom) -> DerivedSource<'a> {
+    let live_key = state.map_render.try_borrow().ok().and_then(|mr| {
+        mr.as_ref().and_then(|c| std::ptr::eq(&c.rm, rm).then_some((c.gen, c.layer)))
+    });
+    match live_key {
+        Some((gen, layer)) => {
+            let hit = matches!(
+                &*state.map_derived.borrow(),
+                Some((g, l, d)) if *g == gen && *l == layer && d.zoom == zoom
+            );
+            if !hit {
+                *state.map_derived.borrow_mut() = Some((gen, layer, build_derived(rm, zoom)));
+            }
+            DerivedSource::Cached(std::cell::Ref::map(state.map_derived.borrow(), |o| {
+                &o.as_ref().expect("populated above").2
+            }))
+        }
+        None => DerivedSource::Fresh(build_derived(rm, zoom)),
+    }
+}
+
+/// Where [`derived_tables`] found its answer; derefs to the tables either way.
+enum DerivedSource<'a> {
+    Cached(std::cell::Ref<'a, MapDerived>),
+    Fresh(MapDerived),
+}
+
+impl std::ops::Deref for DerivedSource<'_> {
+    type Target = MapDerived;
+    fn deref(&self) -> &MapDerived {
+        match self {
+            DerivedSource::Cached(r) => r,
+            DerivedSource::Fresh(d) => d,
+        }
+    }
+}
+
 // ── render_map ────────────────────────────────────────────────────────────────
 
 /// Draw the map from `rm` into `buf` for `area`, using view state from `state`.
@@ -538,8 +640,12 @@ pub fn render_map(rm: &RenderMap, state: &AppState, area: Rect, buf: &mut Buffer
     // top-left pixel; the scroll offset is computed in the SAME space so panning is a
     // pure translate-and-clip and connector geometry is scroll-invariant.
     let boxes = matches!(zoom, crate::state::Zoom::Boxes);
-    let axes = boxes.then(|| boxes_axes(&rm.plan, rm.bounds));
-    let (off_x, off_y) = match &axes {
+    // ── 1. The scroll-independent tables: room placement, position tables, edge
+    //       kinds — cached for the live model, fresh for any other (SQ-1182).
+    let derived = derived_tables(rm, state, zoom);
+    let axes = &derived.axes;
+    let placed = &derived.placed;
+    let (off_x, off_y) = match axes {
         Some((cols, rows)) => (
             area.x as i32 - cols.room_pixel(scroll.0) + state.char_pan.0,
             area.y as i32 - rows.room_pixel(scroll.1) + state.char_pan.1,
@@ -551,35 +657,26 @@ pub fn render_map(rm: &RenderMap, state: &AppState, area: Rect, buf: &mut Buffer
         }
     };
     let room_virtual = |cell: (i32, i32)| -> (i32, i32) {
-        match &axes {
+        match axes {
             Some((cols, rows)) => (cols.room_pixel(cell.0), rows.room_pixel(cell.1)),
             None => cell_to_virtual(cell, zoom),
         }
     };
-
-    // ── 1. Place ALL rooms in virtual space (independent of scroll/area) ──────
-    let (bw, _bh) = zoom_box_size(zoom);
-    let mut placed: std::collections::HashMap<RoomId, VRect> =
-        std::collections::HashMap::new();
-    for room in &rm.rooms {
-        let (vx, vy) = room_virtual(room.cell);
-        placed.insert(room.id, VRect { x: vx, y: vy, w: bw as i32 });
-    }
 
     // ── 2. Stub (portal) edges at non-Boxes zoom keep the bare-label `draw_stub`; Boxes zoom draws
     //       the in-room portal-icon overlay after the rooms (below).
     let connector_style = state.colors.theme.get("map.connector").style;
     for edge in &rm.edges {
         if edge.is_stub && !boxes {
-            draw_stub(edge, &placed, off_x, off_y, area, buf, connector_style);
+            draw_stub(edge, placed, off_x, off_y, area, buf, connector_style);
         }
     }
 
     // ── 3. Boxes zoom: draw line-art connectors along their assigned lanes, on top of
     //       the rooms drawn below them in step 2.
     let mut arrowheads: Vec<Arrowhead> = Vec::new();
-    if let Some((cols, rows)) = &axes {
-        arrowheads = render_lane_connectors(&rm.plan, cols, rows, (off_x, off_y), area, buf, &state.symbols.arrows, &state.symbols.path, &state.symbols.portal, &state.colors, state.symbols.diagonal_corners, &edge_kinds(rm));
+    if let Some((cols, rows)) = axes {
+        arrowheads = render_lane_connectors(&rm.plan, cols, rows, (off_x, off_y), area, buf, &state.symbols.arrows, &state.symbols.path, &state.symbols.portal, &state.colors, state.symbols.diagonal_corners, &derived.kinds);
     }
 
     // ── 4. Draw rooms on top of the line-art (translate + clip) ───────────────
@@ -594,7 +691,7 @@ pub fn render_map(rm: &RenderMap, state: &AppState, area: Rect, buf: &mut Buffer
     // normal view the icons go on the interior right column; in portal view (show_portal_labels)
     // they move onto the border and the destination names float outside the box.
     if boxes {
-        draw_portal_icons(rm, &placed, state, state.show_portal_labels, (off_x, off_y), area, buf);
+        draw_portal_icons(rm, placed, state, state.show_portal_labels, (off_x, off_y), area, buf);
     }
 
     // ── 5. Draw departure/arrival arrowheads LAST, so each embeds in the room ─

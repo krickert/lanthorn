@@ -469,8 +469,9 @@ pub(crate) fn refresh_engine_input(
 }
 
 /// Refill the command band from the engine, once per loop tick: its object
-/// columns every tick (they are live), and its VERB column once per open, from
-/// the story's own grammar (SQ-1111).
+/// columns whenever the VM has run since the last fill (`turn_epoch`-gated,
+/// SQ-1175 — objects cannot move while the VM is parked at a read), and its
+/// VERB column once per open, from the story's own grammar (SQ-1111).
 ///
 /// Thin wrapper over `app::render::command_band`'s two refreshers, which live in
 /// the lib so the integration tests can drive them against a real story. Both
