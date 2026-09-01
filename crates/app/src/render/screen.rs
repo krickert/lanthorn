@@ -1149,6 +1149,11 @@ fn render_node(
                             let click_scale =
                                 if frame.plan_is_menu { menu.as_ref().unwrap_or(&scale) } else { &scale };
                             gr.record_hybrid_click_map(area, click_scale, native, cell_px, frame.packed_text.clone());
+                            // SQ-1188: hand this frame's changed-band encodes to the
+                            // background worker in one batch. Every band above kept
+                            // its old upload placed; the results land via
+                            // `poll_v6_job` and the next redraw places them.
+                            gr.spawn_band_jobs(picker);
                         }
                         // The story window as real terminal text (primary-Buffer path).
                         //

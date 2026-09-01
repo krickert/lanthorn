@@ -810,6 +810,31 @@ mod emitter {
         frame(&mut gr, 40);
         let settled = sink.0.borrow().len();
 
+        // SQ-1188: the change frame stages the encode for the worker and keeps
+        // the old upload placed — its emission is byte-empty. The transmit goes
+        // out on the frame after the result lands, and THAT frame's emission is
+        // what the one-cell claim is about.
+        frame(&mut gr, 90);
+        {
+            let change_frame = sink.0.borrow()[settled..].to_vec();
+            assert!(
+                !change_frame.windows(4).any(|w| w == b"a=T,"),
+                "the change frame re-places the OLD upload and transmits nothing"
+            );
+            assert_eq!(
+                change_frame.windows(PLACEHOLDER.len()).filter(|w| *w == PLACEHOLDER).count(),
+                0,
+                "and repaints no placeholder cell"
+            );
+        }
+        let settled = sink.0.borrow().len();
+        gr.spawn_band_jobs(&picker);
+        for _ in 0..500 {
+            if gr.poll_v6_job() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         frame(&mut gr, 90);
         let emitted = sink.0.borrow()[settled..].to_vec();
 
