@@ -489,6 +489,26 @@ fn scale_halo(s: f32) -> u32 {
     }
 }
 
+/// Fold the canvas pixels of the native rect `[x0, x1) × [y0, y1)` into `h` —
+/// the content half of every band freshness hash. One definition so the crop
+/// and stretch draws cannot disagree about what "the footprint's pixels"
+/// means, and so the walk has one place to be made fast (SQ-1189).
+fn hash_canvas_rows(
+    h: &mut std::collections::hash_map::DefaultHasher,
+    canvas: &image::RgbaImage,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+) {
+    use std::hash::Hash;
+    for ny in y0..y1 {
+        for nx in x0..x1 {
+            canvas.get_pixel(nx, ny).0.hash(h);
+        }
+    }
+}
+
 /// Render a graphics window directly as per-cell background colours when it is a
 /// solid fill or a thin strip — the shape games use for chrome: panel dividers,
 /// colour bars, backgrounds (e.g. Kerkerkruip draws its rules as 1×N / N×1 solid
@@ -1209,6 +1229,24 @@ pub struct GraphicsRender {
     /// content + scale + scaled dimensions; each band crops its sub-rect from it,
     /// so band output stays byte-identical to a per-band whole-canvas resize.
     chrome_scaled: Option<(u64, image::RgbaImage)>,
+    /// SQ-1187: the cached hybrid chrome-ring frame — canvases, strips, band
+    /// placements, viewport — replayed whole when `v6_hybrid_gen`'s key holds
+    /// still. Lives here (not on `AppState`) because this is the object whose
+    /// band caches the replay leans on, and the two must be invalidated
+    /// together on a font-size change.
+    pub(crate) hybrid: Option<crate::render::screen::HybridFrame>,
+    /// How many times the hybrid ring frame has been COMPUTED since launch
+    /// (SQ-1187). The gate's oracle: an unchanged frame replayed from cache
+    /// leaves it still, any input change bumps it. Public for the gate's
+    /// falsification suite, and cheap enough to keep forever.
+    pub hybrid_builds: u64,
+    /// SQ-1187: true while the current frame REPLAYS an unchanged hybrid
+    /// frame. The whole-frame generation key has already proven every input to
+    /// the per-band content hashes unchanged, so the three band draws reuse
+    /// their stored hashes instead of re-walking canvas pixels. Reset by
+    /// [`Self::begin_band_log`] so it can never leak across frames or into the
+    /// raster path.
+    band_replay: bool,
     /// Kitty-protocol graphics windows: one transmitted image per window,
     /// placed with an EXPLICIT r×c grid so the terminal scales the canvas to
     /// exactly the window's cell rect (SQ-0520 — see `render_kitty_virtual`).
@@ -1896,6 +1934,11 @@ impl GraphicsRender {
         self.invalidate_v6();
         self.invalidate_chrome_bands();
         self.chrome_scaled = None;
+        // The hybrid frame's generation key covers the font size, so a font
+        // change would rebuild it anyway — dropped here too so a frame fitted
+        // against the old cell can never outlive the band caches it replays
+        // (SQ-1187).
+        self.hybrid = None;
     }
 
     /// Poll the background v6 encode: if it finished, install its protocol as the
@@ -2085,6 +2128,14 @@ impl GraphicsRender {
         self.band_mags.clear();
         self.ops.clear();
         self.band_ground = None;
+        self.band_replay = false;
+    }
+
+    /// SQ-1187: declare whether this frame REPLAYS an unchanged hybrid frame —
+    /// see the field. Set by the hybrid draw half right after the frame gate,
+    /// never anywhere else.
+    pub fn set_band_replay(&mut self, on: bool) {
+        self.band_replay = on;
     }
 
     /// Declare the ground this frame's chrome bands resolve their transparency
@@ -2249,7 +2300,6 @@ impl GraphicsRender {
         let sy_hi = (rel_y0 as i64 + bh as i64 - scale.off_y as i64).clamp(sy_lo, sh as i64);
 
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
         // Hash ONLY the band's own native footprint (not the whole canvas): a
         // change confined to another band's native pixels then leaves this band's
         // hash — and its cached upload — untouched (SQ-0514). The footprint is the
@@ -2273,24 +2323,34 @@ impl GraphicsRender {
             let ny0 = scaled_to_native(sy_lo as u32, nh, sh).saturating_sub(halo);
             let ny1 = (scaled_to_native(sy_hi as u32 - 1, nh, sh) + 1 + halo).min(nh);
             footprint = Some((nx0, ny0, nx1 - nx0, ny1 - ny0));
-            (nx0, nx1, ny0, ny1).hash(&mut h);
-            for ny in ny0..ny1 {
-                for nx in nx0..nx1 {
-                    chrome_canvas.get_pixel(nx, ny).0.hash(&mut h);
-                }
-            }
-        } else {
-            // Fully in the letterbox margin — no native pixels feed it.
-            0u8.hash(&mut h);
         }
-        self.band_ground.map(|p| p.0).hash(&mut h);
-        scale.s.to_bits().hash(&mut h);
-        (scale.off_x, scale.off_y).hash(&mut h);
-        (cw, ch).hash(&mut h);
-        (rel_x0, rel_y0, bw, bh).hash(&mut h);
-        let hash = h.finish();
         let key = (BandSlot::Art as u8, band.x, band.y, band.width, band.height);
-        let fresh = matches!(self.chrome_bands.get(&key), Some((v, _, _)) if *v == hash);
+        let cached_hash = self.chrome_bands.get(&key).map(|(v, _, _)| *v);
+        // SQ-1187: on a replay frame the whole-frame generation key has already
+        // proven every input to this hash unchanged, so the stored hash IS the
+        // hash and no pixel is walked. Any frame that could have moved an input
+        // rebuilt the HybridFrame, and that frame carries `band_replay = false`.
+        let hash = match cached_hash.filter(|_| self.band_replay) {
+            Some(v) => v,
+            None => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                match footprint {
+                    Some((nx0, ny0, fw, fh)) => {
+                        (nx0, nx0 + fw, ny0, ny0 + fh).hash(&mut h);
+                        hash_canvas_rows(&mut h, chrome_canvas, nx0, nx0 + fw, ny0, ny0 + fh);
+                    }
+                    // Fully in the letterbox margin — no native pixels feed it.
+                    None => 0u8.hash(&mut h),
+                }
+                self.band_ground.map(|p| p.0).hash(&mut h);
+                scale.s.to_bits().hash(&mut h);
+                (scale.off_x, scale.off_y).hash(&mut h);
+                (cw, ch).hash(&mut h);
+                (rel_x0, rel_y0, bw, bh).hash(&mut h);
+                h.finish()
+            }
+        };
+        let fresh = cached_hash == Some(hash);
         if !fresh {
             // Copy the sub-rect under this band out of the frame-shared scaled
             // chrome into a band-sized image (letterbox area outside the scaled
@@ -2502,25 +2562,29 @@ impl GraphicsRender {
         let bh = band.height as u32 * ch;
 
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        // Hash ONLY the crop's native footprint (coords + pixels) plus the target
-        // device size — the stretch factor is (bw,bh)/(cw_n,ch_n), so both ends are
-        // covered. A change outside this native rect (e.g. the banner's Score/Moves)
-        // never alters the hash, keeping the flank's cached upload fresh (SQ-0514).
-        (slot as u8).hash(&mut h); // discriminator vs. draw_chrome_band keys on the same map
-        (cx, cy, cw_n, ch_n).hash(&mut h);
         let x1 = (cx + cw_n).min(canvas_w);
         let y1 = (cy + ch_n).min(canvas_h);
-        for ny in cy..y1 {
-            for nx in cx..x1 {
-                chrome_canvas.get_pixel(nx, ny).0.hash(&mut h);
-            }
-        }
-        self.band_ground.map(|p| p.0).hash(&mut h);
-        (bw, bh).hash(&mut h);
-        let hash = h.finish();
         let key = (slot as u8, band.x, band.y, band.width, band.height);
-        let fresh = matches!(self.chrome_bands.get(&key), Some((v, _, _)) if *v == hash);
+        let cached_hash = self.chrome_bands.get(&key).map(|(v, _, _)| *v);
+        // SQ-1187: on a replay frame the stored hash is the hash — see
+        // `draw_chrome_band`.
+        let hash = match cached_hash.filter(|_| self.band_replay) {
+            Some(v) => v,
+            None => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // Hash ONLY the crop's native footprint (coords + pixels) plus the target
+                // device size — the stretch factor is (bw,bh)/(cw_n,ch_n), so both ends are
+                // covered. A change outside this native rect (e.g. the banner's Score/Moves)
+                // never alters the hash, keeping the flank's cached upload fresh (SQ-0514).
+                (slot as u8).hash(&mut h); // discriminator vs. draw_chrome_band keys on the same map
+                (cx, cy, cw_n, ch_n).hash(&mut h);
+                hash_canvas_rows(&mut h, chrome_canvas, cx, x1, cy, y1);
+                self.band_ground.map(|p| p.0).hash(&mut h);
+                (bw, bh).hash(&mut h);
+                h.finish()
+            }
+        };
+        let fresh = cached_hash == Some(hash);
         if !fresh {
             // Copy the native crop (clamped to the canvas) into its own image, then
             // resize it to the band's device box. Transparent native pixels stay
@@ -2660,16 +2724,24 @@ impl GraphicsRender {
         }
 
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (slot as u8).hash(&mut h);
-        (src.width(), src.height()).hash(&mut h);
-        src.as_raw().hash(&mut h);
-        (bw, bh).hash(&mut h);
-        self.band_ground.map(|p| p.0).hash(&mut h);
-        (dx, dy, dw, dh).hash(&mut h);
-        let hash = h.finish();
         let key = (slot as u8, band.x, band.y, band.width, band.height);
-        let fresh = matches!(self.chrome_bands.get(&key), Some((v, _, _)) if *v == hash);
+        let cached_hash = self.chrome_bands.get(&key).map(|(v, _, _)| *v);
+        // SQ-1187: on a replay frame the stored hash is the hash — see
+        // `draw_chrome_band`.
+        let hash = match cached_hash.filter(|_| self.band_replay) {
+            Some(v) => v,
+            None => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (slot as u8).hash(&mut h);
+                (src.width(), src.height()).hash(&mut h);
+                src.as_raw().hash(&mut h);
+                (bw, bh).hash(&mut h);
+                self.band_ground.map(|p| p.0).hash(&mut h);
+                (dx, dy, dw, dh).hash(&mut h);
+                h.finish()
+            }
+        };
+        let fresh = cached_hash == Some(hash);
         if !fresh {
             let scaled = resize_directional(src, dw, dh);
             // The band is `dest` and transparent everywhere else. When `dest` IS the
