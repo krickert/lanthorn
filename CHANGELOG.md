@@ -25,6 +25,22 @@ Absolute URLs or no link.
 is staged in [`docs/readme-next.md`](docs/readme-next.md), because the README
 describes the RELEASED build and must not describe this one until it ships.*
 
+### The story picker follows your folders, and finds a story in any of them
+
+A library sorted into sub-folders used to show the picker one level of itself.
+Folders are now rows at the top of the list: `Enter` (or a double-click) opens
+one, `Backspace` or the `..` row comes back up, and the selection lands on the
+folder you left. Sorting keeps folders on top under every column, downloads
+land in the folder on screen, and a folder row has its own `story_folder`
+colour in `style.toml`.
+
+`Ctrl+F` opens a type-to-filter field over an in-memory index of the **whole**
+library, built in the background as the picker opens, so the folder view is up
+instantly and the index catches up behind it. Every word typed must occur in a
+story's title, author, filename or folder; matches show their folder after the
+title, `↑`/`↓` move through them while typing, `Enter` opens one, `Esc` returns
+to the folder. Both keys are rebindable (`find-story`, `parent-folder`).
+
 ### Breaking — the command-line flags
 
 Every `--no-x` flag is replaced by a positive one that takes a value, across
