@@ -492,7 +492,23 @@ fn scale_halo(s: f32) -> u32 {
 /// Fold the canvas pixels of the native rect `[x0, x1) × [y0, y1)` into `h` —
 /// the content half of every band freshness hash. One definition so the crop
 /// and stretch draws cannot disagree about what "the footprint's pixels"
-/// means, and so the walk has one place to be made fast (SQ-1189).
+/// means, and so the walk has one place to be made fast.
+///
+/// SQ-1189: one hasher write per ROW over `as_raw()`, not one `Hash` call per
+/// pixel. `get_pixel().0.hash()` cost four bounds-checked sample reads plus a
+/// SipHash round per pixel — ~1M rounds for a 640x400 footprint — where the
+/// backing buffer is already one contiguous RGBA byte run per row. Semantics
+/// are equivalent by construction: the same canvas hashes the same bytes in
+/// the same order, and any changed pixel inside the footprint changes the byte
+/// stream. The footprint bounds (and their SQ-0824 halo) are unchanged — the
+/// callers still hash the coords themselves, so a moved footprint over
+/// identical bytes still misses.
+///
+/// The finer generation this cannot become: the chrome canvas is a per-frame
+/// COMPOSITE of many windows, the paint ground and the theme's pages, so no
+/// single `GraphicsWindow::version` describes it — the version-shaped gate
+/// exists one level up instead, where SQ-1187's whole-frame key skips this
+/// hash entirely on a replay frame.
 fn hash_canvas_rows(
     h: &mut std::collections::hash_map::DefaultHasher,
     canvas: &image::RgbaImage,
@@ -501,11 +517,16 @@ fn hash_canvas_rows(
     y0: u32,
     y1: u32,
 ) {
-    use std::hash::Hash;
+    use std::hash::Hasher;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let w = canvas.width() as usize;
+    let raw = canvas.as_raw();
+    let len = (x1 - x0) as usize * 4;
     for ny in y0..y1 {
-        for nx in x0..x1 {
-            canvas.get_pixel(nx, ny).0.hash(h);
-        }
+        let base = (ny as usize * w + x0 as usize) * 4;
+        h.write(&raw[base..base + len]);
     }
 }
 
@@ -5613,6 +5634,45 @@ mod tests {
 
         assert_ne!(before[&top_key], after[&top_key], "the changed top band re-encodes (hash changed)");
         assert_eq!(before[&bot_key], after[&bot_key], "the disjoint bottom band stays fresh (hash unchanged)");
+    }
+
+    #[test]
+    fn hash_canvas_rows_tracks_footprint_pixels_exactly() {
+        // SQ-1189: the row-slice walk must be semantically equivalent to the
+        // per-pixel walk it replaced — same canvas → same key, any changed
+        // pixel INSIDE the footprint → changed key, any change strictly
+        // OUTSIDE it → same key.
+        use std::hash::Hasher;
+        let hash = |c: &image::RgbaImage| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            hash_canvas_rows(&mut h, c, 2, 12, 1, 9);
+            h.finish()
+        };
+        let mut canvas = image::RgbaImage::new(20, 10);
+        for (x, y, p) in canvas.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 13) as u8, (y * 7) as u8, ((x + y) * 5) as u8, 255]);
+        }
+        let base = hash(&canvas);
+        assert_eq!(base, hash(&canvas.clone()), "same canvas → same key");
+
+        let mut inside = canvas.clone();
+        inside.put_pixel(11, 8, image::Rgba([1, 2, 3, 4])); // last col/row of the footprint
+        assert_ne!(base, hash(&inside), "a changed pixel inside the footprint changes the key");
+        let mut corner = canvas.clone();
+        corner.put_pixel(2, 1, image::Rgba([9, 9, 9, 9])); // first col/row of the footprint
+        assert_ne!(base, hash(&corner), "the footprint's first pixel is covered too");
+
+        let mut outside = canvas.clone();
+        outside.put_pixel(12, 8, image::Rgba([1, 2, 3, 4])); // one column past x1
+        outside.put_pixel(1, 5, image::Rgba([1, 2, 3, 4])); // one column before x0
+        outside.put_pixel(5, 0, image::Rgba([1, 2, 3, 4])); // one row above y0
+        outside.put_pixel(5, 9, image::Rgba([1, 2, 3, 4])); // one row below y1
+        assert_eq!(base, hash(&outside), "a change strictly outside the footprint leaves the key alone");
+
+        // A degenerate footprint hashes nothing and does not panic.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        hash_canvas_rows(&mut h, &canvas, 5, 5, 2, 8);
+        hash_canvas_rows(&mut h, &canvas, 3, 9, 6, 6);
     }
 
     #[test]
