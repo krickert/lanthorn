@@ -25,6 +25,39 @@ Absolute URLs or no link.
 is staged in [`docs/readme-next.md`](docs/readme-next.md), because the README
 describes the RELEASED build and must not describe this one until it ships.*
 
+### Performance
+
+A pre-release sweep of everything that runs per turn and per frame. None of it
+changes what lanthorn does — all of it changes when and where.
+
+- **The guidance features now cost a turn almost nothing.** The shadow probe
+  refuses a question *before* paying for the snapshot when its worker is busy;
+  the Glulx snapshot diffs RAM by the slice instead of byte-at-a-time; and one
+  host snapshot per turn is shared by the turn history, the auto-save and the
+  return probe, where each used to take its own (~100 ms apiece on a large
+  Glulx game, in a debug build).
+- **"Does any object answer to this word?" is one set lookup.** The reveal and
+  the seen-words scrape used to walk every object's every parse word with
+  fresh allocations per comparison — now a truncated word set is built once a
+  turn and asked in O(1).
+- **The command band stopped re-reading the world twenty times a second.** With
+  the band open, the object columns re-read the engine only when the VM has
+  actually run.
+- **The hybrid v6 frame is gated the way raster always was.** An unchanged
+  frame replays a cached composition instead of rebuilding megabytes of canvas
+  and re-rasterizing every chrome glyph; changed picture bands compress and
+  encode on a worker thread while the old image holds the screen, so a turn's
+  art no longer hitches the UI on its way in.
+- **Evicted kitty uploads are now deleted from the terminal.** Before, they
+  leaked until the terminal's own quota evicted something — possibly a picture
+  still on screen.
+- **Auto-save builds and writes the archive on a background thread**, and the
+  opt-in turn history is bounded by the new `history_turns` key (default 500
+  turns) instead of growing for the life of the session.
+- **The map pane's derived tables are cached per layout generation**, and the
+  terminal write path is buffered — thousands of tiny locked writes per dense
+  frame became a handful.
+
 ### Breaking — the command-line flags
 
 Every `--no-x` flag is replaced by a positive one that takes a value, across
