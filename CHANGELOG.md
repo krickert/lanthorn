@@ -67,6 +67,11 @@ new `lanthorn-audio-relay` binary streams that FIFO over a WebSocket on port
 WebAudio. lanthorn itself is unchanged. Publish both ports; `LANTHORN_WEB_AUDIO=off`
 turns it off. See `docs/features/docker.md`.
 
+### GIF cover art is accepted
+
+IFDB and the IFComp archive serve some cover art as GIF; a fetch used to
+discard it as undecodable. The GIF decoder is now enabled.
+
 ### `--import-metadata`: curated identifications and covers
 
 For stories IFDB cannot identify by IFID, or has no cover for, a tab-separated
