@@ -144,6 +144,14 @@ const SAVES: &[Row] = &[
             "the archive and keeps per-turn blobs in memory.",
         ],
     ),
+    d(
+        "history_turns",
+        "500",
+        &[
+            "How many of the most recent turns record_turn_history retains before",
+            "evicting the oldest. Bounds memory on a long session; no 0 = unbounded.",
+        ],
+    ),
     d("undo_levels", "16", &["Undo depth: retained in-memory snapshots. 0 disables undo."]),
     d(
         "aux_storage",

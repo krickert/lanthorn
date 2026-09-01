@@ -437,6 +437,10 @@ fn post_turn_bookkeeping(
             map_changed,
             &result.transcript,
         );
+        // Bound retained turns (SQ-1185): `TurnRecord::save` is a full VM
+        // snapshot, so left uncapped this grows without limit over an
+        // arbitrarily long session.
+        app::history::cap_history(&mut state.history, state.config.history_turns);
     }
 
     // ── Inventory tracking ────────────────────────────────────────
