@@ -684,8 +684,12 @@ impl Machine {
             self.mem.write_byte(i as u32, b);
         }
 
-        // Fresh execution + screen model, identical to a cold boot.
-        let (state, screen) = boot_state_and_screen(&mut self.mem);
+        // Fresh execution + screen model, identical to a cold boot — except the
+        // v6 change generation, which stays MONOTONE across the reboot (SQ-1191):
+        // a reader caching the screen model against the counter must never meet
+        // a rebooted screen wearing a number it has already seen on the old one.
+        let (state, mut screen) = boot_state_and_screen(&mut self.mem);
+        screen.v6_generation = self.screen.v6_generation.wrapping_add(1);
         self.state = state;
         self.screen = screen;
 
@@ -866,7 +870,7 @@ impl Machine {
     pub fn set_v6_text(&mut self, metric: crate::screen::V6Metric) {
         let cell = metric.cell();
         self.v6_metric = metric;
-        if let Some(v6) = self.screen.v6.as_mut() {
+        if let Some(v6) = self.screen.v6_mut() {
             for w in v6.windows.iter_mut() {
                 w.font_size = (cell.h() << 8) | cell.w();
             }
@@ -897,7 +901,7 @@ impl Machine {
         }
         let cell = self.v6_cell();
         crate::screen::write_screen_dims_px(&mut self.mem, width_px, height_px, cell);
-        if let Some(v6) = self.screen.v6.as_mut() {
+        if let Some(v6) = self.screen.v6_mut() {
             // frotz `restart_screen`: windows 0 and 1 take the new screen WIDTH so a
             // story reading `get_wind_prop` before sizing anything sees the real
             // screen; window 0 also takes its height (ZMSD §8.8.3.3, "Window 0
@@ -914,7 +918,7 @@ impl Machine {
         let cell = self.v6_cell();
         crate::screen::write_screen_dims(&mut self.mem, rows, cols, cell);
         if self.mem.version() == 6 {
-            if let Some(v6) = self.screen.v6.as_mut() {
+            if let Some(v6) = self.screen.v6_mut() {
                 let width = cols.max(1) as u16 * cell.w();
                 let height = rows.max(1) as u16 * cell.h();
                 v6.windows[0].x_size = width;
@@ -1547,7 +1551,7 @@ impl Machine {
                         a as i16 == -1,
                         b as i16 == -1,
                     );
-                } else if let Some(v6) = self.screen.v6.as_mut() {
+                } else if let Some(v6) = self.screen.v6_mut() {
                     let win = ops.get(2).copied().map(|w| (if w == 0xFFFD { v6.current as u16 } else { w }) as u8).unwrap_or(v6.current);
                     // SQ-0956: a TWO-COLOUR CARD has one bit, and a §8.3.1 pair
                     // carries one bit for it — see
@@ -2138,7 +2142,7 @@ impl Machine {
                     let screen_h = self.mem.read_word(0x24);
                     let mut retired = false;
                     let mut whole = true;
-                    if let Some(v6) = self.screen.v6.as_mut() {
+                    if let Some(v6) = self.screen.v6_mut() {
                         // (window, new top, new height) — window 1 across the top,
                         // window 0 tiled below it, both the full screen width.
                         let tiling =
@@ -2293,7 +2297,7 @@ impl Machine {
                 if self.trace_screen { self.screen_trace.push(format!("@set_window({})", zscreen_window_name(win as u16))); }
                 let mut mirror = None;
                 let mut style = None;
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     let w = win as usize;
                     if w < v6.windows.len() {
                         v6.current = win;
@@ -2367,7 +2371,7 @@ impl Machine {
                     _ => false,
                 };
                 let mut mirror = None;
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     // v6 erase is PAINT: background fills the window's CURRENT
                     // screen rect. Painted text runs (any window's) lose the
                     // covered glyphs — no more, no less: Shogun erases its
@@ -2622,7 +2626,7 @@ impl Machine {
             0x0F => {
                 let row = ops.first().copied().unwrap_or(1);
                 let col = ops.get(1).copied().unwrap_or(1);
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     let win = ops.get(2).copied().map(|w| (if w == 0xFFFD { v6.current as u16 } else { w }) as u8).unwrap_or(v6.current);
                     if self.trace_screen {
                         self.screen_trace.push(format!("@set_cursor(row={row}, col={col}, window={win})"));
@@ -2701,7 +2705,7 @@ impl Machine {
                 // CURRENT v6 window's prop 10 so get_wind_prop(w, 10) reads
                 // fresh.
                 let new_style = self.screen.text_style as u16;
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     let cur = v6.current as usize;
                     if let Some(w) = v6.windows.get_mut(cur) {
                         w.text_style = new_style;
@@ -2961,7 +2965,7 @@ impl Machine {
             0x0E => {
                 let value = ops.first().copied().unwrap_or(0);
                 if self.trace_screen { self.screen_trace.push(format!("@erase_line({value})")); }
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     let cur = v6.current as usize;
                     let (top, left, width) = {
                         let w = &v6.windows[cur.min(7)];
@@ -3171,7 +3175,7 @@ impl Machine {
                         None => self.screen.v6.as_ref().map(|v6| v6.current as u16),
                     };
                     if let Some(win) = win {
-                        if let Some(v6) = self.screen.v6.as_mut() {
+                        if let Some(v6) = self.screen.v6_mut() {
                             if let Some(w) = v6.windows.get_mut(win as usize) {
                                 w.font_number = new_font;
                             }
@@ -3217,7 +3221,7 @@ impl Machine {
             0x0D => {
                 let fg_op = ops.first().copied().unwrap_or(0);
                 let bg_op = ops.get(1).copied().unwrap_or(0);
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     let win = ops.get(2).copied().map(|w| (if w == 0xFFFD { v6.current as u16 } else { w }) as u8).unwrap_or(v6.current);
                     if self.trace_screen {
                         let fg = decode_true_colour(fg_op).map(zscreen_colour_name).unwrap_or_else(|| fg_op.to_string());
@@ -3391,7 +3395,7 @@ impl Machine {
                 }
                 let mut retired = false;
                 let mut whole = false;
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     if (win as usize) < v6.windows.len() {
                         let w = &mut v6.windows[win as usize];
                         if (w.y_coord, w.x_coord) != (y, x) {
@@ -3429,7 +3433,7 @@ impl Machine {
                 // 2/3) are still stored verbatim; only the cell grid is bounded.
                 let mut retired = false;
                 let mut whole = false;
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     if (win as usize) < v6.windows.len() {
                         let w = &mut v6.windows[win as usize];
                         // The box is changing under prose already on screen, and
@@ -3476,7 +3480,7 @@ impl Machine {
                         "@window_style(win={win}, flags={flags:#06b}, op={operation})"
                     ));
                 }
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     if (win as usize) < v6.windows.len() {
                         let w = &mut v6.windows[win as usize];
                         w.attributes = match operation {
@@ -3499,7 +3503,7 @@ impl Machine {
                 if self.trace_screen {
                     self.screen_trace.push(format!("@put_wind_prop(win={win}, prop={prop}, val={val})"));
                 }
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     if let Some(w) = v6.windows.get_mut(win as usize) {
                         w.put_prop(prop, val);
                     }
@@ -3600,7 +3604,7 @@ impl Machine {
                 if self.trace_screen {
                     self.screen_trace.push(format!("@set_margins(left={left}, right={right}, win={win})"));
                 }
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     if let Some(w) = v6.windows.get_mut(win as usize) {
                         w.put_prop(6, left); // clamped — see ZWindow::put_prop
                         w.put_prop(7, right);
@@ -3658,7 +3662,7 @@ impl Machine {
                 }
                 if win == 0 {
                     // Intentionally silent — see above.
-                } else if let Some(v6) = self.screen.v6.as_mut() {
+                } else if let Some(v6) = self.screen.v6_mut() {
                     if let Some(w) = v6.windows.get_mut(win as usize) {
                         w.scroll_pixels(pixels, cell);
                     }
@@ -4049,7 +4053,7 @@ impl Machine {
         if self.newline_interrupt_active {
             return;
         }
-        let routine = match self.screen.v6.as_mut().and_then(|v6| v6.windows.get_mut(win)) {
+        let routine = match self.screen.v6_mut().and_then(|v6| v6.windows.get_mut(win)) {
             Some(w) if w.interrupt_countdown != 0 => {
                 w.interrupt_countdown -= 1;
                 if w.interrupt_countdown != 0 {
@@ -4178,7 +4182,7 @@ impl Machine {
         // The style/colours this text is going out in, for the SQ-0697 shadow
         // below — read before the window borrow.
         let (style, fg, bg) = (self.v6_run_style(), self.screen.current_fg, self.screen.current_bg);
-        let Some(v6) = self.screen.v6.as_mut() else {
+        let Some(v6) = self.screen.v6_mut() else {
             return;
         };
         let idx = (v6.current as usize).min(7);
@@ -4275,7 +4279,7 @@ impl Machine {
     fn v6_reload_line_counts(&mut self) {
         // SQ-0917: the session's v6 cell, read before any borrow of `self.screen`.
         let cell = self.v6_cell();
-        if let Some(v6) = self.screen.v6.as_mut() {
+        if let Some(v6) = self.screen.v6_mut() {
             for w in v6.windows.iter_mut() {
                 w.reload_line_count(cell);
             }
@@ -4448,7 +4452,7 @@ impl Machine {
                 // every machine but Arthur's Amiga press this answers the cell
                 // width for every glyph and everything below is what it was.
                 let metric = &self.v6_metric;
-                if let Some(w) = self.screen.v6.as_mut().and_then(|v6| v6.windows.get_mut(idx)) {
+                if let Some(w) = self.screen.v6_mut().and_then(|v6| v6.windows.get_mut(idx)) {
                     let fw = cell.w();
                     let fh = cell.h();
                     let (fg, bg) = (w.fg, w.bg);
@@ -4762,7 +4766,7 @@ impl Machine {
                     }
                     w.set_grid_cursor(r, c);
                 }
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     for r in finished {
                         v6.paint_run(idx, r, &self.v6_metric);
                     }
@@ -4844,7 +4848,7 @@ impl Machine {
                 // Taken on BOTH branches, so a declaration can never outlive the
                 // print that answered it.
                 let (col, row) = self.v6_take_declared_indent(s);
-                if let Some(v6) = self.screen.v6.as_mut() {
+                if let Some(v6) = self.screen.v6_mut() {
                     v6.windows[cur].push_prose(s, (col > 0).then_some(col), (row > 0).then_some(row));
                 }
             } else {
@@ -8123,7 +8127,7 @@ pub(crate) mod tests {
             Memory::new(crate::header::tests_support::sample_story(6)).unwrap(),
         );
         {
-            let w = &mut m.screen.v6.as_mut().unwrap().windows[0];
+            let w = &mut m.screen.v6_mut().unwrap().windows[0];
             w.interrupt_countdown = 3;
             w.interrupt_routine = 0xA0; // present, but must not fire yet
         }
@@ -8149,7 +8153,7 @@ pub(crate) mod tests {
         // ZMSD §8.8.3.1's "text copied to output stream 2" — which is how a game
         // says this window's text is not the transcript's (advent.z6's `style`).
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.current = 3;
             let w = &mut v6.windows[3];
             w.attributes = 0b1011; // wrap + scroll + buffered, NOT copy-to-transcript
@@ -8176,7 +8180,7 @@ pub(crate) mod tests {
         let mut m =
             Machine::new(Memory::new(crate::header::tests_support::sample_story(6)).unwrap());
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.current = 3;
             let w = &mut v6.windows[3];
             w.attributes = 0b1011; // wrap + scroll + buffered, NOT copy-to-transcript
@@ -8259,7 +8263,7 @@ pub(crate) mod tests {
             Memory::new(crate::header::tests_support::sample_story(6)).unwrap(),
         );
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.current = 7;
             let w = &mut v6.windows[7];
             w.attributes = 0b1111; // wrap + scroll + copy-to-transcript + buffered
@@ -8308,7 +8312,7 @@ pub(crate) mod tests {
     #[test]
     fn with_nothing_declared_the_input_window_is_still_the_transcript() {
         let mut m = diverted_prose_machine();
-        m.screen.v6.as_mut().unwrap().windows[0].attributes = 0b1011; // …and not even window 0
+        m.screen.v6_mut().unwrap().windows[0].attributes = 0b1011; // …and not even window 0
         m.screen.v6_input_window = 3;
         m.print_text("you are in a maze\n");
 
@@ -8329,7 +8333,7 @@ pub(crate) mod tests {
             Memory::new(v6_newline_story(&[0xBB, 0xBA], &[0x95, 0x10, 0xB0])).unwrap(),
         );
         {
-            let w = &mut m.screen.v6.as_mut().unwrap().windows[0];
+            let w = &mut m.screen.v6_mut().unwrap().windows[0];
             w.interrupt_countdown = 1; // fire after this one new-line
             w.interrupt_routine = 0xA0;
         }
@@ -8356,7 +8360,7 @@ pub(crate) mod tests {
             Memory::new(v6_newline_story(&[0xBB, 0xBA], &rout)).unwrap(),
         );
         {
-            let w = &mut m.screen.v6.as_mut().unwrap().windows[0];
+            let w = &mut m.screen.v6_mut().unwrap().windows[0];
             w.interrupt_countdown = 1;
             w.interrupt_routine = 0xA0;
         }
@@ -9754,7 +9758,7 @@ pub(crate) mod tests {
 
         // A SECOND fill at a new position accumulates rather than replacing —
         // this is the whole point: a card is many fills from one moved window.
-        if let Some(v6) = m.screen.v6.as_mut() {
+        if let Some(v6) = m.screen.v6_mut() {
             v6.windows[3].x_coord = 73;
             v6.windows[3].bg = crate::screen::ZColour::True(0x001f);
         }
@@ -11008,8 +11012,8 @@ pub(crate) mod tests {
         // ZMSD §15: zero y/x means the cursor coordinate in the current window
         // (the cursor is stored in 1-based pixels and used verbatim).
         let mut m = v6_exec_machine();
-        m.screen.v6.as_mut().unwrap().windows[0].y_cursor = 9;
-        m.screen.v6.as_mut().unwrap().windows[0].x_cursor = 17;
+        m.screen.v6_mut().unwrap().windows[0].y_cursor = 9;
+        m.screen.v6_mut().unwrap().windows[0].x_cursor = 17;
         m.exec_ext(0x05, &[7, 0, 0], None, None);
         let ev = m.pending_pictures.last().unwrap();
         assert_eq!((ev.y, ev.x), (9, 17));
@@ -11019,7 +11023,7 @@ pub(crate) mod tests {
     fn v6_set_margins_stores_and_snaps_cursor() {
         let mut m = v6_exec_machine();
         // Cursor sits at pixel 9, inside the new 20px left margin.
-        m.screen.v6.as_mut().unwrap().windows[1].x_cursor = 9;
+        m.screen.v6_mut().unwrap().windows[1].x_cursor = 9;
         m.exec_ext(0x08, &[20, 8, 1], None, None); // set_margins(left, right, window)
         let w = &m.screen.v6.as_ref().unwrap().windows[1];
         assert_eq!(w.left_margin, 20, "left margin stored (prop 6)");
@@ -11035,9 +11039,9 @@ pub(crate) mod tests {
         // new text column (x_size - right) must snap home. (matches Frotz's
         // two-sided `x_cursor <= left || x_cursor > x_size - right`.)
         let mut m = v6_exec_machine();
-        m.screen.v6.as_mut().unwrap().windows[0].x_size = 548;
+        m.screen.v6_mut().unwrap().windows[0].x_size = 548;
         // Cursor at pixel 300 — past the new text column (548 - 328 = 220).
-        m.screen.v6.as_mut().unwrap().windows[0].x_cursor = 300;
+        m.screen.v6_mut().unwrap().windows[0].x_cursor = 300;
         m.exec_ext(0x08, &[2, 328, 0], None, None); // set_margins(left=2, right=328, win=0)
         let w = &m.screen.v6.as_ref().unwrap().windows[0];
         assert_eq!(w.right_margin, 328, "right margin stored (prop 7)");
@@ -11071,7 +11075,7 @@ pub(crate) mod tests {
             let mut m = v6_exec_machine();
             m.v6_metric = crate::screen::V6Metric::proportional(cell, advances.clone(), 0);
             {
-                let w = &mut m.screen.v6.as_mut().unwrap().windows[0];
+                let w = &mut m.screen.v6_mut().unwrap().windows[0];
                 w.x_size = 200; // 25 columns of 8
                 w.right_margin = 0;
                 w.left_margin = left_margin;
@@ -11482,8 +11486,8 @@ pub(crate) mod tests {
         // its right-aligned layout math.
         let mut m = v6_exec_machine();
         v6_place_window(&mut m, 3, 41, 25, 24, 100);
-        m.screen.v6.as_mut().unwrap().windows[3].y_cursor = 7;
-        m.screen.v6.as_mut().unwrap().windows[3].x_cursor = 33;
+        m.screen.v6_mut().unwrap().windows[3].y_cursor = 7;
+        m.screen.v6_mut().unwrap().windows[3].x_cursor = 33;
         // get_wind_prop(-3, prop) must read window 3 (the current window).
         m.exec_ext(0x13, &[0xFFFD, 4], Some(0), None); // y_cursor -> sp
         m.exec_ext(0x13, &[0xFFFD, 5], Some(0), None); // x_cursor -> sp
@@ -11690,8 +11694,8 @@ pub(crate) mod tests {
         // non-v6 screen cursor fields, which v6 never updates — (0,0).
         let mut m = v6_exec_machine();
         m.exec_var(0x0B, &[3], None, None); // set_window(3)
-        m.screen.v6.as_mut().unwrap().windows[3].y_cursor = 57;
-        m.screen.v6.as_mut().unwrap().windows[3].x_cursor = 123;
+        m.screen.v6_mut().unwrap().windows[3].y_cursor = 57;
+        m.screen.v6_mut().unwrap().windows[3].x_cursor = 123;
         m.exec_var(0x10, &[0x0100], None, None); // get_cursor -> array at 0x0100
         assert_eq!(m.mem.read_word(0x0100), 57, "word 0 = y cursor in pixels");
         assert_eq!(m.mem.read_word(0x0102), 123, "word 1 = x cursor in pixels");
@@ -12236,7 +12240,7 @@ pub(crate) mod tests {
         // (This test replaces an assertion that pinned the opposite.)
         let mut m = v6_exec_machine();
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.windows[7].y_cursor = 33;
             v6.windows[7].x_cursor = 57;
         }
@@ -12253,7 +12257,7 @@ pub(crate) mod tests {
         // prose printed to the current window must be tagged with it.
         let mut m = v6_exec_machine();
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.windows[4].fg = ZColour::Standard(3);
             v6.windows[4].bg = ZColour::Standard(6);
         }
@@ -12290,7 +12294,7 @@ pub(crate) mod tests {
     fn v6_erase_window_clears_target_window_grid() {
         let mut m = v6_exec_machine();
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.windows[3].grid.resize(2, 2);
             v6.windows[3].grid.put(1, 1, 'X', 0, ZColour::Default, ZColour::Default);
             v6.windows[3].y_cursor = 5;
@@ -12372,7 +12376,7 @@ pub(crate) mod tests {
         m.set_screen_dims(25, 80);
         m.exec_var(0x0A, &[160], None, None); // split_window(160px) -> window 1 has height
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.current = 3;
             v6.windows[0].bg = ZColour::Standard(6);
             v6.windows[2].y_cursor = 40;
@@ -12400,7 +12404,7 @@ pub(crate) mod tests {
         m.set_screen_dims(25, 80);
         m.exec_var(0x0A, &[160], None, None); // split_window(160px)
         {
-            let v6 = m.screen.v6.as_mut().unwrap();
+            let v6 = m.screen.v6_mut().unwrap();
             v6.current = 3;
             v6.windows[2].grid.resize(1, 2);
             v6.windows[2].grid.put(1, 1, 'X', 0, ZColour::Default, ZColour::Default);
@@ -12458,7 +12462,7 @@ pub(crate) mod tests {
         // (a game computing garbage coords must not land at the right edge).
         let mut m = v6_exec_machine();
         m.exec_var(0x0B, &[1], None, None); // current = 1
-        m.screen.v6.as_mut().unwrap().windows[1].x_size = 320; // window width, px
+        m.screen.v6_mut().unwrap().windows[1].x_size = 320; // window width, px
         m.exec_var(0x0F, &[9, 17], None, None); // set_cursor(y=9px, x=17px)
         {
             let w = &m.screen.v6.as_ref().unwrap().windows[1];
@@ -12705,7 +12709,7 @@ pub(crate) mod tests {
     fn hostile_print_flood_cannot_overflow_the_cursor_advance() {
         let mut m = v6_exec_machine();
         {
-            let w = &mut m.screen.v6.as_mut().unwrap().windows[1];
+            let w = &mut m.screen.v6_mut().unwrap().windows[1];
             w.y_cursor = WINDOW_PX_CAP;
             w.x_cursor = WINDOW_PX_CAP;
         }

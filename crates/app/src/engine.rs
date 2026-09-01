@@ -867,8 +867,13 @@ pub trait Engine {
     /// The sequence always ends on `screen()`'s composite, byte for byte — which
     /// is why everything that wants the game's state (saves, the display list,
     /// `/dump-windows`) keeps asking `screen()` and is unaffected by pacing.
-    fn screen_now(&self) -> ScreenModel {
-        self.screen()
+    ///
+    /// Handed back as a SHARED `Arc` (SQ-1191): the zvm session memoizes the
+    /// built model and returns the same allocation for every frame on which
+    /// nothing changed, so a caller must treat it as read-only — which the
+    /// render has done since its `ChromeStrip` runs became owned (SQ-1187).
+    fn screen_now(&self) -> std::sync::Arc<ScreenModel> {
+        std::sync::Arc::new(self.screen())
     }
 
     /// A diagnostic dump of the live window layout, one line per entry, for the

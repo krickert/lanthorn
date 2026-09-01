@@ -1245,6 +1245,21 @@ pub struct ScreenState {
     /// this at 0, so the panel's typed-input echo went dark until the next read
     /// re-established it.
     pub v6_input_window: u8,
+    /// Change GENERATION of the v6 window table (SQ-1191): advanced by
+    /// [`ScreenState::v6_mut`], the one door to `&mut V6Windows`, so a host can
+    /// tell "the screen may look different" from "nothing moved" with a single
+    /// integer compare instead of re-reading eight windows' runs and grids.
+    /// Read it through [`ScreenState::v6_generation`].
+    ///
+    /// A `pub` field on the same terms as a canvas `version` stamp: writers go
+    /// through `v6_mut` (the `v6_generation_discipline` test holds that door),
+    /// and the only legitimate direct write is a wholesale swap keeping the
+    /// counter monotone — `Machine::restart` carries it across the reboot's
+    /// fresh `ScreenState` for exactly that reason. Transient display state,
+    /// like `current_fg`: never serialised, so a host that installs a restored
+    /// `ScreenState` gets a counter with no history and must drop anything it
+    /// cached against the old one.
+    pub v6_generation: u64,
 }
 
 impl Default for ScreenState {
@@ -1267,6 +1282,7 @@ impl Default for ScreenState {
             current_bg: ZColour::Default,
             v6: None,
             v6_input_window: 0,
+            v6_generation: 0,
         }
     }
 }
@@ -1427,6 +1443,45 @@ pub fn machine_screen_pair(m: &crate::cpu::exec::Machine) -> Option<(ZColour, ZC
 }
 
 impl ScreenState {
+    /// The v6 window table's change generation (SQ-1191).
+    ///
+    /// Moves whenever the table MAY have changed — every `&mut V6Windows` is
+    /// handed out by [`ScreenState::v6_mut`], which advances it — so two equal
+    /// readings promise the table reads back identically, while two different
+    /// readings promise nothing beyond "look again". Deliberately conservative
+    /// in that direction: a mutable borrow that ends up writing nothing costs a
+    /// caching reader one rebuild, never a stale screen.
+    ///
+    /// What it does NOT cover, on purpose: facts a v6 frame reads from
+    /// elsewhere — header memory (screen dims `$20`–`$25`, the §8.3.3 default
+    /// pair `$2C`/`$2D`), [`Machine::v6_win0_out_chars`], `v6_input_window` —
+    /// are cheap scalar reads a caching reader keys on directly, and stamping
+    /// them here would mean bumping from inside `Memory` writes. Monotone
+    /// across `Machine::restart`; a `ScreenState` a host installs wholesale
+    /// (a restored save) carries a counter with no history, so any cache keyed
+    /// on the old screen's numbers must be dropped with the old screen.
+    ///
+    /// [`Machine::v6_win0_out_chars`]: crate::cpu::exec::Machine
+    pub fn v6_generation(&self) -> u64 {
+        self.v6_generation
+    }
+
+    /// The one door to mutable v6 window state (SQ-1191): the 8-window table,
+    /// with [`ScreenState::v6_generation`] advanced on the way through.
+    ///
+    /// Every mutation path — paint, erase, moves and resizes, scrolls, cursor
+    /// and margin writes, the Amiga pens repaint — reaches the table through
+    /// this borrow, which is what lets one counter stand in for all of them.
+    /// The `v6_generation_discipline` test keeps it the one door: the only
+    /// `.v6.as_mut(` in the crate is the line below, so the next mutator
+    /// cannot forget the bump by never being offered a bumpless spelling.
+    pub fn v6_mut(&mut self) -> Option<&mut V6Windows> {
+        if self.v6.is_some() {
+            self.v6_generation = self.v6_generation.wrapping_add(1);
+        }
+        self.v6.as_mut()
+    }
+
     /// Apply a `set_colour` under [`amiga_global_colour_pair`]: move the
     /// machine's two text "pens" and repaint the screen through them. (SQ-0740)
     ///
@@ -1520,7 +1575,7 @@ impl ScreenState {
         //    "draw over what is already here" and is the one thing the sharing
         //    rule must not take away from it.
         let mut mirror = None;
-        if let Some(v6) = self.v6.as_mut() {
+        if let Some(v6) = self.v6_mut() {
             let current = v6.current;
             if let Some(w) = v6.windows.get_mut(win as usize) {
                 if let Some(c) = fg {
@@ -1564,7 +1619,7 @@ impl ScreenState {
     /// dragged Zork Zero's light-grey page to transparent — the pair follows the
     /// current WINDOW, which is not where the pens live.
     fn repaint_amiga_pens(&mut self, fg: Option<ZColour>, bg: Option<ZColour>) {
-        let Some(v6) = self.v6.as_mut() else { return };
+        let Some(v6) = self.v6_mut() else { return };
         for w in v6.windows.iter_mut() {
             if let Some(fg) = fg {
                 w.fg = fg;
@@ -4446,7 +4501,7 @@ mod tests {
     /// window the game has never coloured.
     fn screen_with_text_on_it() -> ScreenState {
         let mut s = ScreenState { v6: Some(V6Windows::default()), ..Default::default() };
-        let v6 = s.v6.as_mut().unwrap();
+        let v6 = s.v6_mut().unwrap();
         let w1 = &mut v6.windows[1];
         w1.fg = ZColour::Standard(9);
         w1.bg = ZColour::Standard(2);
@@ -4603,5 +4658,125 @@ mod tests {
         s.set_amiga_colour_pair(0, Some(ZColour::Standard(2)), Some(ZColour::Standard(10)), false, false);
         assert_eq!(s.current_fg, ZColour::Default);
         assert_eq!(s.current_bg, ZColour::Default);
+    }
+
+    /// SQ-1191: every mutation class a screen-model reader cares about moves
+    /// [`ScreenState::v6_generation`] — paint, erase, move/resize, scroll, and
+    /// the Amiga pens repaint — because each one reaches the table through
+    /// [`ScreenState::v6_mut`], the one door. And the counter moves ONLY for
+    /// v6 mutation: a read borrow and a v1–5 screen leave it alone.
+    #[test]
+    fn v6_generation_moves_with_every_mutation_class() {
+        let metric = V6Metric::fixed(V6Cell::DEFAULT);
+        let mut s = ScreenState { v6: Some(V6Windows::default()), ..Default::default() };
+        let mut last = s.v6_generation();
+        let moved = |s: &ScreenState, what: &str, last: &mut u64| {
+            assert!(s.v6_generation() > *last, "{what} must advance the v6 generation");
+            *last = s.v6_generation();
+        };
+
+        // Paint: a run deposited on window 1.
+        s.v6_mut().unwrap().paint_run(1, run_at(15, 31, "banner", 0), &metric);
+        moved(&s, "paint_run", &mut last);
+
+        // Erase: a screen rect wiped across the shared raster.
+        s.v6_mut().unwrap().erase_screen_rect(1, 1, 32, 64, &metric);
+        moved(&s, "erase_screen_rect", &mut last);
+
+        // Move/resize: window props written the way the opcodes write them.
+        s.v6_mut().unwrap().windows[1].put_prop(0, 33); // y position
+        moved(&s, "put_prop (move)", &mut last);
+        s.v6_mut().unwrap().windows[1].put_prop(2, 64); // height
+        moved(&s, "put_prop (resize)", &mut last);
+
+        // Scroll: pixels through a window.
+        s.v6_mut().unwrap().windows[0].scroll_pixels(15, V6Cell::DEFAULT);
+        moved(&s, "scroll_pixels", &mut last);
+
+        // Colour: the §8.3 Amiga pens repaint bumps WITHOUT the caller ever
+        // borrowing the table — its own inner borrows go through the door.
+        s.set_amiga_colour_pair(0, Some(ZColour::Standard(9)), Some(ZColour::Standard(2)), false, false);
+        moved(&s, "set_amiga_colour_pair", &mut last);
+
+        // A read borrow moves nothing…
+        let _ = s.v6.as_ref().unwrap().windows[0].texts.len();
+        assert_eq!(s.v6_generation(), last, "a read borrow must not advance the generation");
+
+        // …and neither does a v1–5 screen, which has no v6 table to change.
+        let mut classic = ScreenState::default();
+        assert!(classic.v6_mut().is_none());
+        assert_eq!(classic.v6_generation(), 0, "no v6 table, no generation to move");
+    }
+
+    /// SQ-1191: the generation moves through the `Machine` seams a host drives —
+    /// printed prose, a host resize — and stays MONOTONE across `@restart`'s
+    /// wholesale screen swap, so a model cached against the pre-restart screen
+    /// can never match the rebooted one.
+    #[test]
+    fn v6_generation_moves_through_the_machine_seams() {
+        let mem = crate::memory::Memory::new(crate::header::tests_support::sample_story(6)).unwrap();
+        let mut m = crate::cpu::exec::Machine::new(mem);
+        let g0 = m.screen.v6_generation();
+
+        m.print_text("hello\n");
+        let g1 = m.screen.v6_generation();
+        assert!(g1 > g0, "prose printed through window 0 must advance the generation");
+
+        m.set_v6_screen_px(560, 384);
+        let g2 = m.screen.v6_generation();
+        assert!(g2 > g1, "a host resize must advance the generation");
+
+        m.restart();
+        assert!(
+            m.screen.v6_generation() > g2,
+            "@restart swaps in a fresh screen; its generation must continue past the old one, never restart behind it"
+        );
+    }
+
+    /// SQ-1191 discipline: [`ScreenState::v6_mut`] is the ONE DOOR to
+    /// `&mut V6Windows`. The only `.v6.as_mut(` in the crate's source is the
+    /// line inside `v6_mut` itself — any other spelling is a mutation path the
+    /// generation counter cannot see, written by someone with no reason to know
+    /// the counter exists (the `palette_lock_discipline` shape, SQ-0905).
+    ///
+    /// Deliberately NOT scanned: `.v6 = Some(…)` installs. Those are boot-shaped
+    /// — a fresh table on a fresh or local `ScreenState` (boot, fixtures) — and
+    /// the one production swap of a LIVE screen, `Machine::restart`, carries the
+    /// counter across explicitly. Outlawing the spelling would forbid legitimate
+    /// fixture setup to guard a path the restart carry and the field's own docs
+    /// already cover.
+    #[test]
+    fn v6_generation_discipline() {
+        // Assembled so this test's own source is not a hit.
+        let needle = format!(".v6.as_mut{}", '(');
+        fn scan(dir: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    scan(&p, needle, hits);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    for (i, line) in std::fs::read_to_string(&p).unwrap().lines().enumerate() {
+                        if line.trim_start().starts_with("//") {
+                            continue; // prose may name the spelling; code may not
+                        }
+                        if line.contains(needle) {
+                            hits.push(format!("{}:{}", p.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &needle, &mut hits);
+        assert_eq!(
+            hits.len(),
+            1,
+            "`{needle}` may appear exactly once in zvm — inside ScreenState::v6_mut. \
+             Route any other mutable borrow through `v6_mut()` so the v6 generation moves with it. Found: {hits:?}"
+        );
+        assert!(
+            hits[0].contains("screen.rs"),
+            "the one sanctioned `{needle}` lives in screen.rs's v6_mut, found {hits:?}"
+        );
     }
 }

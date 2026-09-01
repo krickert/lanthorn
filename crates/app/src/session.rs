@@ -675,6 +675,20 @@ pub struct GameSession {
     ///
     /// [`drain_turn`]: GameSession::drain_turn
     object_word_set: std::cell::RefCell<Option<std::sync::Arc<grammar_model::ObjectWordSet>>>,
+    /// The built v6 [`ScreenModel`], memoized against everything its build reads
+    /// (SQ-1191) — see [`V6ModelKey`]. `screen_now` runs once per FRAME, and the
+    /// build deep-clones every window's runs, grids and prose; between turns
+    /// nothing on the screen moves, so a redraw (cursor blink, mouse move, map
+    /// pan) costs one key compare instead of a clone tree.
+    ///
+    /// Same shape and soundness argument as [`object_word_set`](Self::object_word_set)
+    /// above: live data behind a `RefCell`, dropped wherever its inputs are
+    /// swapped out from under the key — [`restore_screen`] installs a screen
+    /// whose fresh [`zvm::screen::ScreenState::v6_generation`] could collide
+    /// with a number the memo already holds, and `restore_state` /
+    /// `restore_game_save` swap memory without draining a turn. A `@restart`
+    /// needs no drop: zvm keeps the generation monotone across the reboot.
+    v6_model_memo: std::cell::RefCell<Option<(V6ModelKey, std::sync::Arc<ScreenModel>)>>,
     /// PC at which the disasm cache was last runtime-confirmed; the per-turn
     /// fold is skipped while the VM is parked at the same PC (nav/scroll calls).
     last_confirmed_pc: std::cell::Cell<Option<u32>>,
@@ -1108,6 +1122,7 @@ impl GameSession {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -1585,7 +1600,7 @@ impl GameSession {
     /// (§7.1.1.1), so a command turn's reply always opens a line.
     fn arm_line_continuation(&mut self) {
         let idx = self.machine.screen.v6_input_window as usize;
-        self.pen_before_char = self.machine.screen.v6.as_mut().and_then(|v6| {
+        self.pen_before_char = self.machine.screen.v6_mut().and_then(|v6| {
             let w = v6.windows.get_mut(idx)?;
             w.clear_stream_origin();
             Some(w.pen())
@@ -3578,6 +3593,91 @@ impl GameSession {
             content_size,
         }
     }
+
+    /// The [`V6ModelKey`] for one build of the v6 model over `visible` — every
+    /// fact [`GameSession::v6_screen_model`] reads, reduced to cheap compares.
+    fn v6_model_key(&self, visible: &std::collections::HashMap<u8, crate::graphics::Canvas>) -> V6ModelKey {
+        let mut canvases: Vec<(u8, u64, u64)> =
+            visible.iter().map(|(w, c)| (*w, c.version, c.z_seq)).collect();
+        canvases.sort_unstable();
+        let mut fills: Vec<(u8, u64)> =
+            self.window_fills.iter().map(|(w, f)| (*w, f.seq)).collect();
+        fills.sort_unstable();
+        V6ModelKey {
+            generation: self.machine.screen.v6_generation(),
+            cell: (self.machine.v6_cell().w(), self.machine.v6_cell().h()),
+            input_window: self.machine.screen.v6_input_window,
+            win0_out_chars: self.machine.v6_win0_out_chars,
+            screen_px: (self.machine.mem.read_word(0x22), self.machine.mem.read_word(0x24)),
+            screen_chars: (self.machine.mem.read_byte(0x20), self.machine.mem.read_byte(0x21)),
+            page_pair: machine_screen_pair(&self.machine)
+                .map(|(fg, bg)| (crate::state::pack_zcolour(fg), crate::state::pack_zcolour(bg))),
+            canvases,
+            fills,
+        }
+    }
+
+    /// [`GameSession::v6_screen_model`], memoized behind [`V6ModelKey`]
+    /// (SQ-1191). A frame whose key matches the held one gets the held `Arc`
+    /// back — one key build and compare instead of deep-cloning every window's
+    /// runs, grids and prose — and any mismatch rebuilds and replaces the memo,
+    /// so the stored model always corresponds to the stored key.
+    fn v6_screen_model_shared(
+        &self,
+        visible: &std::collections::HashMap<u8, crate::graphics::Canvas>,
+    ) -> std::sync::Arc<ScreenModel> {
+        let key = self.v6_model_key(visible);
+        if let Some((held, model)) = self.v6_model_memo.borrow().as_ref() {
+            if *held == key {
+                return std::sync::Arc::clone(model);
+            }
+        }
+        let model = std::sync::Arc::new(self.v6_screen_model(visible));
+        *self.v6_model_memo.borrow_mut() = Some((key, std::sync::Arc::clone(&model)));
+        model
+    }
+}
+
+/// Everything [`GameSession::v6_screen_model`] READS, reduced to cheap compares
+/// — the key for [`GameSession::v6_model_memo`] (SQ-1191).
+///
+/// The expensive tree (eight windows' runs, grids and prose) is stood for by
+/// zvm's [`zvm::screen::ScreenState::v6_generation`], which advances with every
+/// mutable borrow of the window table. Everything else the build consumes is a
+/// cheap scalar read taken fresh per key, so a missed bump cannot hide in it:
+///
+/// - `cell`: the session's v6 cell (`Machine::v6_cell`) — every native→cell
+///   division in the build;
+/// - `input_window` / `win0_out_chars`: the prose-window choice and the
+///   window-0 placeholder/fill-freshness tests;
+/// - `screen_px` / `screen_chars`: header `$22`/`$24` and `$20`/`$21` — the
+///   clip box and the degenerate `content_size` fallback;
+/// - `page_pair`: [`machine_screen_pair`]'s ANSWER — keying on the output
+///   covers the header bytes and the licence flag it reads, whoever wrote them;
+/// - `canvases`: each visible canvas's `(version, z_seq)` — content and draw
+///   order, and thereby WHICH map the caller handed in (the settled
+///   `pictures_canvas` vs a paced in-flight frame, SQ-0708);
+/// - `fills`: each window's erase fill by its draw-sequence stamp, which is
+///   unique per insertion — a fill is immutable once recorded, and replacing
+///   one takes a fresh stamp.
+///
+/// NOT in the key, and why each omission is sound: `v6_metric` is replaced
+/// only by `Machine::set_v6_text`, which moves the generation on its way
+/// through the window table; the status model is constant (`HostManaged` for
+/// every v4+ story, v6 included); and `pack_zcolour` is pure tag-packing — the
+/// palette resolves colours at RENDER time, behind the render's own content
+/// key (SQ-1187), so a palette change never alters this model.
+#[derive(PartialEq)]
+struct V6ModelKey {
+    generation: u64,
+    cell: (u16, u16),
+    input_window: u8,
+    win0_out_chars: u64,
+    screen_px: (u16, u16),
+    screen_chars: (u8, u8),
+    page_pair: Option<(u32, u32)>,
+    canvases: Vec<(u8, u64, u64)>,
+    fills: Vec<(u8, u64)>,
 }
 
 /// The `face:` block of `/dump-windows` — which TYPEFACE the metrics below came
@@ -4140,6 +4240,10 @@ pub fn restore_screen(session: &mut GameSession, screen: zvm::screen::ScreenStat
     // `max` below is a no-op. (SQ-0681)
     let restored_cols = screen.upper.cols;
     let buffering = screen.buffer_mode;
+    // The restored screen's v6 generation has no history — its numbers can
+    // collide with ones the memo already holds — so the memoized model goes
+    // with the screen it described (SQ-1191).
+    session.v6_model_memo.take();
     let machine = &mut session.machine;
     machine.screen = screen;
     machine.out.set_buffer_mode(buffering);
@@ -4791,11 +4895,13 @@ impl Engine for GameSession {
     /// [`screen`](Engine::screen) for every non-v6 story and for every v6 frame
     /// once the sequence has settled, which is every frame the player is not
     /// actively watching a picture land on.
-    fn screen_now(&self) -> ScreenModel {
+    fn screen_now(&self) -> std::sync::Arc<ScreenModel> {
         if self.machine.screen.v6.is_some() {
-            self.v6_screen_model(self.visible_canvas())
+            // Memoized (SQ-1191): a frame on which nothing changed gets the
+            // previous frame's Arc back instead of a fresh clone tree.
+            self.v6_screen_model_shared(self.visible_canvas())
         } else {
-            screen_model_from_machine(&self.machine)
+            std::sync::Arc::new(screen_model_from_machine(&self.machine))
         }
     }
 
@@ -4885,6 +4991,7 @@ impl Engine for GameSession {
         // drain a turn — drop the cached object-word set here as `drain_turn`
         // does, or it keeps answering for the session we just left (SQ-1176).
         self.object_word_set.take();
+        self.v6_model_memo.take(); // same duty for the memoized screen model (SQ-1191)
         // The restored memory brings NO screen with it — Quetzal archives none by
         // design — so whatever is in the upper window belongs to the moment we
         // just left, not to the one we just restored. Leaving it there lets a
@@ -4930,6 +5037,7 @@ impl Engine for GameSession {
         // Memory was swapped without draining a turn — same duty as in
         // `restore_state` above (SQ-1176).
         self.object_word_set.take();
+        self.v6_model_memo.take(); // same duty for the memoized screen model (SQ-1191)
         // complete_restore_success lands mid-way through the game's save verb
         // (just past the @save descriptor), not at a read. Run forward to the
         // next read so the machine is re-armed at a clean prompt — otherwise the
@@ -7302,6 +7410,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7374,6 +7483,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7441,6 +7551,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7501,6 +7612,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7590,6 +7702,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7653,6 +7766,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7695,6 +7809,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7750,6 +7865,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7844,6 +7960,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -7896,6 +8013,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
             pict_source: None,
             pictures_canvas: std::collections::HashMap::new(),
@@ -8375,6 +8493,132 @@ mod tests {
         assert_eq!(s.line_key_terminator(&KeyInput::Char('x')), None);
         assert_eq!(s.line_key_terminator(&KeyInput::Enter), None);
         assert_eq!(s.line_key_terminator(&KeyInput::Backspace), None);
+    }
+
+    // ── SQ-1191: the memoized v6 screen model ─────────────────────────────────
+
+    /// A synthetic v6 session with `text` painted on window 7, built the way
+    /// `drain_turn_applies_pending_draw_picture_to_the_window_canvas` builds
+    /// its fixture (bypassing the boot loop the minimal story can't run).
+    fn v6_session_with_run(text: &str) -> GameSession {
+        use zvm::screen::{V6Cell, V6Metric, V6Text, V6Windows, ZColour, ZWindow};
+        let mem = Memory::new(minimal_v6_story()).expect("minimal v6 story");
+        let mut machine = Machine::with_output(mem, Box::new(CaptureSink::new()));
+        let mut windows: [ZWindow; 8] = Default::default();
+        windows[7] = ZWindow { x_size: 64, y_size: 48, ..Default::default() };
+        machine.screen.v6 = Some(V6Windows { windows, current: 7 });
+        let metric = V6Metric::fixed(V6Cell::DEFAULT);
+        machine.screen.v6_mut().unwrap().paint_run(
+            7,
+            V6Text::derived(1, 1, text.to_string(), 0, ZColour::Default, ZColour::Default, V6Cell::DEFAULT),
+            &metric,
+        );
+        GameSession {
+            machine, quit: false, pending: InputKind::Line, strip_prompt: true, pen_before_char: None, output_continued: false,
+            disasm_cache: std::cell::RefCell::new(None),
+            world: std::cell::OnceCell::new(),
+            parse_names: std::cell::OnceCell::new(),
+            object_word_set: std::cell::RefCell::new(None),
+            v6_model_memo: std::cell::RefCell::new(None),
+            last_confirmed_pc: std::cell::Cell::new(None),
+            pict_source: None,
+            pictures_canvas: std::collections::HashMap::new(),
+            canvas_anchor: std::collections::HashMap::new(),
+            art_scale: (V6_ART_SCALE, V6_ART_SCALE),
+            paint: None,
+            paced_frames: std::collections::VecDeque::new(),
+            window_fills: std::collections::HashMap::new(),
+            story_pics: Vec::new(),
+            v6_win0_chars_seen: 0,
+            display_ops: std::collections::HashMap::new(),
+            unreplayable: std::collections::HashSet::new(),
+            boot_screen_cols: zvm::screen::DEFAULT_SCREEN_COLS as u16,
+        }
+    }
+
+    /// Every painted-run text reachable in the model, flattened for a contains test.
+    fn model_run_texts(model: &ScreenModel) -> Vec<String> {
+        let mut out = Vec::new();
+        if let WinNode::Layered(entries) = &model.root {
+            for pw in entries {
+                if let WinNode::Grid(g) = &pw.node {
+                    out.extend(g.px_texts.iter().map(|t| t.text.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// SQ-1191: `screen_now` hands the SAME `Arc` back while nothing on the v6
+    /// screen changes, and a paint through zvm's one door replaces it with a
+    /// fresh model that carries the new run.
+    #[test]
+    fn screen_now_memoizes_the_v6_model_until_the_screen_changes() {
+        use zvm::screen::{V6Cell, V6Metric, V6Text, ZColour};
+        let mut sess = v6_session_with_run("steady");
+
+        let first = Engine::screen_now(&sess);
+        let again = Engine::screen_now(&sess);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "no VM step between two frames: the memoized model must be handed back, not rebuilt"
+        );
+        assert!(model_run_texts(&first).contains(&"steady".to_string()), "the fixture's run is in the model");
+
+        let metric = V6Metric::fixed(V6Cell::DEFAULT);
+        sess.machine.screen.v6_mut().unwrap().paint_run(
+            7,
+            V6Text::derived(17, 1, "painted".to_string(), 0, ZColour::Default, ZColour::Default, V6Cell::DEFAULT),
+            &metric,
+        );
+        let after = Engine::screen_now(&sess);
+        assert!(
+            !std::sync::Arc::ptr_eq(&again, &after),
+            "a paint moved the v6 generation: the next frame must be a fresh build"
+        );
+        assert!(
+            model_run_texts(&after).contains(&"painted".to_string()),
+            "…and the fresh build carries the new run: {:?}",
+            model_run_texts(&after)
+        );
+    }
+
+    /// SQ-1191 stale-model trap: a restored `ScreenState` carries a generation
+    /// with no history, so its numbers can COLLIDE with the one the memo holds.
+    /// `restore_screen` drops the memo, so the first frame after the restore is
+    /// built from the restored table even when the generations match exactly.
+    #[test]
+    fn restore_screen_drops_the_memoized_model() {
+        use zvm::screen::{V6Cell, V6Metric, V6Text, V6Windows, ZColour, ZWindow};
+        let mut sess = v6_session_with_run("before");
+        let held = Engine::screen_now(&sess);
+        assert!(model_run_texts(&held).contains(&"before".to_string()));
+
+        // A replacement screen with different content — and, deliberately, the
+        // SAME generation number the memo was keyed on.
+        let mut saved = zvm::screen::ScreenState::default();
+        let mut windows: [ZWindow; 8] = Default::default();
+        windows[7] = ZWindow { x_size: 64, y_size: 48, ..Default::default() };
+        saved.v6 = Some(V6Windows { windows, current: 7 });
+        let metric = V6Metric::fixed(V6Cell::DEFAULT);
+        saved.v6_mut().unwrap().paint_run(
+            7,
+            V6Text::derived(1, 1, "after".to_string(), 0, ZColour::Default, ZColour::Default, V6Cell::DEFAULT),
+            &metric,
+        );
+        saved.v6_generation = sess.machine.screen.v6_generation();
+
+        restore_screen(&mut sess, saved);
+        let fresh = Engine::screen_now(&sess);
+        assert!(
+            !std::sync::Arc::ptr_eq(&held, &fresh),
+            "the memo must not survive a wholesale screen install"
+        );
+        let texts = model_run_texts(&fresh);
+        assert!(
+            texts.contains(&"after".to_string()) && !texts.contains(&"before".to_string()),
+            "the first post-restore frame is built from the restored table: {texts:?}"
+        );
     }
 }
 
@@ -8908,4 +9152,5 @@ mod untried_turn_tests {
         let left = m.graph.untried(1);
         assert!(left.contains(&Direction::S) && left.contains(&Direction::Up), "{left:?}");
     }
+
 }
