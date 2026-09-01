@@ -142,6 +142,20 @@ pub fn import_row(row: &ImportRow, data_base: &Path, source: &dyn MetadataSource
     }
 
     if let Some(title) = &row.title {
+        // A curated line is for a story IFDB does not have; it must not
+        // replace a record IFDB supplied (a collection zip whose members were
+        // fetched by entry, for one). The cover in the line is still taken.
+        if let Some(existing) = story_info::load(&game_dir, &ifid).and_then(|i| i.fetched) {
+            if existing.source == "ifdb" && !existing.not_found {
+                return match fetch_cover_from(row.cover_url.as_deref(), source, &game_dir, &row.path) {
+                    Some(c) if existing.cover.is_none() => {
+                        set_cover(&game_dir, &ifid, &c);
+                        RowOutcome::CoverAdded
+                    }
+                    _ => RowOutcome::Skipped("already identified on IFDB".to_string()),
+                };
+            }
+        }
         let cover = fetch_cover_from(row.cover_url.as_deref(), source, &game_dir, &row.path);
         let meta = FetchedMeta {
             scanned_at: crate::fetch_worker::now_rfc3339(),
@@ -425,6 +439,11 @@ mod tests {
         let f = story_info::load(&entry.game_dir(&dir), &entry.meta.ifid).unwrap().fetched.unwrap();
         assert_eq!(f.source, "ifdb", "the record itself is untouched");
         assert_eq!(f.cover.as_deref(), Some("cover.png"));
+        // A curated title never replaces the IFDB record.
+        let curated = ImportRow { path: story.clone(), title: Some("Collection".into()), ..Default::default() };
+        assert!(matches!(import_row(&curated, &dir, &src), RowOutcome::Skipped(_)));
+        let f = story_info::load(&entry.game_dir(&dir), &entry.meta.ifid).unwrap().fetched.unwrap();
+        assert_eq!(f.title.as_deref(), Some("A Known Game"));
         // A row with nothing to apply is skipped, not an error.
         let empty = ImportRow { path: story.clone(), ..Default::default() };
         assert!(matches!(import_row(&empty, &dir, &src), RowOutcome::Skipped(_)));
