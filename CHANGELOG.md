@@ -58,6 +58,15 @@ changes what lanthorn does — all of it changes when and where.
   terminal write path is buffered — thousands of tiny locked writes per dense
   frame became a handful.
 
+### Sound in the browser, for the served container
+
+Mode 2 of the Docker image (ttyd in a browser) now plays the game's sound.
+ALSA in the container writes what a process plays to a per-session FIFO, a
+new `lanthorn-audio-relay` binary streams that FIFO over a WebSocket on port
+7682, and ttyd's page carries a script that opens it and plays the PCM with
+WebAudio. lanthorn itself is unchanged. Publish both ports; `LANTHORN_WEB_AUDIO=off`
+turns it off. See `docs/features/docker.md`.
+
 ### `--fetch`: the picker's IFDB pass, run headless
 
 `lanthorn <library> --fetch missing` walks a library (sub-folders included)
@@ -382,16 +391,6 @@ carrying `enable_sound = false` could only be overridden by editing the file.
   on it yet.
 
 ## v0.3.0 — 2026-08-26
-
-### Performance
-
-- Kitty uploads keep one image id across redraws, so a changed picture costs the
-  picture and not the whole frame — up to two orders of magnitude fewer bytes.
-- Uploads go out deflated where the terminal has said it can inflate them.
-- The transcript wrap is incremental instead of rebuilt every frame: a
-  twenty-thousand-turn session draws, and answers a keystroke, at the cost of its
-  first (a keystroke was 25 ms).
-- A live font-size change re-measures the cell in place; no restart.
 
 ### Version 6 typefaces
 
