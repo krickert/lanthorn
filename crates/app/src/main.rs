@@ -648,7 +648,7 @@ fn draw_story_panel(
 /// Render one frame. Returns both pane inner-content rects so the event loop
 /// can route mouse events and make accurate `recenter_on` calls.
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<app::terminal_dump::CountingWriter<std::io::Stdout>>>,
+    terminal: &mut Terminal<CrosstermBackend<app::terminal_dump::CountingWriter<std::io::BufWriter<std::io::Stdout>>>>,
     engine: &dyn Engine,
     mapper: &Mapper,
     state: &AppState,

@@ -48,7 +48,7 @@ pub(crate) struct BootResult {
     /// Wrapped in [`app::terminal_dump::CountingWriter`] so `/dump-terminal` can
     /// report how many bytes a frame costs (SQ-0994). One `fetch_add` per write
     /// and one per flush; it never looks at a byte.
-    pub terminal: Terminal<CrosstermBackend<app::terminal_dump::CountingWriter<Stdout>>>,
+    pub terminal: Terminal<CrosstermBackend<app::terminal_dump::CountingWriter<std::io::BufWriter<Stdout>>>>,
     pub game_dir: std::path::PathBuf,
     pub ifid: String,
     pub arc_file: std::path::PathBuf,
@@ -2078,8 +2078,14 @@ pub(crate) fn boot_story(
     // are session setup rather than frame traffic.
     let traffic: app::terminal_dump::TrafficHandle = Default::default();
     state.term_traffic = Some(std::sync::Arc::clone(&traffic));
+    // And buffered before it reaches the tty (SQ-1192): raw `Stdout` is a
+    // mutex-locked LineWriter with a ~1 KiB buffer, so a dense frame was
+    // thousands of lock/flush rounds — one per queued crossterm command. The
+    // buffer sits INSIDE the counter so the traffic numbers keep meaning what
+    // they meant: bytes when the backend writes them, a flush per drawn frame.
+    // Writes larger than the buffer (a base64 image transmit) bypass it whole.
     let terminal = match Terminal::new(CrosstermBackend::new(app::terminal_dump::CountingWriter::new(
-        stdout(),
+        std::io::BufWriter::with_capacity(256 * 1024, stdout()),
         traffic,
     ))) {
         Ok(t) => t,
