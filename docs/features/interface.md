@@ -1027,6 +1027,14 @@ the folder on screen. Everything else is unchanged: sorting keeps the folders
 on top under every column, and a fetch sweep (`r`) covers the folder's stories
 and skips its folders.
 
+**The cover grid (`g`) lists the folder and all of the games below it.** A
+grid of covers is most useful when it covers a lot, and a folder that contains
+only folders would otherwise be an empty grid, so in the gallery the tiles are
+all the games under the current folder, taken from the same in-memory index as
+the find (the header notes this, plus `indexing, N so far` until the index is
+complete). `Backspace` still moves up a folder, and the grid re-scopes;
+switching back to the list returns to the folder view.
+
 **`Ctrl+F` finds a story anywhere under the root.** It opens a type-to-filter
 field in the footer over an **in-memory index of the whole library** that the
 picker starts building the moment it opens, one folder at a time on its own

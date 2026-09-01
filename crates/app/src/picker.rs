@@ -1191,10 +1191,19 @@ pub fn folder_label(entry: &StoryEntry, dir: &Path) -> Option<String> {
 /// the folder (relative to `root`). An empty query matches everything. Folder
 /// rows never match; the result is stories only, in the default sort.
 pub fn search_library(index: &[StoryEntry], root: &Path, query: &str) -> Vec<StoryEntry> {
+    search_library_under(index, root, root, query)
+}
+
+/// [`search_library`] restricted to the stories under `scope` (a folder at or
+/// below `root`): what the cover gallery shows for a folder, since a grid of
+/// covers is worth more the more of the library it covers, and a folder that
+/// holds only folders would otherwise show an empty one.
+pub fn search_library_under(index: &[StoryEntry], root: &Path, scope: &Path, query: &str) -> Vec<StoryEntry> {
     let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
     let mut out: Vec<StoryEntry> = index
         .iter()
         .filter(|e| !e.is_folder())
+        .filter(|e| e.path.starts_with(scope))
         .filter(|e| {
             if terms.is_empty() {
                 return true;
@@ -3704,6 +3713,30 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["burg.z5", "curses.z5", "top.z5"]);
         assert!(targets.iter().all(|t| !t.ifid.is_empty()), "a target carries the IFID the fetch is keyed on");
+    }
+
+    #[test]
+    fn search_library_under_keeps_to_the_scope_and_its_folders() {
+        let root = PathBuf::from("/lib");
+        let mut a = story("Alpha", "a.z5", None, None);
+        a.path = root.join("zcode/a.z5");
+        let mut b = story("Beta", "b.z5", None, None);
+        b.path = root.join("zcode/german/b.z5");
+        let mut c = story("Gamma", "c.z5", None, None);
+        c.path = root.join("glulx/c.z5");
+        let index = vec![a, b, c];
+        let names = |scope: &Path| -> Vec<String> {
+            search_library_under(&index, &root, scope, "").iter().map(|e| e.title.clone()).collect()
+        };
+        assert_eq!(names(&root), vec!["Alpha", "Beta", "Gamma"], "the root is the whole library");
+        assert_eq!(names(&root.join("zcode")), vec!["Alpha", "Beta"], "a folder and the folders under it");
+        assert_eq!(names(&root.join("zcode/german")), vec!["Beta"]);
+        assert!(names(&root.join("nothing")).is_empty());
+        assert_eq!(
+            search_library_under(&index, &root, &root.join("zcode"), "beta").len(),
+            1,
+            "the query still applies within the scope"
+        );
     }
 
     #[test]
