@@ -50,6 +50,9 @@ folder you left. Sorting keeps folders on top under every column, downloads
 land in the folder on screen, and a folder row has its own `story_folder`
 colour in `style.toml`.
 
+The cover grid (`g`) lists all the games below the current folder instead of
+that one folder, so a library sorted into folders still has a gallery.
+
 `Ctrl+F` opens a type-to-filter field over an in-memory index of the **whole**
 library, built in the background as the picker opens, so the folder view is up
 instantly and the index catches up behind it. Every word typed must occur in a

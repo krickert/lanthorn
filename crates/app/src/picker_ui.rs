@@ -568,6 +568,40 @@ fn apply_find(
     list.selected = 0;
 }
 
+/// Whether the list on screen is the gallery's recursive view: the cover grid,
+/// no find field open, and a library index to draw from (a disk set has none,
+/// and shows its rows as tiles as it always did).
+fn gallery_all_folders(view: PickerView, finding: bool, has_index: bool) -> bool {
+    matches!(view, PickerView::Gallery) && !finding && has_index
+}
+
+/// Replace the list with every story under `dir` (the gallery's view of a
+/// folder), keeping the selection on the same story where it survives.
+#[allow(clippy::too_many_arguments)]
+fn show_gallery_scope(
+    index: &[app::picker::StoryEntry],
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    stories: &mut Vec<app::picker::StoryEntry>,
+    row_badges: &mut Vec<app::picker::RowBadges>,
+    aux_cache: &mut Vec<Option<app::picker::StoryAux>>,
+    list: &mut app::list_scroll::ListScroll,
+    data_base: &std::path::Path,
+    hint_index: &app::hints::HintIndex,
+) {
+    let keep = stories.get(list.selected).filter(|e| !e.is_folder()).map(|e| (e.path.clone(), e.meta.disk_entry.clone()));
+    *stories = app::picker::search_library_under(index, root, dir, "");
+    *row_badges = stories
+        .iter()
+        .map(|e| app::picker::compute_row_badges(e, data_base, hint_index))
+        .collect();
+    *aux_cache = (0..stories.len()).map(|_| None).collect();
+    list.len(stories.len());
+    list.selected = keep
+        .and_then(|(p, d)| stories.iter().position(|e| e.is(&p, d.as_deref())))
+        .unwrap_or(0);
+}
+
 /// What the picker's title line says, and which folder the row painter
 /// measures a match's folder label against.
 pub(crate) struct PickerHeading<'a> {
@@ -577,6 +611,16 @@ pub(crate) struct PickerHeading<'a> {
     pub root: &'a std::path::Path,
     /// `Some` while find-story's field is open.
     pub find: Option<FindStatus<'a>>,
+    /// The cover gallery, showing every story under `dir` rather than the
+    /// folder's own rows (`None` in the list, and with no index to draw on).
+    pub all_folders: Option<IndexStatus>,
+}
+
+/// How far the library index has got, for a header that draws on it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IndexStatus {
+    pub indexed: usize,
+    pub done: bool,
 }
 
 /// The find field's state, as the header reports it.
@@ -591,7 +635,7 @@ impl<'a> PickerHeading<'a> {
     /// A folder view of `dir`, which is also the root.
     #[cfg(test)]
     fn browse(dir: &'a std::path::Path) -> Self {
-        PickerHeading { dir, root: dir, find: None }
+        PickerHeading { dir, root: dir, find: None, all_folders: None }
     }
 
     /// The folder a row's label is relative to: the root while finding (a match
@@ -612,6 +656,15 @@ impl<'a> PickerHeading<'a> {
                     " lanthorn — find a story  ({n} match{es} for “{}” in {}{progress})   [i: info · {toggle}]",
                     f.query,
                     self.root.display()
+                )
+            }
+            None if self.all_folders.is_some() => {
+                let status = self.all_folders.expect("checked");
+                let progress = if status.done { String::new() } else { format!(" · indexing, {} so far", status.indexed) };
+                format!(
+                    " lanthorn — choose a story  ({} in {} and its folders{progress})   [i: info · {toggle}]",
+                    stories.len(),
+                    self.dir.display()
                 )
             }
             None => {
@@ -1167,6 +1220,8 @@ pub(crate) fn run_story_picker(
                 dir: &dir,
                 root: &root,
                 find: find_field.as_ref().map(|f| FindStatus { query: f.as_str(), indexed: index.len(), done: index_done }),
+                all_folders: gallery_all_folders(view, find_field.is_some(), index_rx.is_some())
+                    .then_some(IndexStatus { indexed: index.len(), done: index_done }),
             };
             match view {
                 PickerView::List => {
@@ -1375,6 +1430,8 @@ pub(crate) fn run_story_picker(
         if index_grew {
             if let Some(field) = &find_field {
                 apply_find(&index, &root, field.as_str(), &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
+            } else if gallery_all_folders(view, false, index_rx.is_some()) {
+                show_gallery_scope(&index, &root, &dir, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
             }
         }
 
@@ -1502,6 +1559,9 @@ pub(crate) fn run_story_picker(
                     }
                     stories = rows_for(&source, &dir, &root, data_base);
                     merge_index(&mut index, &stories);
+                    if gallery_all_folders(view, find_field.is_some(), index_rx.is_some()) {
+                        show_gallery_scope(&index, &root, &dir, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
+                    }
                     app::picker::resort_preserving_selection(&mut stories, 0, sort);
                     row_badges = stories
                         .iter()
@@ -1554,6 +1614,9 @@ pub(crate) fn run_story_picker(
                 }
                 stories = rows_for(&source, &dir, &root, data_base);
                     merge_index(&mut index, &stories);
+                    if gallery_all_folders(view, find_field.is_some(), index_rx.is_some()) {
+                        show_gallery_scope(&index, &root, &dir, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
+                    }
                 app::picker::resort_preserving_selection(&mut stories, 0, sort);
                 row_badges = stories
                     .iter()
@@ -1719,9 +1782,13 @@ pub(crate) fn run_story_picker(
                     match k.code {
                         Esc => {
                             find_field = None;
-                            let here = dir.clone();
-                            enter_folder(&source, &mut dir, &root, &here, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index, viewport, anim);
                             panel_scroll = 0;
+                            if gallery_all_folders(view, false, index_rx.is_some()) {
+                                show_gallery_scope(&index, &root, &dir, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
+                            } else {
+                                let here = dir.clone();
+                                enter_folder(&source, &mut dir, &root, &here, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index, viewport, anim);
+                            }
                         }
                         Enter => {
                             if let Some(entry) = stories.get(list.selected) {
@@ -1945,7 +2012,12 @@ pub(crate) fn run_story_picker(
                             if dir != root {
                                 if let Some(parent) = dir.parent().map(|p| p.to_path_buf()) {
                                     panel_scroll = 0;
-                                    enter_folder(&source, &mut dir, &root, &parent, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index, viewport, anim);
+                                    if gallery_all_folders(view, find_field.is_some(), index_rx.is_some()) {
+                                        dir = parent;
+                                        show_gallery_scope(&index, &root, &dir, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
+                                    } else {
+                                        enter_folder(&source, &mut dir, &root, &parent, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index, viewport, anim);
+                                    }
                                 }
                             }
                         }
@@ -1980,6 +2052,23 @@ pub(crate) fn run_story_picker(
                                 PickerView::Gallery => PickerView::List,
                             };
                             gallery_first_row = 0;
+                            // The grid shows the folder and everything under
+                            // it; the list shows the folder's own rows. Swap
+                            // the list to match, unless a find is showing
+                            // matches in both.
+                            if find_field.is_none() && index_rx.is_some() {
+                                panel_scroll = 0;
+                                if matches!(view, PickerView::Gallery) {
+                                    show_gallery_scope(&index, &root, &dir, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index);
+                                } else {
+                                    let keep = stories.get(list.selected).map(|e| e.path.clone());
+                                    let here = dir.clone();
+                                    enter_folder(&source, &mut dir, &root, &here, &mut stories, &mut row_badges, &mut aux_cache, &mut list, data_base, &hint_index, viewport, anim);
+                                    if let Some(idx) = keep.and_then(|p| stories.iter().position(|e| e.path == p)) {
+                                        list.select(idx, viewport, anim);
+                                    }
+                                }
+                            }
                         }
                         // Refetch only the selected story, ignoring its cache.
                         // Ignored while a sweep is already running, so a second
@@ -4061,6 +4150,26 @@ mod tests {
         assert!(row_text(&buf, 4, area).contains("Anchorhead"), "stories follow the folders");
     }
 
+    /// The gallery's header says it is showing the folder and everything
+    /// under it, and how far the index has got while it is still building.
+    #[test]
+    fn the_gallery_heading_names_the_recursive_scope() {
+        let root = std::path::Path::new("/tmp/lib");
+        let stories = make_two_test_stories();
+        let sub = root.join("zcode");
+        let building = super::PickerHeading {
+            dir: &sub,
+            root,
+            find: None,
+            all_folders: Some(super::IndexStatus { indexed: 2, done: false }),
+        };
+        let line = building.line(&stories, "g: list");
+        assert!(line.contains("2 in /tmp/lib/zcode and its folders · indexing, 2 so far"), "{line:?}");
+        let done = super::PickerHeading { all_folders: Some(super::IndexStatus { indexed: 2, done: true }), ..building };
+        let line = done.line(&stories, "g: list");
+        assert!(line.contains("and its folders)") && !line.contains("indexing"), "{line:?}");
+    }
+
     /// While finding, a match shows the folder it came from after its title;
     /// in a plain folder view, where every row is in the header's folder, it
     /// shows nothing of the kind.
@@ -4082,6 +4191,7 @@ mod tests {
             dir: root,
             root,
             find: Some(super::FindStatus { query: "zor", indexed: 2, done: false }),
+            all_folders: None,
         };
         super::draw_story_picker(&stories, &list, &badges, &glyphs, &finding, &cs, &km(), app::picker::Sort::default(), area, &mut buf);
         let header = row_text(&buf, 0, area);
