@@ -1061,6 +1061,19 @@ written where the picker writes them, exit code 0 unless a fetch failed.
 built in the first place; the picker then opens with titles, authors, ratings
 and covers already there.
 
+**For what IFDB could not settle, a curated file.** `lanthorn ~/if-games
+--import-metadata rows.tsv` applies a tab-separated file, one row per story,
+made by a person or by an agent working from the IF Archive's descriptions,
+IFDB's search, IFWiki or a competition's archive. The header names the
+columns, in any order: `path`, then `ifdb_tuid` (the story is fetched from
+IFDB by that id, the same call the picker's `u` makes, and IFDB's record wins),
+or `title` / `author` / `year` / `genre` / `language` / `description` (written
+as a curated record: the list shows the title, the info panel the rest, and
+nothing is invented for an empty column), and `cover_url` (downloaded, checked
+to decode, saved as the cover; a story with its own frontispiece is left
+alone). Extra columns such as `confidence` and `evidence` are ignored, so the
+file can carry the reasoning that produced it.
+
 **Shift-Enter** opens the story's **launch options** instead of launching it —
 the boot-time choices lanthorn can only honour *before* a game starts: which
 picture archive to draw its art from, and which machine to present itself as.

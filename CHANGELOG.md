@@ -67,6 +67,14 @@ new `lanthorn-audio-relay` binary streams that FIFO over a WebSocket on port
 WebAudio. lanthorn itself is unchanged. Publish both ports; `LANTHORN_WEB_AUDIO=off`
 turns it off. See `docs/features/docker.md`.
 
+### `--import-metadata`: curated identifications and covers
+
+For stories IFDB cannot identify by IFID, or has no cover for, a tab-separated
+file of rows (`path`, then an `ifdb_tuid` to fetch by, or a title, author,
+year, genre, language and description to record, and a `cover_url` to
+download) is applied with `lanthorn <library> --import-metadata rows.tsv`.
+The picker reads the result like any fetched record.
+
 ### `--fetch`: the picker's IFDB pass, run headless
 
 `lanthorn <library> --fetch missing` walks a library (sub-folders included)

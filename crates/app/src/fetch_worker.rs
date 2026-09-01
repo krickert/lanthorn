@@ -336,7 +336,7 @@ fn stem_title(path: &Path) -> String {
     path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string()
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
 

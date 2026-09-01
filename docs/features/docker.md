@@ -89,6 +89,14 @@ writes the sidecars into the shared `/data` volume, so the next browser session
 opens the picker with the metadata already there. `--fetch all` refetches
 what is cached; run `missing` again after adding games.
 
+For stories IFDB does not know by IFID, or has no cover for, a curated TSV
+(see `--import-metadata` in the interface docs) is applied the same way, with
+the file bind-mounted in:
+
+```sh
+docker compose run --rm -v "$PWD/curated.tsv:/curated.tsv:ro" lanthorn /stories --import-metadata /curated.tsv
+```
+
 ### What the browser mode can and cannot show
 
 xterm.js does not implement the Kitty graphics protocol, and lanthorn's

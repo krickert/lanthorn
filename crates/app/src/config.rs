@@ -441,6 +441,17 @@ pub struct Cli {
     #[arg(long, value_enum, value_name = "MISSING|ALL")]
     pub fetch: Option<FetchMode>,
 
+    /// Import curated metadata for stories from a TSV file, then exit.
+    ///
+    /// For stories the IFDB pass could not identify by IFID, or that IFDB has
+    /// no cover for. A header row names the columns (any order): `path`, and
+    /// then `ifdb_tuid` (the story is fetched from IFDB by that id), or
+    /// `title`, `author`, `year`, `genre`, `language`, `description` (written
+    /// as a curated record), and `cover_url` (downloaded as the cover). One
+    /// printed line per row; exits 0 unless a row failed.
+    #[arg(long = "import-metadata", value_name = "TSV")]
+    pub import_metadata: Option<PathBuf>,
+
     /// How the Version 6 graphical pane is drawn, for this launch only. The two
     /// modes are listed below, out of the same doc comments the settings screen
     /// reads, so there is no second description here to fall out of step.
@@ -3067,6 +3078,7 @@ mod tests {
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -3155,6 +3167,7 @@ mod tests {
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -3187,6 +3200,7 @@ mod tests {
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -3219,6 +3233,7 @@ mod tests {
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -3883,6 +3898,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -3913,6 +3929,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -3960,6 +3977,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4057,6 +4075,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4089,6 +4108,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4122,6 +4142,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4190,6 +4211,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4251,6 +4273,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4300,6 +4323,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4494,6 +4518,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4554,6 +4579,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4612,6 +4638,7 @@ use_defaults = false
             pictures: None,
             story_pick: None,
             fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
@@ -4684,6 +4711,7 @@ use_defaults = false
             ("--colour", "machine"),
             ("--fetch", "missing"),
             ("--fetch", "all"),
+            ("--import-metadata", "/tmp/rows.tsv"),
         ] {
             let cli = Cli::try_parse_from(["lanthorn", flag, value, "g.z5"])
                 .unwrap_or_else(|e| panic!("{flag} {value} should parse: {e}"));

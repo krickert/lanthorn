@@ -1708,6 +1708,12 @@ fn main() {
     // `--fetch`: the browser's IFDB pass with no browser, then exit. Placed
     // after `source` so it takes the same library or disk set the picker
     // would, and before anything touches the terminal.
+    // `--import-metadata`: curated rows for what `--fetch` could not settle.
+    if let Some(tsv) = ctx.cli.import_metadata.as_deref() {
+        let source = app::ifdb::IfdbClient::new();
+        std::process::exit(app::metadata_import::run(tsv, &ctx.data_base, &source, std::time::Duration::from_millis(500)));
+    }
+
     if let Some(mode) = ctx.cli.fetch {
         let Some(source) = source.as_ref() else {
             eprintln!("lanthorn: --fetch needs a library directory or a story file");

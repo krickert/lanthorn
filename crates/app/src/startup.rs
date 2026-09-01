@@ -188,6 +188,7 @@ pub(crate) fn resolve_launch() -> LaunchCtx {
     if cfg.default_story_dir.is_none()
         // A headless --fetch has no one to answer a question.
         && cli.fetch.is_none()
+        && cli.import_metadata.is_none()
         && cli.story.as_deref().map(|p| p.is_dir()).unwrap_or(false)
         && prompt_yes_no(&format!(
             "Set {} as your default story directory?",
