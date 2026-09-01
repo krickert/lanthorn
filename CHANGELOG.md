@@ -25,6 +25,15 @@ Absolute URLs or no link.
 is staged in [`docs/readme-next.md`](docs/readme-next.md), because the README
 describes the RELEASED build and must not describe this one until it ships.*
 
+### Sound in the browser, for the served container
+
+Mode 2 of the Docker image (ttyd in a browser) now plays the game's sound.
+ALSA in the container writes what a process plays to a per-session FIFO, a
+new `lanthorn-audio-relay` binary streams that FIFO over a WebSocket on port
+7682, and ttyd's page carries a script that opens it and plays the PCM with
+WebAudio. lanthorn itself is unchanged. Publish both ports; `LANTHORN_WEB_AUDIO=off`
+turns it off. See `docs/features/docker.md`.
+
 ### `--fetch`: the picker's IFDB pass, run headless
 
 `lanthorn <library> --fetch missing` walks a library (sub-folders included)
