@@ -1158,6 +1158,22 @@ pub fn spawn_library_index(root: PathBuf, data_base: PathBuf) -> std::sync::mpsc
     rx
 }
 
+/// The fetch targets a headless `--fetch` works through: one per story in
+/// `source`, and for a library that means the stories in all of its folders,
+/// in the order [`index_library`] visits them.
+pub fn fetch_targets(source: &StorySource, data_base: &Path) -> Vec<crate::fetch_worker::FetchTarget> {
+    let mut out: Vec<crate::fetch_worker::FetchTarget> = Vec::new();
+    match source {
+        StorySource::Library(root) => index_library(root, data_base, |batch| {
+            out.extend(batch.entries.iter().map(crate::fetch_worker::FetchTarget::row));
+        }),
+        other @ StorySource::DiskSet { .. } => {
+            out.extend(other.scan(data_base).iter().map(crate::fetch_worker::FetchTarget::row));
+        }
+    }
+    out
+}
+
 /// Where `entry` lives relative to `dir`: `None` when it sits directly in
 /// `dir` (or outside it altogether), `Some("sub/deeper")` otherwise, always
 /// with forward slashes since it is a label, not a path.
@@ -3674,6 +3690,20 @@ mod tests {
         assert_eq!(titles("zcode"), vec!["Curses", "Die Burg"], "a parent folder matches everything under it");
         assert_eq!(titles("zcode nel"), vec!["Curses"], "several terms all have to hit");
         assert!(titles("nothing-here").is_empty());
+    }
+
+    #[test]
+    fn fetch_targets_reach_the_stories_in_all_folders_and_no_folder_rows() {
+        let root = nested_library("fetch-targets");
+        let targets = fetch_targets(&StorySource::Library(root.clone()), &root);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut names: Vec<String> = targets
+            .iter()
+            .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["burg.z5", "curses.z5", "top.z5"]);
+        assert!(targets.iter().all(|t| !t.ifid.is_empty()), "a target carries the IFID the fetch is keyed on");
     }
 
     #[test]

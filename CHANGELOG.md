@@ -58,6 +58,13 @@ changes what lanthorn does — all of it changes when and where.
   terminal write path is buffered — thousands of tiny locked writes per dense
   frame became a handful.
 
+### `--fetch`: the picker's IFDB pass, run headless
+
+`lanthorn <library> --fetch missing` walks a library (sub-folders included)
+and fetches the metadata and cover art the picker's `r` would, printing one
+line per story and exiting, so a server's library gets its sidecars built
+without anyone at the picker. `--fetch all` refetches the cached ones.
+
 ### The story picker follows your folders, and finds a story in any of them
 
 A library sorted into sub-folders used to show the picker one level of itself.
