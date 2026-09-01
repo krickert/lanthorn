@@ -12,9 +12,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
+
+use crate::render::graphics::KittyDeleteQueue;
 
 /// Decode PNG/JPEG bytes into a `DynamicImage`. `None` on any decode failure.
 pub fn decode(bytes: &[u8]) -> Option<image::DynamicImage> {
@@ -70,8 +73,19 @@ const TILE_CAP: usize = 128;
 pub struct CoverState {
     decoded: HashMap<PathBuf, Option<image::DynamicImage>>,
     order: VecDeque<PathBuf>,
-    proto: Option<(PathBuf, u16, u16, Protocol)>,
-    tiles: VecDeque<(PathBuf, u16, u16, Protocol)>,
+    /// The trailing `Option<u32>` is the kitty image id [`place_protocol`]
+    /// returned the last time this entry was placed (`None` off-kitty, or
+    /// before the first placement) — [`Self::note_proto_placed`] fills it in.
+    /// One id per entry: `proto` holds at most one, and each `tiles` slot is
+    /// its own separate build (SQ-1190).
+    ///
+    /// [`place_protocol`]: crate::render::graphics::place_protocol
+    proto: Option<(PathBuf, u16, u16, Protocol, Option<u32>)>,
+    tiles: VecDeque<(PathBuf, u16, u16, Protocol, Option<u32>)>,
+    /// Uploads an eviction/replacement here abandoned, queued for the terminal
+    /// to free (SQ-1190) — this loop runs before any `AppState`/`GraphicsRender`
+    /// exists, so it keeps its own queue rather than sharing that one.
+    deletes: KittyDeleteQueue,
 }
 
 impl CoverState {
@@ -83,9 +97,52 @@ impl CoverState {
     /// Both caches are keyed `(path, cols, rows)`, which is exactly the key a
     /// font-size change cannot move: the browser can keep the same cell rect
     /// while every cell in it becomes a different box in pixels.
+    ///
+    /// Every dropped entry's upload is freed in the terminal, not merely
+    /// forgotten (SQ-1190) — a font-size change is exactly the kind of frame
+    /// this abandons wholesale.
     pub fn invalidate_cell_geometry(&mut self) {
-        self.proto = None;
-        self.tiles.clear();
+        if let Some(old) = self.proto.take() {
+            self.deletes.queue(old.4);
+        }
+        for t in self.tiles.drain(..) {
+            self.deletes.queue(t.4);
+        }
+    }
+
+    /// Flush any deletes queued by eviction/replacement into `buf` (SQ-1190),
+    /// mirroring `GraphicsRender::flush_kitty_deletes` for a loop with no
+    /// `GraphicsRender` of its own — see [`KittyDeleteQueue`].
+    pub fn flush_kitty_deletes(&mut self, area: Rect, buf: &mut Buffer) {
+        self.deletes.flush(area, buf);
+    }
+
+    /// Queue a delete for an upload owned by ANOTHER cache in the same picker
+    /// loop — the resource-preview modal (`picker_ui.rs`), which has no
+    /// `GraphicsRender` of its own either and would rather share this queue
+    /// (already flushed every frame) than keep and flush a second one that
+    /// would also lose whatever it held whenever the modal closes and its
+    /// struct is dropped (SQ-1190).
+    pub fn queue_external_delete(&mut self, id: Option<u32>) {
+        self.deletes.queue(id);
+    }
+
+    /// Record the kitty image id [`Self::protocol`]'s caller placed it under,
+    /// so a later replace/evict can free it (SQ-1190). A no-op if there is no
+    /// cached entry to attach it to.
+    pub fn note_proto_placed(&mut self, id: Option<u32>) {
+        if let Some(entry) = self.proto.as_mut() {
+            entry.4 = id;
+        }
+    }
+
+    /// Record the kitty image id [`Self::tile_protocol`]'s caller placed it
+    /// under — always the most-recently-used tile, since a cache hit promotes
+    /// to the back and a miss pushes there (SQ-1190).
+    pub fn note_tile_placed(&mut self, id: Option<u32>) {
+        if let Some(entry) = self.tiles.back_mut() {
+            entry.4 = id;
+        }
     }
 
     /// True when `path` has already been decoded (`Some` or `None`) — skip the
@@ -104,12 +161,19 @@ impl CoverState {
     pub fn insert(&mut self, path: PathBuf, img: Option<image::DynamicImage>) {
         if self.decoded.insert(path.clone(), img).is_some() {
             // Existing key: move it to most-recent, and invalidate a stale raster
-            // (both the info-panel proto and any gallery tiles for this path).
+            // (both the info-panel proto and any gallery tiles for this path),
+            // freeing each dropped upload in the terminal (SQ-1190).
             self.order.retain(|p| p != &path);
-            if matches!(&self.proto, Some((p, _, _, _)) if *p == path) {
-                self.proto = None;
+            if matches!(&self.proto, Some((p, _, _, _, _)) if *p == path) {
+                let old = self.proto.take();
+                self.deletes.queue(old.and_then(|t| t.4));
             }
-            self.tiles.retain(|(p, _, _, _)| p != &path);
+            let stale_tiles: Vec<Option<u32>> =
+                self.tiles.iter().filter(|(p, ..)| *p == path).map(|(.., id)| *id).collect();
+            self.tiles.retain(|(p, ..)| *p != path);
+            for id in stale_tiles {
+                self.deletes.queue(id);
+            }
         }
         self.order.push_back(path);
         while self.decoded.len() > CAP {
@@ -129,10 +193,16 @@ impl CoverState {
         if self.decoded.remove(path).is_some() {
             self.order.retain(|p| p != path);
         }
-        if matches!(&self.proto, Some((p, _, _, _)) if p == path) {
-            self.proto = None;
+        if matches!(&self.proto, Some((p, _, _, _, _)) if p == path) {
+            let old = self.proto.take();
+            self.deletes.queue(old.and_then(|t| t.4));
         }
-        self.tiles.retain(|(p, _, _, _)| p != path);
+        let stale_tiles: Vec<Option<u32>> =
+            self.tiles.iter().filter(|(p, ..)| p == path).map(|(.., id)| *id).collect();
+        self.tiles.retain(|(p, ..)| p != path);
+        for id in stale_tiles {
+            self.deletes.queue(id);
+        }
     }
 
     /// Build-or-reuse a protocol for `path`'s cover, fitted (aspect-preserved)
@@ -151,13 +221,13 @@ impl CoverState {
         animating: bool,
     ) -> Option<&Protocol> {
         let img = self.decoded.get(path).and_then(|o| o.as_ref())?;
-        let cached_for_path = matches!(&self.proto, Some((p, _, _, _)) if p == path);
+        let cached_for_path = matches!(&self.proto, Some((p, _, _, _, _)) if p == path);
         if animating && cached_for_path {
-            return self.proto.as_ref().map(|(_, _, _, p)| p);
+            return self.proto.as_ref().map(|(_, _, _, p, _)| p);
         }
         let fresh = matches!(
             &self.proto,
-            Some((p, w, h, _)) if p == path && *w == area.width && *h == area.height
+            Some((p, w, h, _, _)) if p == path && *w == area.width && *h == area.height
         );
         if !fresh {
             // Direction-aware + alpha-correct, then an identity `Fit` (SQ-0829): a
@@ -171,9 +241,14 @@ impl CoverState {
                 Size::new(area.width, area.height),
                 false,
             )?;
-            self.proto = Some((path.to_path_buf(), area.width, area.height, built));
+            // Freed only once the rebuild has actually succeeded — the `?` above
+            // must leave a surviving entry (and its terminal upload) alone
+            // (SQ-1190).
+            let old = self.proto.take();
+            self.deletes.queue(old.and_then(|t| t.4));
+            self.proto = Some((path.to_path_buf(), area.width, area.height, built, None));
         }
-        self.proto.as_ref().map(|(_, _, _, p)| p)
+        self.proto.as_ref().map(|(_, _, _, p, _)| p)
     }
 
     /// Build-or-reuse a gallery-tile protocol for `path`'s cover, fitted into
@@ -191,12 +266,14 @@ impl CoverState {
         if let Some(pos) = self
             .tiles
             .iter()
-            .position(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
+            .position(|(p, w, h, _, _)| p == path && *w == area.width && *h == area.height)
         {
-            // Cache hit: promote to most-recently-used and hand it back.
+            // Cache hit: promote to most-recently-used and hand it back. Same
+            // `Protocol`, so the id `note_tile_placed` already recorded is still
+            // right — nothing to free here.
             let entry = self.tiles.remove(pos).unwrap();
             self.tiles.push_back(entry);
-            return self.tiles.back().map(|(_, _, _, p)| p);
+            return self.tiles.back().map(|(_, _, _, p, _)| p);
         }
         let img = self.decoded.get(path).and_then(|o| o.as_ref())?;
         // Same reduction as [`protocol`], only harder: a gallery tile is smaller
@@ -210,11 +287,15 @@ impl CoverState {
             Size::new(area.width, area.height),
             false,
         )?;
-        self.tiles.push_back((path.to_path_buf(), area.width, area.height, built));
+        self.tiles.push_back((path.to_path_buf(), area.width, area.height, built, None));
+        // LRU eviction beyond capacity frees each dropped tile's upload, not
+        // merely the struct that named it (SQ-1190).
         while self.tiles.len() > TILE_CAP {
-            self.tiles.pop_front();
+            if let Some(evicted) = self.tiles.pop_front() {
+                self.deletes.queue(evicted.4);
+            }
         }
-        self.tiles.back().map(|(_, _, _, p)| p)
+        self.tiles.back().map(|(_, _, _, p, _)| p)
     }
 
     /// The aspect-fitted, centred sub-rect of `area` for `path`'s cover, computed
@@ -502,6 +583,100 @@ mod tests {
         assert_eq!(st.tiles.len(), 1);
         st.forget(p);
         assert_eq!(st.tiles.len(), 0, "forget drops the tile raster too");
+    }
+
+    /// A real kitty picker so `place_protocol` has an id to hand back — the
+    /// tests above use `halfblocks()`, which never names one and so cannot
+    /// exercise the delete path at all.
+    fn test_kitty_picker() -> Picker {
+        crate::render::graphics::kitty_picker(8, 16)
+    }
+
+    /// Build (or reuse) `path`'s tile and record the id `place_protocol`
+    /// returns for it, exactly as `picker_ui.rs`'s gallery draw does.
+    fn place_tile(st: &mut CoverState, picker: &Picker, path: &Path, area: Rect, buf: &mut Buffer) -> Option<u32> {
+        let proto = st.tile_protocol(picker, path, area)?;
+        let id = crate::render::graphics::place_protocol(proto, area, buf);
+        st.note_tile_placed(id);
+        id
+    }
+
+    /// SQ-1190: an image replaced under the SAME path (`insert` re-decoding a
+    /// freshly fetched cover) must free the tile upload it drops, not merely
+    /// forget it — `tile_protocol_dropped_when_image_is_replaced_or_forgotten`
+    /// above only checks the cache count, which is silent about the terminal
+    /// leak. Falsified by reverting the `self.deletes.queue(id)` calls this
+    /// quest added to `insert`/`forget`: the flush below then writes nothing.
+    #[test]
+    fn replacing_or_forgetting_a_cover_queues_a_delete_for_its_tile_upload() {
+        let mut st = CoverState::default();
+        let picker = test_kitty_picker();
+        let area = Rect::new(0, 0, 4, 4);
+        let p = Path::new("game.gblorb");
+        let mut buf = Buffer::empty(area);
+
+        st.insert(p.to_path_buf(), decode(&png_bytes()));
+        let id = place_tile(&mut st, &picker, p, area, &mut buf).expect("kitty picker names an id");
+
+        // Re-decoding the same path drops the stale tile raster — and must
+        // queue its upload for deletion.
+        st.insert(p.to_path_buf(), decode(&png_bytes()));
+        let mut flush_buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        st.flush_kitty_deletes(Rect::new(0, 0, 4, 1), &mut flush_buf);
+        let cell = flush_buf.cell((0, 0)).expect("a plain cell to carry the delete");
+        assert!(
+            cell.symbol().contains(crate::render::graphics::kitty_delete_escape(id).as_str()),
+            "insert() must queue a delete for the replaced tile's upload"
+        );
+
+        // Same for `forget`.
+        let id2 = place_tile(&mut st, &picker, p, area, &mut buf).expect("kitty picker names an id");
+        st.forget(p);
+        let mut flush_buf2 = Buffer::empty(Rect::new(0, 0, 4, 1));
+        st.flush_kitty_deletes(Rect::new(0, 0, 4, 1), &mut flush_buf2);
+        let cell2 = flush_buf2.cell((0, 0)).expect("a plain cell to carry the delete");
+        assert!(
+            cell2.symbol().contains(crate::render::graphics::kitty_delete_escape(id2).as_str()),
+            "forget() must queue a delete for the forgotten tile's upload"
+        );
+    }
+
+    /// SQ-1190: the gallery-tile LRU's capacity eviction must free the oldest
+    /// tile's upload, not merely pop the struct that named it — kitty evicts
+    /// by ITS OWN LRU too and evicts images that are currently placed
+    /// (`GraphicsRender`'s SQ-0753 comment), so an unbounded pile of orphaned
+    /// gallery-tile uploads can blank a tile still on screen.
+    ///
+    /// Falsified by reverting the `self.deletes.queue(evicted.4)` call in
+    /// `tile_protocol`'s eviction loop: the flush below then writes nothing.
+    #[test]
+    fn tile_lru_eviction_queues_a_delete_for_the_evicted_upload() {
+        let mut st = CoverState::default();
+        let picker = test_kitty_picker();
+        let area = Rect::new(0, 0, 4, 4);
+        let mut buf = Buffer::empty(area);
+
+        let first = PathBuf::from("game0.gblorb");
+        st.insert(first.clone(), decode(&png_bytes()));
+        let id = place_tile(&mut st, &picker, &first, area, &mut buf).expect("kitty picker names an id");
+
+        // Push TILE_CAP more distinct tiles: the first push past capacity
+        // evicts `first` (the oldest), and the LRU stays at capacity after.
+        for i in 1..=TILE_CAP {
+            let path = PathBuf::from(format!("game{i}.gblorb"));
+            st.insert(path.clone(), decode(&png_bytes()));
+            place_tile(&mut st, &picker, &path, area, &mut buf);
+        }
+        assert_eq!(st.tiles.len(), TILE_CAP, "capacity is enforced");
+        assert!(st.tiles.iter().all(|(p, ..)| p != &first), "the oldest tile was evicted");
+
+        let mut flush_buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        st.flush_kitty_deletes(Rect::new(0, 0, 4, 1), &mut flush_buf);
+        let cell = flush_buf.cell((0, 0)).expect("a plain cell to carry the delete");
+        assert!(
+            cell.symbol().contains(crate::render::graphics::kitty_delete_escape(id).as_str()),
+            "LRU eviction must queue a delete for the evicted tile's upload"
+        );
     }
 
     #[test]

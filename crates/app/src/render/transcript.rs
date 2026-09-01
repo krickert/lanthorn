@@ -2409,7 +2409,11 @@ fn render_middle(
     let cache = state.transcript_wrap.borrow();
     let entry = cache.as_ref().expect("wrap cache populated above");
     // Per-frame eviction: bound the inline-image protocol cache to present images.
-    state.inline_image_render.borrow_mut().retain_live(&entry.live_bands);
+    // Every evicted band's kitty upload must be freed in the terminal, not
+    // merely forgotten (SQ-1190) — `InlineImageRender` has no `GraphicsRender`
+    // of its own, so route the ids it hands back into the sibling field's queue.
+    let evicted_bands = state.inline_image_render.borrow_mut().retain_live(&entry.live_bands);
+    state.graphics_render.borrow_mut().queue_external_deletes(evicted_bands);
     // Window the cached rows to the visible viewport (cheap; no re-wrap). The
     // top-anchor only applies at the bottom, handled inside `window_wrapped_rows`.
     let (lines, total_rows, first_abs_row) =

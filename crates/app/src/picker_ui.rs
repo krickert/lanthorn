@@ -62,8 +62,15 @@ struct ResourcePreview {
     /// The decoded image, when this is a renderable Pict.
     image: Option<image::DynamicImage>,
     /// Cached protocol, keyed by the content rect `(w, h)` and zoom it was
-    /// built for, so a resize or a zoom step invalidates it.
-    proto: Option<(u16, u16, PreviewZoom, ratatui_image::protocol::Protocol)>,
+    /// built for, so a resize or a zoom step invalidates it. The trailing
+    /// `Option<u32>` is the kitty image id it was last placed under (SQ-1190),
+    /// set by `draw_resource_preview` right after `place_protocol`. Freeing it
+    /// (on rebuild, or when the modal closes) rides on `cover`'s own delete
+    /// queue — the preview has no `GraphicsRender` to share either, and reusing
+    /// `cover`'s (already flushed every frame) beats a second private one that
+    /// would need flushing too, and would lose whatever it held whenever the
+    /// whole `ResourcePreview` is dropped on close.
+    proto: Option<(u16, u16, PreviewZoom, ratatui_image::protocol::Protocol, Option<u32>)>,
     /// A status line shown instead of (or below) an image.
     status: Option<String>,
     /// Current zoom (SQ-0486): `Fit` on open; `+`/`-`/wheel step it.
@@ -1039,7 +1046,7 @@ pub(crate) fn run_story_picker(
 
             // Resource-preview modal (SQ-0347): drawn last, over everything.
             if let Some(pv) = &mut preview {
-                let rects = draw_resource_preview(pv, area, cover_picker.as_ref(), &cs, buf);
+                let rects = draw_resource_preview(pv, area, cover_picker.as_ref(), &cs, buf, &mut cover);
                 preview_area = rects.area;
                 preview_close_rect = rects.close;
                 preview_button_rects = rects.buttons;
@@ -1065,6 +1072,11 @@ pub(crate) fn run_story_picker(
                     launch_row_rects = rects.rows;
                 }
             }
+
+            // Free any kitty uploads the cover/tile caches abandoned since the
+            // last frame (SQ-1190) — this loop has no `GraphicsRender` of its
+            // own, so `cover` keeps and flushes its own queue the same way.
+            cover.flush_kitty_deletes(area, buf);
         });
 
         // Housekeeping (runs every iteration, before the poll gate below, so a
@@ -1443,7 +1455,12 @@ pub(crate) fn run_story_picker(
                             preview.as_mut().unwrap().zoom = PreviewZoom::Fit;
                         }
                         Esc | Enter | Char('q') | Char(' ') => {
-                            preview = None;
+                            // Free the modal's upload before dropping the struct
+                            // that names it (SQ-1190) — `preview = None` alone
+                            // would only forget the id, not free it.
+                            if let Some(old) = preview.take() {
+                                cover.queue_external_delete(old.proto.and_then(|t| t.4));
+                            }
                             if let Some(a) = audio.as_mut() {
                                 a.stop_all();
                             }
@@ -1895,7 +1912,10 @@ pub(crate) fn run_story_picker(
                         let on_button = preview_button_rects.iter().any(|(_, r)| r.contains(pt));
                         let outside = !preview_area.contains(pt);
                         if on_close || on_button || outside {
-                            preview = None;
+                            // See the keyboard-dismiss arm above (SQ-1190).
+                            if let Some(old) = preview.take() {
+                                cover.queue_external_delete(old.proto.and_then(|t| t.4));
+                            }
                             if let Some(a) = audio.as_mut() {
                                 a.stop_all();
                             }
@@ -2349,7 +2369,8 @@ fn draw_story_gallery(
                     // matter how the render protocol reports its own size.
                     let fit = cover.fitted_tile_rect(picker, &key, cover_rect);
                     if let Some(proto) = cover.tile_protocol(picker, &key, fit) {
-                        app::render::graphics::place_protocol(proto, fit, buf);
+                        let id = app::render::graphics::place_protocol(proto, fit, buf);
+                        cover.note_tile_placed(id);
                         drew_cover = true;
                     }
                 }
@@ -2622,7 +2643,8 @@ fn draw_info_panel(
                         used_w,
                         used_h,
                     );
-                    app::render::graphics::place_protocol(proto, dest, buf);
+                    let id = app::render::graphics::place_protocol(proto, dest, buf);
+                    cover.note_proto_placed(id);
                 }
                 if used_h > 0 {
                     inner = Rect::new(inner.x, inner.y + used_h, inner.width, inner.height - used_h);
@@ -3173,6 +3195,9 @@ fn draw_resource_preview(
     picker: Option<&ratatui_image::picker::Picker>,
     cs: &app::colors::ColorScheme,
     buf: &mut ratatui::buffer::Buffer,
+    // Shares `cover`'s delete queue (SQ-1190) — see the doc comment on
+    // `ResourcePreview::proto`.
+    cover: &mut app::cover::CoverState,
 ) -> app::render::dialog::DialogRects {
     use app::render::dialog::{draw_dialog, ButtonId, DialogButton, DialogSpec, DialogStyle, Placement};
     // Centre a generous box: 80% of the terminal, floored so it stays usable on
@@ -3204,7 +3229,7 @@ fn draw_resource_preview(
     let mut drew_image = false;
     if let (Some(picker), Some(img)) = (picker, pv.image.as_ref()) {
         if content.width >= 1 && content.height >= 1 {
-            let fresh = matches!(&pv.proto, Some((w, h, z, _))
+            let fresh = matches!(&pv.proto, Some((w, h, z, _, _))
                 if *w == content.width && *h == content.height && *z == pv.zoom);
             if !fresh {
                 let target = ratatui::layout::Size::new(content.width, content.height);
@@ -3238,10 +3263,16 @@ fn draw_resource_preview(
                     }
                 };
                 if let Some(built) = built {
-                    pv.proto = Some((content.width, content.height, pv.zoom, built));
+                    // Freed only once the rebuild actually produced something — a
+                    // failed build (an unlikely encode error) must leave the
+                    // surviving proto, and its terminal upload, alone (SQ-1190).
+                    let old = pv.proto.take();
+                    cover.queue_external_delete(old.and_then(|t| t.4));
+                    pv.proto = Some((content.width, content.height, pv.zoom, built, None));
                 }
             }
-            if let Some((_, _, _, proto)) = &pv.proto {
+            let mut placed_id = None;
+            if let Some((_, _, _, proto, _)) = &pv.proto {
                 let sz = proto.size();
                 let uw = sz.width.min(content.width);
                 let uh = sz.height.min(content.height);
@@ -3251,8 +3282,13 @@ fn draw_resource_preview(
                     uw,
                     uh,
                 );
-                app::render::graphics::place_protocol(proto, dest, buf);
+                placed_id = Some(app::render::graphics::place_protocol(proto, dest, buf));
                 drew_image = true;
+            }
+            if let Some(id) = placed_id {
+                if let Some(entry) = pv.proto.as_mut() {
+                    entry.4 = id;
+                }
             }
         }
     }

@@ -1505,6 +1505,19 @@ impl GraphicsRender {
         }
     }
 
+    /// Queue `a=d,d=I` deletes for uploads a SIBLING cache owns (SQ-1190): the
+    /// inline-image transcript bands and the picker's cover/gallery tiles are
+    /// placed through [`place_protocol`], exactly like a chrome band, but they
+    /// live in `InlineImageRender`/`cover.rs`, not here — `queue_protocol_delete`
+    /// is private, so this is the seam that lets their eviction share this queue
+    /// and [`Self::flush_kitty_deletes`]'s no-flicker sequencing instead of
+    /// duplicating either.
+    pub(crate) fn queue_external_deletes(&mut self, ids: impl IntoIterator<Item = u32>) {
+        for id in ids {
+            self.queue_protocol_delete(Some(id));
+        }
+    }
+
     /// Queue a delete for an upload that is being REPLACED IN PLACE — one still
     /// covering the rect its successor is about to take (SQ-0817).
     ///
@@ -2739,6 +2752,76 @@ impl GraphicsRender {
                 band.width, band.height, band.x, band.y
             )),
         }
+    }
+}
+
+// ── Delete queues detached from a `GraphicsRender` instance (SQ-1190) ────────
+//
+// `GraphicsRender` lives on `AppState`, but two other `Protocol` caches place
+// uploads through the same `place_protocol` and have no `AppState` to share it
+// with: the pre-game picker's cover/tile/preview caches (`cover.rs`,
+// `picker_ui.rs`) run their own event loop before any `AppState` exists. The
+// two pieces below are `GraphicsRender::queue_protocol_delete` and
+// `flush_kitty_deletes`, detached from `self` so a queue with no instance in
+// common can still emit the identical bytes and no-flicker sequencing instead
+// of duplicating either by hand.
+
+/// The literal escape that frees one kitty image id — `a=d,d=I` deletes the
+/// image data and every placement of it at once, exactly what
+/// `GraphicsRender::queue_protocol_delete` writes.
+pub(crate) fn kitty_delete_escape(id: u32) -> String {
+    format!("\x1b_Gq=2,a=d,d=I,i={id}\x1b\\")
+}
+
+/// [`GraphicsRender::flush_kitty_deletes`], operating on a caller-owned `pending`
+/// string instead of `self.pending_deletes`. Kept in sync with that method by
+/// hand — the two have no instance to share, so this is the alternative to
+/// duplicating the caller-facing queue itself.
+fn flush_kitty_deletes_into(pending: &mut String, area: Rect, buf: &mut Buffer) {
+    use ratatui::buffer::CellDiffOption;
+    if pending.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let plain = cell.diff_option == CellDiffOption::None
+                && cell.symbol().len() == 1
+                && cell.symbol().is_ascii()
+                && !cell.symbol().starts_with(char::is_control);
+            if !plain {
+                continue;
+            }
+            let symbol = format!("{}{}", pending, cell.symbol());
+            cell.set_symbol(&symbol)
+                .set_diff_option(CellDiffOption::ForcedWidth(std::num::NonZeroU16::new(1).unwrap()));
+            pending.clear();
+            return;
+        }
+    }
+}
+
+/// A delete queue for a `Protocol` cache with no `GraphicsRender` to share
+/// (SQ-1190) — see the section header above. Same two-step shape as
+/// `GraphicsRender`'s own queue: [`Self::queue`] an id an eviction/replacement
+/// abandoned, [`Self::flush`] it into a frame's buffer once a plain cell can
+/// carry it.
+#[derive(Default)]
+pub struct KittyDeleteQueue(String);
+
+impl KittyDeleteQueue {
+    /// Queue a delete for an upload nothing on screen depends on any more. A
+    /// no-op for `None` — a non-kitty protocol, or an entry never placed.
+    pub fn queue(&mut self, id: Option<u32>) {
+        if let Some(id) = id {
+            self.0.push_str(&kitty_delete_escape(id));
+        }
+    }
+
+    /// Flush queued deletes into `buf`, riding on the first plain cell found in
+    /// `area` (never dropped — deferred to a later flush if none is found).
+    pub fn flush(&mut self, area: Rect, buf: &mut Buffer) {
+        flush_kitty_deletes_into(&mut self.0, area, buf);
     }
 }
 

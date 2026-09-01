@@ -247,7 +247,15 @@ pub struct InlineImageRender {
     /// `Arc` keeps its pixel-buffer address reserved while cached, so the
     /// pointer-based key can never collide with a later image that reuses a
     /// freed address (the ABA bug). Same shared allocation the live image holds.
-    cache: std::collections::HashMap<BandCacheKey, (std::sync::Arc<image::RgbaImage>, Protocol)>,
+    ///
+    /// The third element is the kitty image id `place_protocol` returned the
+    /// last time this entry was placed (`None` off-kitty, or before the first
+    /// placement) — one id per cache entry, since each key already names a
+    /// distinct row of a distinct band at a distinct page/cell size, so no two
+    /// entries are ever the same upload (SQ-1190). `retain_live` reads it back
+    /// out to free the upload a dropped entry still owns in the terminal,
+    /// mirroring `GraphicsRender::chrome_bands` (SQ-0753).
+    cache: std::collections::HashMap<BandCacheKey, (std::sync::Arc<image::RgbaImage>, Protocol, Option<u32>)>,
     /// The whole source image fitted to a band's cell box, cached per
     /// [`FittedKey`] and SHARED by every row of that band. The
     /// fit `resize_exact` is by far the expensive step (a full-image resample);
@@ -340,20 +348,42 @@ impl InlineImageRender {
                 None => strip,
             };
             if let Ok(proto) = picker.new_protocol(strip, Size::new(band.cols, 1), Resize::Fit(None)) {
-                self.cache.insert(key, (band.image.pixels.clone(), proto));
+                self.cache.insert(key, (band.image.pixels.clone(), proto, None));
             }
         }
-        if let Some((_, proto)) = self.cache.get(&key) {
-            crate::render::graphics::place_protocol(proto, dest, buf);
+        // Placed every frame this row is drawn, not only on a cache miss — the id
+        // is stable for a given `Protocol`, so re-recording it is idempotent, and
+        // it is how a freshly-built entry (still `None` above) learns the id it
+        // was just placed under (SQ-1190).
+        let placed = self.cache.get(&key).map(|(_, proto, _)| crate::render::graphics::place_protocol(proto, dest, buf));
+        if let Some(id) = placed {
+            if let Some(entry) = self.cache.get_mut(&key) {
+                entry.2 = id;
+            }
         }
     }
 
     /// Drop cache entries for bands no longer live, keyed by source Arc-ptr
     /// (`live` holds the currently-visible bands' pointers). Bounds growth and,
     /// with the pinned Arc in the value, releases addresses only once truly gone.
-    pub fn retain_live(&mut self, live: &std::collections::HashSet<usize>) {
+    ///
+    /// Returns the kitty image ids the evicted entries were placed under, so the
+    /// caller can free them in the terminal (`GraphicsRender::queue_external_deletes`)
+    /// rather than merely forgetting the struct that named them (SQ-1190,
+    /// mirroring SQ-0753's `GraphicsRender::retain_live`/`retain_chrome_bands`).
+    /// One id per evicted entry: each `BandCacheKey` names a distinct row of a
+    /// distinct band at a distinct page/cell size, so eviction here can never
+    /// free an id another surviving entry still places.
+    pub fn retain_live(&mut self, live: &std::collections::HashSet<usize>) -> Vec<u32> {
+        let dropped: Vec<u32> = self
+            .cache
+            .iter()
+            .filter(|(key, _)| !live.contains(&key.0))
+            .filter_map(|(_, (_, _, id))| *id)
+            .collect();
         self.cache.retain(|key, _| live.contains(&key.0));
         self.fitted.retain(|key, _| live.contains(&key.0));
+        dropped
     }
 }
 
@@ -687,5 +717,46 @@ mod tests {
         assert_eq!(r.cache.len(), 1);
         assert!(r.cache.keys().any(|k| k.0 == ptr1));
         assert!(!r.cache.keys().any(|k| k.0 == ptr2));
+    }
+
+    /// SQ-1190: an evicted band's kitty upload must be freed in the terminal,
+    /// not merely forgotten here. `place_protocol` is the only place that ever
+    /// learns the id `render_row` placed a band's `Protocol` under — this
+    /// asserts `retain_live` reads it back out of the entry it drops and hands
+    /// it to the caller, rather than discarding it along with the struct.
+    ///
+    /// Falsified by reverting the `entry.2 = id` write-back in `render_row`:
+    /// every entry then stays `None` and this returns an empty `Vec` instead
+    /// of the id, exactly the leak this quest fixes.
+    #[test]
+    fn retain_live_returns_the_evicted_kitty_ids_to_delete() {
+        let mut px = image::RgbaImage::new(16, 16);
+        for p in px.pixels_mut() {
+            *p = image::Rgba([200, 0, 0, 255]);
+        }
+        let img = crate::inline_image::InlineImage {
+            pixels: std::sync::Arc::new(px),
+            align: crate::inline_image::ImageAlign::InlineUp,
+            scaled: None, margin_px: None,
+        };
+        let band = crate::render::transcript::ImageBand { image: img, cols: 2, rows: 2, row: 0, x_off: 0 };
+        // A real kitty picker (not `Picker::halfblocks()`), so `place_protocol`
+        // actually has an id to hand back.
+        let picker = crate::render::graphics::kitty_picker(8, 16);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 4));
+        let mut r = InlineImageRender::default();
+        r.render_row(&picker, &band, Rect::new(0, 0, 2, 1), None, &mut buf);
+        let id = r
+            .cache
+            .values()
+            .next()
+            .and_then(|(_, _, id)| *id)
+            .expect("a kitty placement must have named an id");
+
+        let evicted = r.retain_live(&std::collections::HashSet::new());
+        assert_eq!(evicted, vec![id], "the evicted entry's id must be handed back for deletion");
+
+        // A second eviction of the same (now-empty) cache frees nothing new.
+        assert!(r.retain_live(&std::collections::HashSet::new()).is_empty());
     }
 }

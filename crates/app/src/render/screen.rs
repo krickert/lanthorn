@@ -323,6 +323,10 @@ fn render_story_pane_frame(
         let tarea = reserve_text_margin(tarea, state, margin_style(model, state), buf);
         let mut t = render_transcript(&model.status, introspect, state, tarea, buf, gi);
         links.append(&mut t.links);
+        // Unlike the multi-window path below, this one never opens a graphics
+        // window — but an inline transcript image's eviction still queues a
+        // delete here (SQ-1190), so it needs the same flush.
+        state.graphics_render.borrow_mut().flush_kitty_deletes(area, buf);
         return StoryPaneMetrics {
             scrollbar: t.scrollbar,
             max_scroll: t.max_scroll,
