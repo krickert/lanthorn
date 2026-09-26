@@ -72,7 +72,14 @@ pub(crate) fn explicit_pixel_rgba(palette: zvm::screen::Palette, packed: u32) ->
     }
 }
 
-pub(crate) fn packed_to_rgba(packed: u32, fallback: Rgba<u8>, colors: &ColorScheme) -> Rgba<u8> {
+/// `pub` (SQ-1609): a host resolving a packed z-colour off
+/// [`crate::render::screen::V6FrameInputs::host_pair`], or any other packed
+/// value of its own, otherwise has to reimplement this function's own body by
+/// hand from the public primitives it already composes (True24 direct,
+/// Standard via [`crate::colors::standard_colour_rgb`], else a theme fallback
+/// via [`crate::render::resolve_zcolour`]) — this is that composition, done
+/// once.
+pub fn packed_to_rgba(packed: u32, fallback: Rgba<u8>, colors: &ColorScheme) -> Rgba<u8> {
     if packed == 0 {
         return fallback;
     }

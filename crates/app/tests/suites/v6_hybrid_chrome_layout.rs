@@ -864,3 +864,76 @@ fn journey_pc_scale_is_the_main_rings_own_and_differs_from_the_menu_bands() {
         hyb.scale.s
     );
 }
+
+// ---------------------------------------------------------------------------
+// SQ-1609 — the SQ-0508(b) continuous divider bridge, published as
+// `V6HybridChromeLayout::divider_fills`.
+// ---------------------------------------------------------------------------
+
+/// `v6_arthur_status.rs`'s own `arthur_screen_swaps_do_not_move_the_frame` F3
+/// case: `arthur_at_status()` (== this file's `arthur_pc()`), then a Line read
+/// terminated by ZSCII 135 (F1=133, so F3=135) — how Arthur's keypad screens
+/// are actually invoked, reaching the F3 inventory screen whose two dividers
+/// are `draw_chrome_text_strip`'s own cited SQ-0508(b)/SQ-1035 specimen.
+fn arthur_f3_inventory() -> Option<GameSession> {
+    let mut s = arthur_pc()?;
+    let _ = s.submit_line_with_terminator("", 135);
+    Some(s)
+}
+
+/// Arthur's F3 inventory screen is `draw_chrome_text_strip`'s own cited
+/// specimen for SQ-0508(b): its two dividers are reversed-whitespace runs that
+/// the letterbox scale bridges across terminal rows carrying no run of their
+/// own at all — a plain walk over `runs`/`ground` (each keyed to a row that
+/// already has one) cannot see those bridged rows, which is exactly what
+/// `V6HybridChromeLayout::divider_fills` exists to publish.
+///
+/// Checks the field agrees with what actually gets drawn: every row in a
+/// reported `(col, first, last)` span — INCLUDING the interior rows with no
+/// run of their own, the whole reason this field exists — must show a
+/// reversed blank cell in the real Hybrid render at that column.
+#[test]
+fn arthur_f3_divider_fills_agree_with_the_real_render() {
+    let Some(session) = arthur_f3_inventory() else { return };
+    let state = render_state(app::render::graphics::kitty_picker(8, 16));
+    let area = Rect::new(0, 0, 120, 40);
+    let buf = render_real(&session, &state, area);
+    let model = session.screen();
+    let WinNode::Layered(items) = &model.root else { panic!("arthur-f3: a v6 frame has a Layered root") };
+    let native = v6::native_extent(items, &state.v6_text);
+    let cell = state.v6_text.cell();
+    let layout = v6::classify_windows(items, cell);
+    let hyb = hybrid_chrome_layout(&layout, native, area, (8, 16), &state)
+        .unwrap_or_else(|| panic!("arthur-f3: expected a hybrid chrome layout"));
+    assert!(!hyb.divider_fills.is_empty(), "arthur-f3: no divider fills published at all — premise failed");
+
+    // At least one bridged span must actually cover more than one row — the
+    // whole point of this field over a naive per-run walk, which would report
+    // (or entirely omit) only the rows a run happens to sit on.
+    assert!(
+        hyb.divider_fills.iter().any(|&(_, first, last)| last > first),
+        "arthur-f3: every reported divider span is a single row — the multi-row bridge \
+         this field exists for was never exercised (premise failed)"
+    );
+
+    let mut checked = 0;
+    for &(col, first, last) in &hyb.divider_fills {
+        assert!(first >= area.y as i32 && last < area.bottom() as i32, "arthur-f3: divider span out of bounds");
+        for y in first..=last {
+            let (x, y) = (col, y as u16);
+            let cell = buf.cell((x, y)).unwrap();
+            assert!(
+                cell.symbol().trim().is_empty(),
+                "arthur-f3: divider fill predicts a blank cell at ({x},{y}) but the real render shows {:?}",
+                cell.symbol()
+            );
+            assert!(
+                cell.style().add_modifier.contains(ratatui::style::Modifier::REVERSED),
+                "arthur-f3: divider fill predicts REVERSED at ({x},{y}), including the interior \
+                 bridged rows with no run of their own, but the real render disagrees"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "arthur-f3: no in-bounds divider-fill cell to check — premise failed");
+}

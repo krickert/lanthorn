@@ -5425,6 +5425,23 @@ pub struct V6HybridChromeLayout {
     /// shape a host that does not care which flank an extension belongs to
     /// can draw directly.
     pub divider_exts: Vec<FlankBorderExt>,
+    /// SQ-0508(b)'s continuous divider bridge, published SQ-1609: one entry
+    /// `(col, first_row, last_row)` per divider column `draw_chrome_text_strip`
+    /// paints continuously from `first_row` to `last_row` inclusive (both in
+    /// the HOST's terminal cells, like `runs`' own `row`) — a reversed
+    /// whitespace run is a solid vertical rule, and the letterbox scale maps
+    /// some GAME rows onto terminal rows with no run of their own at all, so a
+    /// bare walk over `runs`/`ground` (which only ever visits a row that
+    /// already carries one) misses those bridged rows entirely; Arthur's F3
+    /// inventory screen is the specimen (see `draw_chrome_text_strip`'s own
+    /// SQ-0508(b) comment). Bounded to first-painted..last-painted for that
+    /// column, not the whole strip (SQ-1035): Arthur's two inventory dividers
+    /// belong to window 2, which ends at the score bar below it, and a host
+    /// that ran them to the strip's bottom would draw rule through the bar and
+    /// on down the story window. A host paints a reversed blank cell at `col`
+    /// on every row `first_row..=last_row`, the same style `runs`' own reversed
+    /// entries use.
+    pub divider_fills: Vec<(u16, i32, i32)>,
 }
 
 /// SQ-1599: one ground-fill `draw_chrome_text_strip` paints before it stamps a
@@ -5594,6 +5611,52 @@ fn strip_ground_fills(
     out
 }
 
+/// SQ-1609: `draw_chrome_text_strip`'s own SQ-0508(b)/SQ-1035 continuous
+/// divider-fill pass, computed without a `Buffer` to paint into — see
+/// [`V6HybridChromeLayout::divider_fills`] for the shape and how a host uses
+/// it. Deliberately does NOT reuse `strip_ground_fills`'s row iteration: that
+/// walk (via `chrome_by_row`'s `by_row`) only ever visits a row that already
+/// carries a run, and a row the letterbox scale bridges in as blank has none
+/// by construction — this instead records, per divider column, the first and
+/// last row a reversed-whitespace run actually painted it on (skipping a
+/// reverse-BAR row exactly as the real pass does — its own edge-to-edge flood
+/// subsumes any rule), then hands back only the columns that still paint
+/// something once that span is clamped to the strip's own rows (SQ-1035).
+fn strip_divider_fills(
+    runs: &[crate::engine::PxText],
+    rect: Rect,
+    scale: &crate::render::v6_layout::Scale,
+    cell_px: (u16, u16),
+    pane: Rect,
+    cell: zvm::screen::V6Cell,
+) -> Vec<(u16, i32, i32)> {
+    let by_row = chrome_by_row(runs, rect, scale, cell_px, pane, cell);
+    let mut divider_rows: std::collections::BTreeMap<u16, (i32, i32)> = std::collections::BTreeMap::new();
+    for (row, row_runs) in &by_row {
+        if row_is_reverse_bar(row_runs.iter().map(|(t, _)| t)) {
+            continue;
+        }
+        for (t, _) in row_runs {
+            if t.style & 1 != 0 && t.text.trim().is_empty() {
+                let (c, _) = run_cell(t, scale, cell_px, pane, cell);
+                if c >= rect.x as i32 && c < rect.right() as i32 {
+                    let span = divider_rows.entry(c as u16).or_insert((*row, *row));
+                    span.0 = span.0.min(*row);
+                    span.1 = span.1.max(*row);
+                }
+            }
+        }
+    }
+    divider_rows
+        .into_iter()
+        .filter_map(|(c, (first, last))| {
+            let lo = first.max(rect.y as i32);
+            let hi = last.min(rect.bottom() as i32 - 1);
+            (lo <= hi).then_some((c, lo, hi))
+        })
+        .collect()
+}
+
 /// SQ-1599: `draw_chrome_text_strip`'s own post-origin resolution — SQ-0747's
 /// rule stretch, its claimed-word collision guard, and the strip's own
 /// left-edge clip (SQ-0949) — computed per run without a `Buffer` to paint
@@ -5672,6 +5735,7 @@ impl V6HybridChromeLayout {
     fn from_frame(frame: &HybridFrame, pane: Rect, native: (u16, u16), cell_px: (u16, u16), cell: zvm::screen::V6Cell) -> Self {
         let mut runs = Vec::new();
         let mut ground = Vec::new();
+        let mut divider_fills = Vec::new();
         for s in &frame.strips {
             if let ChromeStrip::Text(rect, text_runs) = s {
                 let positions = strip_run_positions(text_runs, *rect, &frame.scale, cell_px, pane, native, cell);
@@ -5680,6 +5744,7 @@ impl V6HybridChromeLayout {
                     runs.push(V6HybridChromeRun { run, col, row, over_art: false, in_menu_band: false, resolved: r });
                 }
                 ground.extend(strip_ground_fills(text_runs, *rect, &frame.scale, cell_px, pane, native, cell));
+                divider_fills.extend(strip_divider_fills(text_runs, *rect, &frame.scale, cell_px, pane, cell));
             }
         }
         let menu_band: Vec<Rect> = frame
@@ -5698,6 +5763,7 @@ impl V6HybridChromeLayout {
                     runs.push(V6HybridChromeRun { run, col, row, over_art: false, in_menu_band: true, resolved: r });
                 }
                 ground.extend(strip_ground_fills(text_runs, *rect, menu_scale, cell_px, pane, native, cell));
+                divider_fills.extend(strip_divider_fills(text_runs, *rect, menu_scale, cell_px, pane, cell));
             }
         }
         // SQ-0944: text the game printed ON its own artwork, positioned exactly
@@ -5721,6 +5787,7 @@ impl V6HybridChromeLayout {
             ground,
             flank_borders: frame.flank_borders.clone(),
             divider_exts: frame.divider_exts.clone(),
+            divider_fills,
         }
     }
 }

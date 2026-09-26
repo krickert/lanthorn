@@ -427,6 +427,53 @@ fn resolve_zcolour_is_callable_from_outside_render() {
     );
 }
 
+// ── `packed_to_rgba` (SQ-1609) ──────────────────────────────────────────────
+
+/// `render::v6_layout::packed_to_rgba` used to be `pub(crate)`, unreachable from
+/// a host resolving a packed z-colour off [`app::render::screen::V6FrameInputs::host_pair`]
+/// (or any other packed value it holds) to a concrete pixel colour — it had to
+/// reimplement this function's own body from the public primitives
+/// (`app::colors::standard_colour_rgb`, `app::render::resolve_zcolour`). It is
+/// `pub` now — callable straight from here, exactly as a host would, with no
+/// need to restate the packed-colour-to-RGBA mapping.
+#[test]
+fn packed_to_rgba_is_callable_from_outside_render() {
+    use app::colors::ColorScheme;
+    use app::render::v6_layout::packed_to_rgba;
+    use app::state::pack_zcolour;
+    use image::Rgba;
+    use zvm::screen::ZColour;
+
+    let scheme = ColorScheme::terminal_default();
+    let fallback = Rgba([1, 2, 3, 255]);
+
+    // True24: direct RGB, no theme involved.
+    let true24_packed = pack_zcolour(ZColour::True24(0x102030));
+    assert_eq!(
+        packed_to_rgba(true24_packed, fallback, &scheme),
+        Rgba([0x10, 0x20, 0x30, 255]),
+        "a 24-bit true colour resolves to its exact RGB"
+    );
+
+    // Standard(4): resolves through the ZMSD §8.3.1 fixed pixel RGB, the same
+    // table the internal pixel path (`standard_pixel_rgb`) reads.
+    let standard_packed = pack_zcolour(ZColour::Standard(4));
+    let (r, g, b) =
+        app::colors::standard_colour_rgb(scheme.machine_palette, 4).expect("Standard(4) has a §8.3.1 RGB");
+    assert_eq!(
+        packed_to_rgba(standard_packed, fallback, &scheme),
+        Rgba([r, g, b, 255]),
+        "a Standard colour resolves through the fixed §8.3.1 pixel RGB"
+    );
+
+    // Default (0) → fallback, unconditionally.
+    assert_eq!(
+        packed_to_rgba(0, fallback, &scheme),
+        fallback,
+        "packed 0 (Default) always answers the caller's fallback"
+    );
+}
+
 // ── Opening-banner pager after reset (SQ-1575) ─────────────────────────────
 
 /// Render one frame of the story pane and resolve any pending pager arm against
