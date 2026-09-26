@@ -937,3 +937,165 @@ fn arthur_f3_divider_fills_agree_with_the_real_render() {
     }
     assert!(checked > 0, "arthur-f3: no in-bounds divider-fill cell to check — premise failed");
 }
+
+// ---------------------------------------------------------------------------
+// SQ-1608 — the story-slot OVERLAY: chrome runs Shogun's BOOT menu prints ON
+// TOP of window 0's own ordinary Buffer. Never a Grid, so `hybrid_story_slot_grid`
+// above never answers for this frame — the quest's own gap:
+// `render_node`'s own `WinNode::Layered` in-box pass had no published form at
+// all, and a host could previously only place these runs at their raw native
+// pixel position, which overlaps the story's own printed text at a narrow
+// pane width.
+// ---------------------------------------------------------------------------
+
+/// `v6_shogun_gameplay.rs`'s own boot-menu sequence
+/// (`shogun_hybrid_boot_menu_is_one_coherent_ring_screen_with_a_solid_selection_bar`):
+/// boot, then one space keypress reaches "You may choose to:" and the three
+/// menu items with their selection bar on "START the game".
+fn shogun_boot_menu() -> Option<GameSession> {
+    let mut s = boot_z6("shogun-r322-s890706.z6")?;
+    let r = s.submit_char(b' ');
+    assert!(r.transcript.contains("You may choose to:"), "shogun-boot-menu: menu prompt missing");
+    Some(s)
+}
+
+/// Cross-render agreement for `V6HybridChromeLayout::story_overlay`, the same
+/// pattern `verify_agreement` establishes for `runs` — every non-blank overlay
+/// span must land on a non-blank glyph in the real render — plus the shape
+/// `v6_shogun_gameplay.rs` already pins directly against the buffer (three
+/// items on consecutive rows, in the game's own order), now read through the
+/// PUBLISHED layout instead.
+fn assert_story_overlay_matches(ctx: &str, session: &GameSession, area: Rect) {
+    let state = render_state(app::render::graphics::kitty_picker(8, 16));
+    let buf = render_real(session, &state, area);
+    let model = session.screen();
+    let WinNode::Layered(items) = &model.root else { panic!("{ctx}: a v6 frame has a Layered root") };
+    let native = v6::native_extent(items, &state.v6_text);
+    let cell = state.v6_text.cell();
+    let layout = v6::classify_windows(items, cell);
+    let hyb =
+        hybrid_chrome_layout(&layout, native, area, (8, 16), &state).unwrap_or_else(|| panic!("{ctx}: expected a hybrid chrome layout"));
+    assert!(!hyb.story_overlay.is_empty(), "{ctx}: no story-slot overlay runs published — premise failed");
+
+    // Every span cell must agree with the real render on BOTH its glyph and
+    // its REVERSE modifier — the glyph because that is what a span claims to
+    // paint, and reverse because that is `v6_shogun_gameplay.rs`'s own check
+    // for the selection bar (SQ-0487): a bar that painted only the glyph
+    // cells, or a mask that let it bleed past its own label, would still show
+    // the right characters while disagreeing on which ones are highlighted.
+    let mut checked = 0;
+    let mut reverse_checked = 0;
+    for r in &hyb.story_overlay {
+        let reverse = r.run.style & 1 != 0;
+        let chars: Vec<char> = app::render::blank_control_chars(&r.run.text).chars().collect();
+        for &(lo, hi) in &r.spans {
+            for (i, x) in (lo..hi).enumerate() {
+                if x < area.x as i32 || x >= area.right() as i32 || r.row < area.y as i32 || r.row >= area.bottom() as i32 {
+                    continue;
+                }
+                let (px, py) = (x as u16, r.row as u16);
+                let c = buf.cell((px, py)).unwrap();
+                let want = chars.get(i).copied();
+                let shown = c.symbol().chars().next();
+                assert_eq!(
+                    shown, want,
+                    "{ctx}: overlay run {:?} predicts {want:?} at ({px},{py}) but the real render \
+                     shows {shown:?}",
+                    r.run.text
+                );
+                let reversed = c.style().add_modifier.contains(ratatui::style::Modifier::REVERSED);
+                assert_eq!(
+                    reversed, reverse,
+                    "{ctx}: overlay run {:?} predicts reverse={reverse} at ({px},{py}) but the \
+                     real render disagrees",
+                    r.run.text
+                );
+                checked += 1;
+                if reverse {
+                    reverse_checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "{ctx}: no in-bounds overlay span to check — premise failed");
+    assert!(
+        reverse_checked > 0,
+        "{ctx}: no reverse-video overlay span found — the selection bar's own premise failed"
+    );
+
+    // …and the three items land on consecutive rows, in the game's own order —
+    // `v6_shogun_gameplay.rs`'s own pinned shape, now checked through the
+    // PUBLISHED layout rather than by reading the buffer directly.
+    let row_of = |label: &str| {
+        hyb.story_overlay
+            .iter()
+            .find(|r| r.run.text.contains(label))
+            .map(|r| r.row)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{ctx}: no overlay run carries {label:?} — got {:?}",
+                    hyb.story_overlay.iter().map(|r| &r.run.text).collect::<Vec<_>>()
+                )
+            })
+    };
+    let (start, restore, quit) = (row_of("START the game"), row_of("RESTORE a saved game"), row_of("QUIT the game"));
+    assert_eq!(
+        (restore, quit),
+        (start + 1, start + 2),
+        "{ctx}: the published overlay must place the three items on consecutive rows"
+    );
+}
+
+#[test]
+fn shogun_boot_menu_story_overlay_matches_the_real_render() {
+    let Some(session) = shogun_boot_menu() else { return };
+    assert_story_overlay_matches("shogun-boot-menu", &session, Rect::new(0, 0, 80, 30));
+}
+
+/// A narrow pane — meaningfully narrower than the 80x30 the corpus's own boot-
+/// menu test uses, and narrower than Shogun's own ~68-column native screen —
+/// is the quest's own named risk: a host driving `story_overlay` at a phone
+/// width must still place the menu items without colliding with the story's
+/// own prose. (The quest's own text named "You may choose to:" as that prose,
+/// but that line is a transient message the game's own redraw clears before
+/// the frame this suite ever captures — confirmed absent even from the
+/// existing 80x30 boot-menu render, which never checks for it on screen,
+/// only in the TRANSCRIPT `submit_char` returns. The credits block above the
+/// menu — "Release 322 / Pix 322 / Serial number 890706", confirmed present
+/// at this width — is window 0's own ordinary prose instead, and serves the
+/// same purpose: overlay runs must never land on its rows.)
+#[test]
+fn shogun_boot_menu_story_overlay_matches_the_real_render_at_a_narrow_pane() {
+    let Some(session) = shogun_boot_menu() else { return };
+    let area = Rect::new(0, 0, 60, 30);
+    assert_story_overlay_matches("shogun-boot-menu-narrow", &session, area);
+
+    let state = render_state(app::render::graphics::kitty_picker(8, 16));
+    let buf = render_real(&session, &state, area);
+    let rows: Vec<String> = (0..area.height)
+        .map(|y| (0..area.width).map(|x| buf.cell((x, y)).unwrap().symbol().chars().next().unwrap_or(' ')).collect())
+        .collect();
+    let credit_row = rows
+        .iter()
+        .position(|r| r.contains("Serial number"))
+        .unwrap_or_else(|| panic!("shogun-boot-menu-narrow: credits line not found:\n{}", rows.join("\n")));
+
+    let model = session.screen();
+    let WinNode::Layered(items) = &model.root else { panic!("a v6 frame has a Layered root") };
+    let native = v6::native_extent(items, &state.v6_text);
+    let cell = state.v6_text.cell();
+    let layout = v6::classify_windows(items, cell);
+    let hyb = hybrid_chrome_layout(&layout, native, area, (8, 16), &state)
+        .unwrap_or_else(|| panic!("shogun-boot-menu-narrow: expected a hybrid chrome layout"));
+    for r in &hyb.story_overlay {
+        if r.run.text.trim().is_empty() {
+            continue;
+        }
+        assert_ne!(
+            r.row, credit_row as i32,
+            "shogun-boot-menu-narrow: overlay run {:?} lands on the same row as the credits' own \
+             prose at a narrow pane",
+            r.run.text
+        );
+    }
+}

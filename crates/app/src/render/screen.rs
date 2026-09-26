@@ -5442,6 +5442,18 @@ pub struct V6HybridChromeLayout {
     /// on every row `first_row..=last_row`, the same style `runs`' own reversed
     /// entries use.
     pub divider_fills: Vec<(u16, i32, i32)>,
+    /// Chrome runs printed ON TOP of the story slot itself, in the SAME cell
+    /// coordinates the story box uses (SQ-1608) — Shogun's boot menu
+    /// ("START the game" and its two siblings, the reverse-video selection
+    /// bar) is the specimen: window 0 stays an ordinary `Buffer` there, so
+    /// [`hybrid_story_slot_grid`] never answers for it, and until this field
+    /// existed a host had no published data for this overlay at all and could
+    /// only place these runs at their raw native pixel position — which
+    /// overlaps the story's own printed text at a narrow pane width. A host
+    /// draws each entry over its own rendered story prose, in the SAME cell
+    /// coordinates the story text itself occupies, exactly as
+    /// [`render_node`]'s own `WinNode::Layered` in-box pass draws them here.
+    pub story_overlay: Vec<V6HybridStoryOverlayRun>,
 }
 
 /// SQ-1599: one ground-fill `draw_chrome_text_strip` paints before it stamps a
@@ -5732,7 +5744,14 @@ fn strip_run_resolution(
 }
 
 impl V6HybridChromeLayout {
-    fn from_frame(frame: &HybridFrame, pane: Rect, native: (u16, u16), cell_px: (u16, u16), cell: zvm::screen::V6Cell) -> Self {
+    fn from_frame(
+        frame: &HybridFrame,
+        layout: &crate::render::v6_layout::V6Layout<'_>,
+        pane: Rect,
+        native: (u16, u16),
+        cell_px: (u16, u16),
+        cell: zvm::screen::V6Cell,
+    ) -> Self {
         let mut runs = Vec::new();
         let mut ground = Vec::new();
         let mut divider_fills = Vec::new();
@@ -5777,6 +5796,7 @@ impl V6HybridChromeLayout {
         }
         let click_scale = if frame.plan_is_menu { frame.menu.as_ref().unwrap_or(&frame.scale) } else { &frame.scale };
         let click_map = crate::render::graphics::build_hybrid_click_map(pane, click_scale, native, cell_px, frame.packed_text.clone());
+        let story_overlay = story_slot_overlay_runs(layout, frame.vp_native, frame.viewport, cell);
         V6HybridChromeLayout {
             viewport: frame.viewport,
             viewport_native: frame.vp_native,
@@ -5788,6 +5808,7 @@ impl V6HybridChromeLayout {
             flank_borders: frame.flank_borders.clone(),
             divider_exts: frame.divider_exts.clone(),
             divider_fills,
+            story_overlay,
         }
     }
 }
@@ -5845,7 +5866,7 @@ pub fn hybrid_chrome_layout(
     // recomputes, exactly like `compose_v6_frame` does for the raster path, so
     // any value here is fine; 0 is simplest.
     let frame = build_hybrid_frame_with(0, layout, story, native, pane, cell_px, true, true, 0, default_fg, default_bg, state);
-    Some(V6HybridChromeLayout::from_frame(&frame, pane, native, cell_px, state.v6_text.cell()))
+    Some(V6HybridChromeLayout::from_frame(&frame, layout, pane, native, cell_px, state.v6_text.cell()))
 }
 
 /// Where a v6 STORY-SLOT `Grid` belongs on a host's own screen (SQ-1599) —
@@ -5916,6 +5937,151 @@ pub struct V6HybridStorySlotGrid {
     /// terms lands at `(viewport.x + dx, viewport.y + dy)`, exactly as
     /// [`draw_grid_transparent`] places them.
     pub viewport: Rect,
+}
+
+/// A chrome run [`render_node`]'s own `WinNode::Layered` in-box pass paints ON
+/// TOP of the story slot's own transcript, published on
+/// [`V6HybridChromeLayout::story_overlay`] (SQ-1608) — Shogun's boot menu is
+/// the specimen (`START the game`, `RESTORE a saved game`, `QUIT the game` and
+/// the reverse-video selection bar that moves between them), and it does NOT
+/// go through [`hybrid_story_slot_grid`]: window 0 there stays an ordinary
+/// `Buffer`, not a `Grid`, so that function's `None` is the whole reason this
+/// exists.
+///
+/// Deliberately its own leaner type rather than a reuse of
+/// [`V6HybridChromeRun`]: that type's `over_art`/`in_menu_band` have no
+/// meaning here (this run is never ring art or menu band, it is over the
+/// STORY), and its `resolved` field's own doc is written about
+/// `draw_chrome_text_strip`'s strip-relative resolution (SQ-0747's rule
+/// stretch, the claimed-word guard, a STRIP's own clip) — none of which
+/// applies to a run positioned against the story box instead of a chrome
+/// strip.
+///
+/// `row`/the columns inside `spans` are counted from the story box's own top
+/// and left edge — one terminal cell per the run's own declared grid cell
+/// ([`crate::engine::PxText::gcol`]/`grow`) — and deliberately NEVER routed
+/// through [`V6HybridChromeLayout::scale`]: the story box is placed 1:1,
+/// unscaled, in every hybrid frame, and mapping through the ring's scale here
+/// was the actual historical bug this mirrors the fix for (SQ-0937/SQ-1009).
+///
+/// `spans` is what the real render ACTUALLY paints on `row`, after SQ-0898's
+/// ink-masking: a blank (space) run may not overwrite a cell any glyph run on
+/// the same row already inked, so a reverse-video selection bar can extend
+/// past its own label's text without erasing it — which means a blank run's
+/// own span can come out split around the label it must not touch. A
+/// non-blank run always resolves to exactly one span. This type never
+/// appears for a run whose own origin lands outside the viewport (the real
+/// render skips it too); a run that IS in-viewport but paints nothing (a
+/// blank run entirely masked by ink) still appears, with `spans` empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct V6HybridStoryOverlayRun {
+    /// The run as the game painted it — text (before masking), style, packed
+    /// colours, exactly as [`V6HybridChromeRun::run`].
+    pub run: crate::engine::PxText,
+    pub row: i32,
+    /// Half-open terminal-column ranges on `row` this run actually paints,
+    /// already clipped to the viewport's right edge and split around any
+    /// ink a blank run must not overwrite. See the type's own doc for why
+    /// this can hold more than one range.
+    pub spans: Vec<(i32, i32)>,
+}
+
+/// [`render_node`]'s own `WinNode::Layered` in-box pass (SQ-0892/SQ-0937/
+/// SQ-1009/SQ-0898), computed without a `Buffer` to paint into — see
+/// [`V6HybridStoryOverlayRun`] for the shape and
+/// [`V6HybridChromeLayout::story_overlay`] for how a host uses it. Mirrors
+/// that block's row-grouping, its [`merge_strip_fragments`] call, its
+/// scale-free `gcol`-based column/row computation, and its blank-vs-ink
+/// masking pass exactly; see the real block's own comments (in `render_node`)
+/// for the specimens that pinned each rule.
+fn story_slot_overlay_runs(
+    layout: &crate::render::v6_layout::V6Layout<'_>,
+    vp_native: (u32, u32, u32, u32),
+    viewport: Rect,
+    cell: zvm::screen::V6Cell,
+) -> Vec<V6HybridStoryOverlayRun> {
+    use std::collections::BTreeMap;
+    let mut in_box: BTreeMap<u16, Vec<&crate::engine::PxText>> = BTreeMap::new();
+    for it in &layout.chrome {
+        // Same guard as `render_node`'s own pass: the promoted story grid
+        // (SQ-0934) is already drawn as the story surface, so stamping it
+        // again here would draw every glyph twice.
+        if layout.story.is_some_and(|st| std::ptr::eq(*it, st)) {
+            continue;
+        }
+        if let WinNode::Grid(g) = &it.node {
+            for t in &g.px_texts {
+                let px = t.x.max(1) as f32 - 1.0;
+                let py = t.y.max(1) as f32 - 1.0;
+                if px < vp_native.0 as f32
+                    || px >= (vp_native.0 + vp_native.2) as f32
+                    || py < vp_native.1 as f32
+                    || py >= (vp_native.1 + vp_native.3) as f32
+                {
+                    continue; // outside the story region → already in the ring
+                }
+                in_box.entry(t.y).or_default().push(t);
+            }
+        }
+    }
+    let vp_col = (vp_native.0 / u32::from(cell.w())) as i32;
+    let mut out = Vec::new();
+    for row_runs in in_box.values_mut() {
+        row_runs.sort_by_key(|t| t.x);
+        let run_col = |t: &crate::engine::PxText| viewport.x as i32 + i32::from(t.gcol) - vp_col;
+        let merged = merge_strip_fragments(row_runs);
+        let ink: Vec<(i32, i32)> = merged
+            .iter()
+            .filter(|t| !t.text.trim().is_empty())
+            .map(|t| {
+                let c = run_col(t);
+                (c, c + t.text.chars().count() as i32)
+            })
+            .collect();
+        for t in &merged {
+            let col = run_col(t);
+            let row = viewport.y as i32 + (t.y.max(1) as i32 - 1) / i32::from(cell.h())
+                - (vp_native.1 as i32) / i32::from(cell.h());
+            if row < viewport.y as i32
+                || row >= viewport.bottom() as i32
+                || col < viewport.x as i32
+                || col >= viewport.right() as i32
+            {
+                continue;
+            }
+            let max_w = viewport.right() as usize - col as usize;
+            let mut spans: Vec<(i32, i32)> = Vec::new();
+            if max_w > 0 {
+                let text = crate::render::blank_control_chars(&t.text);
+                if t.text.trim().is_empty() {
+                    let mut open: Option<i32> = None;
+                    for (n, _ch) in text.chars().take(max_w).enumerate() {
+                        let c = col + n as i32;
+                        if ink.iter().any(|&(lo, hi)| c >= lo && c < hi) {
+                            if let Some(s) = open.take() {
+                                spans.push((s, c));
+                            }
+                            continue;
+                        }
+                        if open.is_none() {
+                            open = Some(c);
+                        }
+                    }
+                    if let Some(s) = open {
+                        let end = col + text.chars().take(max_w).count() as i32;
+                        spans.push((s, end));
+                    }
+                } else {
+                    let len = text.chars().count().min(max_w);
+                    if len > 0 {
+                        spans.push((col, col + len as i32));
+                    }
+                }
+            }
+            out.push(V6HybridStoryOverlayRun { run: t.clone(), row, spans });
+        }
+    }
+    out
 }
 
 /// A cheap change key for the whole v6 raster composite (SQ-0469). It folds
