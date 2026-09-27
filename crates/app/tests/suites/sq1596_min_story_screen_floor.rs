@@ -541,6 +541,77 @@ fn v1_to_3_stories_are_exempt_from_the_pane_space_floor_too() {
     assert_eq!(sess.machine.mem.read_byte(0x21), 0, "v3: $21 is never written, floor or no floor");
 }
 
+// ── SQ-1606 (third follow-up): the search must probe the RAW pane ──────────
+//
+// `min_story_pane_for_floor`'s Z-machine probe used to call
+// `declared_story_screen_dims`, which floors its own result at
+// `boot_screen_cols` (SQ-0679/SQ-0680 — a running story's header column count
+// must never shrink below what it booted with). That floor is correct for
+// WRITING the header (`sync_zvm_screen_dims`), but wrong as this search's own
+// yardstick: a host that also seeds `TerminalFacts::min_story_screen` at boot
+// has already widened the pre-boot terminal until the RAW pre-boot pane
+// clears the floor (`min_terminal_size_for_story_floor`), so
+// `boot_screen_cols` itself ends up >= the floor from the moment the session
+// boots. Probing with the header-floored function then makes EVERY
+// candidate's returned cols >= boot_cols >= floor_cols trivially, so the very
+// first probe "passes" regardless of the candidate's actual raw width, and
+// the search returns `real` completely unchanged even though the pane's real
+// rendered grid is still narrower than `floor`.
+//
+// Falsified by reverting `min_story_pane_for_floor`'s probe back to
+// `declared_story_screen_dims(..., version, gs.boot_screen_cols)` — this test
+// then fails, `got` reading back as the unchanged `REAL_PANE` (or its raw
+// `story_screen_dims` reading short of `FLOOR.0`), exactly the originally
+// reported symptom.
+#[test]
+fn min_story_pane_for_floor_bumps_past_a_trivial_boot_cols_floor() {
+    if !story_path().is_file() {
+        eprintln!("SKIP: {} absent", story_path().display());
+        return;
+    }
+    let home = app::scratch_dir("sq1606-followup-raw-probe");
+    // NARROW is narrow enough that, with FLOOR set, boot's own pre-boot search
+    // (min_terminal_size_for_story_floor) widens the terminal until the RAW
+    // pre-boot pane clears FLOOR — which is exactly what makes
+    // `gs.boot_screen_cols` end up >= FLOOR.0 from the moment the session
+    // boots, the precondition this bug needs.
+    let (b, turn1) = boot_and_first_turn(
+        headless_config(&home),
+        TerminalFacts { size: Some(NARROW), min_story_screen: Some(FLOOR), ..TerminalFacts::default() },
+        &home,
+    );
+    assert!(
+        !turn1.contains("[Screen too small.]"),
+        "premise: boots fine under the pre-boot floor search; turn was {turn1:?}"
+    );
+
+    // The exact repro from the quest note: a real pane narrower than FLOOR,
+    // fed directly to the search — not through set_story_pane/story_screen_in,
+    // and unrelated to the terminal size the session actually booted at.
+    const REAL_PANE: (u16, u16) = (30, 19);
+    let got = app::host::screen::min_story_pane_for_floor(&*b.session, &b.state, REAL_PANE, FLOOR);
+    assert_ne!(
+        got, REAL_PANE,
+        "the search must bump the pane, not return the too-narrow real pane unchanged — \
+         the bug this test catches is a trivially-satisfied boot_cols floor making the \
+         very first probe pass regardless of the candidate's actual raw width"
+    );
+
+    let raw = app::render::screen::story_screen_dims(
+        ratatui::layout::Rect::new(0, 0, got.0, got.1),
+        &b.state,
+    )
+    .expect("a non-zero returned pane");
+    assert!(
+        raw.1 >= FLOOR.0,
+        "the RETURNED pane's RAW story_screen_dims must itself clear the floor's column \
+         count — not merely read as clearing it through the header-floored \
+         declared_story_screen_dims, which is exactly what let the original bug through: \
+         got pane={got:?} raw={raw:?} floor={FLOOR:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ── Glulx: the identity mapping (no chrome subtraction at all) ─────────────
 
 /// Bureaucracy's own floor from above is meaningless to Glulx (a different

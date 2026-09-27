@@ -155,13 +155,31 @@ pub fn set_story_pane(session: &mut dyn Engine, state: &AppState, pane: (u16, u1
 /// Engine-aware, mirroring [`sync_zvm_screen_dims`]/[`resize_glulx`]'s own
 /// downcasts, since the chrome a pane crosses before reaching the story
 /// differs by engine:
-/// - a v4+, non-v6 Z-machine session applies the SAME
+/// - a v4+, non-v6 Z-machine session searches on the RAW
+///   [`story_screen_dims`](crate::render::screen::story_screen_dims) for a
+///   candidate pane — not the header-floored
 ///   [`declared_story_screen_dims`](crate::render::screen::declared_story_screen_dims)
-///   subtraction a live resize already applies to this exact pane
-///   ([`sync_zvm_screen_dims`]), searched one cell at a time via
-///   [`boot::bump_dim_for_floor`](crate::host::boot::bump_dim_for_floor) — the
-///   subtraction is fixed chrome, not a ratio, but this reuses that exact
-///   search rather than inverting it by hand;
+///   that [`sync_zvm_screen_dims`] itself applies when it actually WRITES the
+///   header — searched one cell at a time via
+///   [`boot::bump_dim_for_floor`](crate::host::boot::bump_dim_for_floor). This
+///   is deliberate, not an oversight: `declared_story_screen_dims` floors its
+///   result at `boot_screen_cols`, and a host that also seeds
+///   `TerminalFacts::min_story_screen` at boot has already widened the
+///   pre-boot terminal (via
+///   [`min_terminal_size_for_story_floor`](crate::host::boot::min_terminal_size_for_story_floor))
+///   until the RAW pre-boot pane clears the floor — so `boot_screen_cols`
+///   itself ends up at or above `floor_cols` from the moment the session
+///   boots. Probing with `declared_story_screen_dims` at a later live resize
+///   would then floor EVERY candidate's returned cols at `boot_cols >=
+///   floor_cols`, trivially "passing" on the very first candidate regardless
+///   of its actual raw width, and this search would return `real` completely
+///   unchanged even when the pane's real rendered grid is still narrower than
+///   `floor` (a follow-up to SQ-1606, found after the feature first shipped).
+///   The header-floor subtraction still belongs in `sync_zvm_screen_dims`,
+///   which genuinely must never let a WRITTEN header shrink below
+///   `boot_cols` — but the SEARCH here is answering a different question
+///   ("what pane makes the raw rendered grid at least this wide"), and must
+///   not reuse that clamp as its yardstick;
 /// - a v1-3 or v6 session is exempt, matching `declared_story_screen_dims`'s
 ///   own exemption: no floor applies to either, and `real` is returned
 ///   unchanged;
@@ -188,14 +206,8 @@ pub fn min_story_pane_for_floor(
         if version < 4 || version == 6 {
             return real;
         }
-        let boot_cols = gs.boot_screen_cols;
         let probe = |pane: (u16, u16)| {
-            crate::render::screen::declared_story_screen_dims(
-                Rect::new(0, 0, pane.0, pane.1),
-                state,
-                version,
-                boot_cols,
-            )
+            crate::render::screen::story_screen_dims(Rect::new(0, 0, pane.0, pane.1), state)
         };
         let cols = if floor_cols == 0 || state.config.virtual_screen_cols.is_some() {
             real_cols
