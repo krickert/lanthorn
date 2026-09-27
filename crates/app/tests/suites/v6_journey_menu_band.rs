@@ -400,6 +400,7 @@ fn menu_anchor_compose(
         text,
         bottom_anchor_menu,
         hybrid_text_rows: std::collections::HashSet::new(),
+        extend_flanks_under_story_grid: false,
     };
     compose_v6_frame(&layout, frame, &inputs)
 }

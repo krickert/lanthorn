@@ -3005,6 +3005,26 @@ pub struct V6FrameInputs<'a> {
     /// replace it, since `fill_reverse_row_gaps` paints straight onto the
     /// canvas rather than through [`GlyphSink`](crate::render::v6_layout::GlyphSink).
     pub hybrid_text_rows: std::collections::HashSet<u16>,
+    /// Extend the side flanks down the pane even when the story slot is a
+    /// `Grid` (InvisiClues topic menus — Zork Zero, Shogun) rather than a
+    /// `Buffer` (SQ-1618). `false` (every constructor's default) reproduces
+    /// today's behaviour exactly: the `ext` block declines the whole frame on
+    /// the SQ-1026 `!matches!(&story.node, WinNode::Buffer(_))` guard, so
+    /// `extension` stays 0 and the canvas never grows past `native` — a
+    /// truncated `V6Frame.frame.canvas_h` on any pane taller than the game's
+    /// own screen, even though the terminal's own Hybrid renderer tiles the
+    /// flank art down the WHOLE pane regardless of the story slot's node type
+    /// (`build_hybrid_frame_with`'s `tiled_flanks`, which excludes only
+    /// `BottomPlan::Menu`, Journey's shape). `extend_raster_flanks` itself
+    /// never inspects `story.node` — it only reads `story.x_px`/`story.w_px`
+    /// and `frame.canvas_h` — so it already works correctly under a `Grid`
+    /// story slot; the only reason it never gets a tall `frame` to work with
+    /// is this upstream guard forcing `extension = 0`. Set this to let a
+    /// `Grid` story slot extend anyway: the SQ-1026 guard in the main body
+    /// (declining to draw a transcript into the `Grid`'s rect) is untouched
+    /// and still applies at every extension level — only the flank sizing
+    /// changes.
+    pub extend_flanks_under_story_grid: bool,
 }
 
 impl<'a> V6FrameInputs<'a> {
@@ -3065,6 +3085,7 @@ impl<'a> V6FrameInputs<'a> {
             text: crate::render::v6_layout::V6TextMode::Rasterise,
             bottom_anchor_menu: false,
             hybrid_text_rows: std::collections::HashSet::new(),
+            extend_flanks_under_story_grid: false,
         }
     }
 }
@@ -3395,6 +3416,23 @@ fn compose_v6_frame_into(
         // A `Grid` in the story slot contributes its rect and nothing else
         // (SQ-1026) — again no transcript. scopa and Amiga Shogun's InvisiClues.
         if !matches!(&story.node, WinNode::Buffer(_)) {
+            // SQ-1618: a `Grid` story slot (unlike `scopa`'s `Layered`/other
+            // non-Buffer shapes) still wants the FLANK art extended down the
+            // pane, even though it has no transcript to grow — the terminal's
+            // own Hybrid `tiled_flanks` already does this for every non-Menu
+            // shape regardless of node type (see
+            // `V6FrameInputs::extend_flanks_under_story_grid`'s doc). A host
+            // opts in explicitly; every other non-Buffer shape (and every
+            // existing caller, which defaults the flag off) still declines
+            // here exactly as before. Skip straight past the `story_clear`/
+            // `story_prose_box` checks below — they size PROSE growth, which
+            // does not apply to a `Grid`'s bare rect — and hand back the
+            // anchored-band list computed above unchanged (empty on every
+            // known `Grid` specimen: neither Zork Zero's nor Shogun's
+            // InvisiClues screen has a chrome band below the story slot).
+            if matches!(&story.node, WinNode::Grid(_)) && inputs.extend_flanks_under_story_grid {
+                break 'ext Some(anchored);
+            }
             break 'ext None;
         }
         // The picture owns the screen (SQ-0578), or an absolutely-placed plate is
@@ -5546,6 +5584,20 @@ pub struct V6HybridChromeLayout {
     /// coordinates the story text itself occupies, exactly as
     /// [`render_node`]'s own `WinNode::Layered` in-box pass draws them here.
     pub story_overlay: Vec<V6HybridStoryOverlayRun>,
+    /// Native-pixel row TOPS (already mapped through `.y.max(1) - 1`, [`Self::
+    /// text_rows`]'s own key) of the story slot's own `Grid` runs — the
+    /// InvisiClues topic list (SQ-1618) — when [`hybrid_story_slot_grid`]
+    /// would answer `Some` for this exact frame (same `WinNode::Grid` and
+    /// non-empty-viewport tests it makes; not recomputed by a second call,
+    /// since `frame.viewport` is already this frame's own answer to that
+    /// question). Empty on every other frame, including Shogun's boot menu
+    /// (an ordinary `Buffer`, so [`Self::story_overlay`] carries its runs
+    /// instead). Purely additive: a host that draws a story-slot `Grid`
+    /// itself in cells (via [`hybrid_story_slot_grid`]) had no way to tell
+    /// [`V6FrameInputs::hybrid_text_rows`] about those rows before this
+    /// field existed, so `compose_v6_frame_into`'s raster copy and the
+    /// host's own cell draw could disagree over the Grid's own text.
+    pub story_slot_grid_rows: Vec<u16>,
 }
 
 /// SQ-1599: one ground-fill `draw_chrome_text_strip` paints before it stamps a
@@ -5889,6 +5941,17 @@ impl V6HybridChromeLayout {
         let click_scale = if frame.plan_is_menu { frame.menu.as_ref().unwrap_or(&frame.scale) } else { &frame.scale };
         let click_map = crate::render::graphics::build_hybrid_click_map(pane, click_scale, native, cell_px, frame.packed_text.clone());
         let story_overlay = story_slot_overlay_runs(layout, frame.vp_native, frame.viewport, cell);
+        // SQ-1618: `hybrid_story_slot_grid`'s own two extra tests beyond what
+        // this frame has already passed by construction (`WinNode::Grid`,
+        // and a non-empty `frame.viewport` — the same `viewport` that
+        // function would itself compute from the identical
+        // `build_hybrid_frame_with` call, so this is not a second call).
+        let story_slot_grid_rows: Vec<u16> = match layout.story.map(|s| &s.node) {
+            Some(WinNode::Grid(g)) if frame.viewport.width > 0 && frame.viewport.height > 0 => {
+                g.px_texts.iter().map(|t| t.y.max(1) - 1).collect()
+            }
+            _ => Vec::new(),
+        };
         V6HybridChromeLayout {
             viewport: frame.viewport,
             viewport_native: frame.vp_native,
@@ -5901,6 +5964,7 @@ impl V6HybridChromeLayout {
             divider_exts: frame.divider_exts.clone(),
             divider_fills,
             story_overlay,
+            story_slot_grid_rows,
         }
     }
 
@@ -5936,6 +6000,7 @@ impl V6HybridChromeLayout {
             .iter()
             .map(|r| r.run.y.max(1) - 1)
             .chain(self.story_overlay.iter().map(|r| r.run.y.max(1) - 1))
+            .chain(self.story_slot_grid_rows.iter().copied())
             .collect()
     }
 }

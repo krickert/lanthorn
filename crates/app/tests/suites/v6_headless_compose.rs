@@ -226,6 +226,7 @@ fn host_compose_full(
         text,
         bottom_anchor_menu: false,
         hybrid_text_rows: std::collections::HashSet::new(),
+        extend_flanks_under_story_grid: false,
     };
     compose_v6_frame(&layout, RasterFrame::native(native), &inputs)
 }
@@ -732,6 +733,7 @@ fn fmvpoker_compose(session: &GameSession, text: V6TextMode, input: Option<&str>
         text,
         bottom_anchor_menu: false,
         hybrid_text_rows: std::collections::HashSet::new(),
+        extend_flanks_under_story_grid: false,
     };
     compose_v6_frame(&layout, RasterFrame::native(native), &inputs)
 }
@@ -1113,6 +1115,7 @@ fn drop_cap_margin_px_matches_where_the_raster_path_places_the_text_pixel() {
             text: V6TextMode::RecordOnly,
             bottom_anchor_menu: false,
             hybrid_text_rows: std::collections::HashSet::new(),
+            extend_flanks_under_story_grid: false,
         };
         let f = compose_v6_frame(&layout, RasterFrame::native(native), &inputs);
         let s = f.story.unwrap_or_else(|| panic!("honor={honor}: no story box on Zork Zero's boot frame"));
@@ -1514,6 +1517,7 @@ fn arthur_compose_record_only(
         text: V6TextMode::RecordOnly,
         bottom_anchor_menu: false,
         hybrid_text_rows: rows,
+        extend_flanks_under_story_grid: false,
     };
     compose_v6_frame(&layout, RasterFrame::native(native), &inputs)
 }
@@ -1750,6 +1754,7 @@ fn shogun_compose_record_only(
         text: V6TextMode::RecordOnly,
         bottom_anchor_menu: false,
         hybrid_text_rows: rows,
+        extend_flanks_under_story_grid: false,
     };
     compose_v6_frame(&layout, RasterFrame::native(native), &inputs)
 }

@@ -47,6 +47,8 @@ mod host_v6_click;
 mod v6_zork0_color_command;
 #[path = "suites/v6_zork0_hints.rs"]
 mod v6_zork0_hints;
+#[path = "suites/sq1618_grid_flank_extension.rs"]
+mod sq1618_grid_flank_extension;
 #[path = "suites/v6_zork0_icon_backdrop.rs"]
 mod v6_zork0_icon_backdrop;
 #[path = "suites/v6_zork0_splash.rs"]
