@@ -2200,6 +2200,42 @@ impl GlulxSession {
         self.machine.set_line_input_text(text);
     }
 
+    /// Complete a suspended LINE `glk_select` with `terminator` as a registered
+    /// line-terminator keycode ([`gvm::Machine::supply_line_terminated`], Glk
+    /// spec §4.2/§11.2), then drive the game to its next input request or Quit.
+    /// Mirrors `submit`'s own drive/finish sequence, but for a terminator other
+    /// than plain Enter — the Glulx counterpart of the Z-machine's
+    /// `GameSession::submit_line_with_terminator` (SQ-1613).
+    pub fn submit_line_with_terminator(&mut self, command: &str, terminator: u32) -> TurnResult {
+        if self.machine.trace_exec() {
+            self.machine.clear_executed_pcs();
+        }
+        if !self.quit {
+            self.machine.supply_line_terminated(command, terminator);
+            self.drive_turn();
+        }
+        self.finish_turn()
+    }
+
+    /// While a Glulx *line* read is active, decide whether a special key the
+    /// player pressed is one the game registered as a line terminator for the
+    /// pending window (`glk_set_terminators_line_event`, Glk spec §11.2).
+    ///
+    /// Only `Escape` and the function keys can ever be a Glk terminator
+    /// ([`gvm::glk::keycode::is_terminator`]) — arrows are structurally
+    /// excluded, so unlike the Z-machine's v6 arrow gate (SQ-0460, which is
+    /// v6-only anyway) no separate withholding step is needed here. Returns
+    /// the Glk keycode to submit with, or `None` to leave the key to its
+    /// normal app behavior.
+    pub fn line_key_terminator(&self, ki: &KeyInput) -> Option<u32> {
+        let code = key_to_glk(*ki)?;
+        if !gvm::glk::keycode::is_terminator(code) {
+            return None;
+        }
+        let win = self.machine.line_request_window()?;
+        self.machine.is_line_terminator(win, code).then_some(code)
+    }
+
     /// A terminal click landed inside a mouse-watching window: deliver a Glk
     /// `Evtype_MouseInput` event at window-relative `(x, y)` and drive the game to
     /// its next input request. A no-op turn once the game has quit. `x`/`y` are
