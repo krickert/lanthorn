@@ -6097,8 +6097,13 @@ pub fn hybrid_chrome_layout(
     // [`story_slot_grid_wider_than_viewport`], the same check the terminal's
     // own draw and [`hybrid_story_slot_grid`] make, reusing the frame already
     // built here instead of a second one.
+    //
+    // SQ-1623: `state.host_shrinks_story_grid_text` opts a host OUT of this
+    // guard — see that field's own doc. The terminal's own draw
+    // (`render_story_pane_frame`) never reads this field and keeps falling
+    // back to raster regardless, exactly as SQ-1620 left it.
     if let WinNode::Grid(g) = &story.node {
-        if frame.scale.s >= 1.0 && g.cols > frame.viewport.width {
+        if frame.scale.s >= 1.0 && g.cols > frame.viewport.width && !state.host_shrinks_story_grid_text {
             return None;
         }
     }
@@ -6480,12 +6485,22 @@ pub fn hybrid_story_slot_grid(
     // [`story_slot_grid_wider_than_viewport`] makes for the terminal's own
     // draw and [`hybrid_chrome_layout`], reusing the frame already built here
     // instead of building a second one.
-    if frame.scale.s >= 1.0 && g.cols > viewport.width {
+    //
+    // SQ-1623: `state.host_shrinks_story_grid_text` opts a host OUT of this
+    // guard — see that field's own doc, and [`V6HybridStorySlotGrid::grid_cols`]/
+    // [`V6HybridStorySlotGrid::grid_rows`] below for what such a host reads
+    // instead. The terminal's own draw never reads this field.
+    let wider_than_viewport = frame.scale.s >= 1.0 && g.cols > viewport.width;
+    if wider_than_viewport && !state.host_shrinks_story_grid_text {
         return None;
     }
     let rows = viewport.height.min(g.rows);
     let cols = viewport.width.min(g.cols);
-    Some(V6HybridStorySlotGrid { viewport: Rect::new(viewport.x, viewport.y, cols, rows) })
+    Some(V6HybridStorySlotGrid {
+        viewport: Rect::new(viewport.x, viewport.y, cols, rows),
+        grid_cols: g.cols,
+        grid_rows: g.rows,
+    })
 }
 
 /// See [`hybrid_story_slot_grid`] for the full reasoning.
@@ -6495,6 +6510,29 @@ pub struct V6HybridStorySlotGrid {
     /// terms lands at `(viewport.x + dx, viewport.y + dy)`, exactly as
     /// [`draw_grid_transparent`] places them.
     pub viewport: Rect,
+    /// The story-slot grid's own native column/row count (SQ-1623), always
+    /// populated — not only when wider than `viewport`. This is the
+    /// STORY's fact, from `GridWindow::cols`/`GridWindow::rows`, never
+    /// clipped the way `viewport.width`/`viewport.height` are above.
+    ///
+    /// Compare against `viewport.width`/`viewport.height` to detect a
+    /// mismatch and by how much — `grid_cols as f32 / viewport.width as f32`
+    /// is roughly the per-glyph shrink ratio a host taking
+    /// [`AppState::host_shrinks_story_grid_text`] should apply so the whole
+    /// grid fits in the space `viewport.width` describes. Equal to
+    /// `viewport.width`/`viewport.height` (once clipped) whenever the grid
+    /// already fits — this pair only tells you something new in the
+    /// opted-in wider-than-viewport case that field exists for.
+    ///
+    /// A host that shrinks this grid's glyphs to fit must also remap a
+    /// click's device pixel back to a grid column using its OWN per-glyph
+    /// width, not lanthorn's `V6ClickMap::map_click` — that function assumes
+    /// a fixed native 8px-per-column grid and does not know about a host
+    /// drawing this grid smaller than native size. There is no published
+    /// click-map for a shrunk grid; the host owns that arithmetic itself.
+    pub grid_cols: u16,
+    /// See [`Self::grid_cols`].
+    pub grid_rows: u16,
 }
 
 /// A chrome run [`render_node`]'s own `WinNode::Layered` in-box pass paints ON

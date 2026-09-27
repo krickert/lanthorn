@@ -265,3 +265,106 @@ fn narrow_pane_falls_to_raster_and_shows_the_whole_grid() {
         assert!(ran > 0, "the fixtures are present but nothing ran — check the filenames");
     }
 }
+
+/// SQ-1623 — a host that draws its own text (never the terminal) can opt out
+/// of the raster fallback above via `AppState::host_shrinks_story_grid_text`
+/// and get back a `Grid` placement plus the grid's true native size instead,
+/// so it can shrink its own glyphs to fit. Reuses the identical narrow-pane
+/// frame `narrow_pane_falls_to_raster_and_shows_the_whole_grid` pins above —
+/// same specimens, same `NARROW`/`NARROW_CELL` pane, same `hint_menu` boot.
+#[test]
+fn host_opt_in_publishes_grid_instead_of_raster_fallback() {
+    let mut ran = 0;
+    for &(file, release) in SPECIMENS {
+        let Some(s) = hint_menu(file, release) else {
+            eprintln!("SKIP: gitignored story missing at {}", stories_dir().join(file).display());
+            continue;
+        };
+        ran += 1;
+
+        let model = s.screen();
+        let WinNode::Layered(items) = &model.root else { panic!("{file}: a v6 frame has a Layered root") };
+        let cell = zvm::screen::V6Cell::DEFAULT;
+        let native = v6::native_extent(items, &app::native_font::TextFace::cell_only(cell));
+        let layout = v6::classify_windows(items, cell);
+        let Some(story) = layout.story else { panic!("{file}: expected a story window") };
+        let WinNode::Grid(g) = &story.node else { panic!("{file}: premise — the hint screen's story slot must be a Grid") };
+
+        let pane = Rect::new(0, 0, NARROW.0, NARROW.1);
+
+        // 1. Default (`host_shrinks_story_grid_text` left at `false`):
+        // bit-for-bit the SQ-1620 behaviour — both functions still answer
+        // `None`. This is the regression guard that the default truly
+        // changes nothing.
+        let st_default = state_at(NARROW_CELL, true);
+        assert!(
+            !st_default.host_shrinks_story_grid_text,
+            "{file}: premise — the flag must default to false"
+        );
+        assert!(
+            hybrid_story_slot_grid(&layout, native, pane, NARROW_CELL, &st_default).is_none(),
+            "{file} {NARROW:?}/{NARROW_CELL:?}: with the opt-in left off, hybrid_story_slot_grid must \
+             still publish no placement, exactly as SQ-1620 left it"
+        );
+        assert!(
+            hybrid_chrome_layout(&layout, native, pane, NARROW_CELL, &st_default).is_none(),
+            "{file} {NARROW:?}/{NARROW_CELL:?}: with the opt-in left off, hybrid_chrome_layout must \
+             still publish no ring, exactly as SQ-1620 left it"
+        );
+
+        // 2. Opted in: both functions now answer `Some`, and the grid's own
+        // native size (`grid_cols`/`grid_rows`) is wider than the pane's
+        // actual viewport — the fact a host is meant to notice and shrink to.
+        let mut st_opt_in = state_at(NARROW_CELL, true);
+        st_opt_in.host_shrinks_story_grid_text = true;
+
+        let chrome = hybrid_chrome_layout(&layout, native, pane, NARROW_CELL, &st_opt_in);
+        assert!(
+            chrome.is_some(),
+            "{file} {NARROW:?}/{NARROW_CELL:?}: with the opt-in on, hybrid_chrome_layout must publish \
+             a ring for a story-slot grid wider than the viewport"
+        );
+
+        let grid = hybrid_story_slot_grid(&layout, native, pane, NARROW_CELL, &st_opt_in)
+            .unwrap_or_else(|| panic!("{file} {NARROW:?}/{NARROW_CELL:?}: with the opt-in on, hybrid_story_slot_grid must publish a placement"));
+        assert_eq!(
+            grid.grid_cols, g.cols,
+            "{file}: grid_cols must reflect the story's true native grid width"
+        );
+        assert_eq!(
+            grid.grid_rows, g.rows,
+            "{file}: grid_rows must reflect the story's true native grid height"
+        );
+        assert!(
+            grid.grid_cols > grid.viewport.width,
+            "{file}: grid_cols ({}) must exceed the narrow pane's own viewport.width ({}) — \
+             this is the mismatch a host must notice and shrink its glyphs to close",
+            grid.grid_cols,
+            grid.viewport.width
+        );
+
+        // 3. The terminal's own dispatch (`render_story_pane`) is completely
+        // unaffected by the flag either way — it never reads it and keeps
+        // falling back to raster regardless, which is the "terminal keeps
+        // its raster fallback" half of SQ-1623.
+        for (label, st) in [("flag off", &st_default), ("flag on", &st_opt_in)] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, pane.right() + 1, pane.bottom() + 1));
+            let _ = render_story_pane(&model, false, None, st, pane, &mut buf);
+            assert_eq!(
+                st.v6_path_log.borrow().last().map(|(l, _)| l.clone()),
+                Some("raster".into()),
+                "{file} {NARROW:?}/{NARROW_CELL:?} ({label}): the terminal's own dispatch must still \
+                 fall through to raster regardless of the host opt-in"
+            );
+            assert_eq!(
+                st.v6_takeover_reason.get(),
+                Some("grid_wider_than_viewport"),
+                "{file} {NARROW:?}/{NARROW_CELL:?} ({label}): the terminal's takeover reason must be \
+                 unaffected by the host opt-in"
+            );
+        }
+    }
+    if stories_dir().join(SPECIMENS[0].0).exists() {
+        assert!(ran > 0, "the fixtures are present but nothing ran — check the filenames");
+    }
+}

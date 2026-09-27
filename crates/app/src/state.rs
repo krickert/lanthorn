@@ -3670,6 +3670,37 @@ pub struct AppState {
     /// resize honors the same floor with no extra work from the host beyond
     /// setting this once at launch.
     pub min_story_screen: Option<(u16, u16)>,
+    /// A host opt-in (SQ-1623), unrelated to anything `TerminalFacts` carries at
+    /// boot — set directly on an already-built `AppState`, not derived from a
+    /// boot-time probe. `false` (every constructor's default, including
+    /// `AppState::default()`) reproduces today's SQ-1620 behaviour exactly: when
+    /// a v6 story-slot `Grid` is wider, in its own native columns, than the
+    /// Hybrid ring's viewport, [`crate::render::screen::hybrid_chrome_layout`]
+    /// and [`crate::render::screen::hybrid_story_slot_grid`] both answer `None`
+    /// — no ring, no grid placement — exactly as they did before this field
+    /// existed, and the TERMINAL's own render path
+    /// (`crate::render::screen::render_story_pane_frame`) is unconditionally
+    /// unaffected either way, because it never reads this field and always
+    /// falls back to the raster composite for that case (a real terminal
+    /// cannot draw one window's text at a smaller per-glyph size than the rest
+    /// of the screen).
+    ///
+    /// Set this `true` when the host draws its OWN text (a browser or native
+    /// UI, never a terminal) and can shrink that one grid's glyphs to fit —
+    /// unlike a terminal, such a host is not committed to one glyph size for
+    /// the whole frame. With it `true`, `hybrid_chrome_layout` and
+    /// `hybrid_story_slot_grid` answer `Some` for this case instead of `None`,
+    /// on the understanding that the CALLER will do the shrinking:
+    /// `hybrid_story_slot_grid`'s [`crate::render::screen::V6HybridStorySlotGrid::grid_cols`]/
+    /// [`crate::render::screen::V6HybridStorySlotGrid::grid_rows`] carry the
+    /// grid's true native size for the host to compare against its own
+    /// `viewport.width`/`viewport.height` and derive a shrink ratio from.
+    ///
+    /// A host taking this opt-in must also remap clicks itself — see
+    /// `V6HybridStorySlotGrid`'s own doc for why lanthorn's built-in
+    /// `V6ClickMap::map_click` (an assumed fixed native-8px-per-column grid)
+    /// does not apply once the host is drawing this grid's glyphs smaller.
+    pub host_shrinks_story_grid_text: bool,
     /// Bytes and frame flushes the ratatui backend has written to the terminal,
     /// for `/dump-terminal` (SQ-0994). `None` in every headless harness, which
     /// builds no terminal at all — and the report says "unavailable" rather than
@@ -3960,6 +3991,7 @@ impl Default for AppState {
             game_picker_query_answered: false,
             glk_cell_px: None,
             min_story_screen: None,
+            host_shrinks_story_grid_text: false,
             term_traffic: None,
             term_default_colors: crate::term_colors::TermDefaultColors::default(),
             query_sweep: crate::query_sweep::QuerySweep::default(),
