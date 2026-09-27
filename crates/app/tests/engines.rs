@@ -206,4 +206,6 @@ mod walkthrough_hhgg;
 mod walkthrough_zork0;
 #[path = "suites/walkthrough_lurking_horror.rs"]
 mod walkthrough_lurking_horror;
+#[path = "suites/walkthrough_glulx_graphics_sound.rs"]
+mod walkthrough_glulx_graphics_sound;
 
