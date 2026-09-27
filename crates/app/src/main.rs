@@ -3302,7 +3302,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // has seen the output that armed the pager.
         if !state.any_overlay_open()
             && !state.pager.active
-            && zvm_session_opt(&*session).is_some_and(|z| z.pending_input() == app::session::InputKind::Line)
+            && session.pending_input() == app::session::InputKind::Line
         {
             if let Event::Key(k) = &event {
                 if k.kind == KeyEventKind::Press {

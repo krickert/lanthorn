@@ -577,4 +577,40 @@ mod tests {
             assert_eq!(session.pending_input(), InputKind::Line, "the read is left exactly as it was");
         }
     }
+
+    /// (d) SQ-1616: a registered Glulx line terminator must survive an
+    /// `Engine::save_state`/`restore_state` round trip — the same round trip
+    /// `GlulxSession::silent_look` performs on every `look`-driven room-name
+    /// probe (`glulx_session.rs`), so it fires far more often than a
+    /// player-triggered Save State. Before the fix, `gvm::glk::Model::deserialize`
+    /// unconditionally rebuilt every window with an empty terminator list,
+    /// discarding whatever `glk_set_terminators_line_event` had registered — so
+    /// `is_line_terminator(Func1)` read true before the round trip and false
+    /// after it.
+    #[test]
+    fn deliver_line_key_terminator_survives_a_save_restore_round_trip_sq1616() {
+        let mut session = glulx_line_session();
+        assert!(
+            session.line_key_terminator(&KeyInput::Func(1)).is_some(),
+            "premise: Func1 is a registered terminator before any round trip"
+        );
+
+        let snapshot = Engine::save_state(&session);
+        Engine::restore_state(&mut session, &snapshot).expect("restore the session's own save");
+
+        assert!(
+            session.line_key_terminator(&KeyInput::Func(1)).is_some(),
+            "Func1 must still be recognized as a line terminator after a save/restore round trip (SQ-1616)"
+        );
+
+        // And the end-to-end gate still submits the line after the round trip.
+        let mut state = AppState::default();
+        let mut mapper = Mapper::default();
+        let game_dir = std::path::PathBuf::from("nonexistent");
+        let arc_file = std::path::PathBuf::from("nonexistent.lanthorn");
+        let mut tidy = 0u32;
+        let mut ctx = glulx_ctx(&game_dir, &arc_file, &mut tidy);
+        let out = deliver_line_key_terminator(&mut state, &mut mapper, &mut session, &mut ctx, KeyInput::Func(1));
+        assert!(out.is_some(), "the terminator still submits the line after the round trip");
+    }
 }

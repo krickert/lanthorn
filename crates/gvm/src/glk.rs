@@ -3692,6 +3692,15 @@ impl Model {
                     }
                     w(&mut out, win.mouse_req as u32);
                     w(&mut out, win.hyperlink_req as u32);
+                    // Line-input terminators + echo-line setting (SQ-1616, v7): a HOST
+                    // snapshot resumes the VM without the game re-registering these via
+                    // `glk_set_terminators_line_event`/`glk_set_echo_line_event`, so
+                    // they must survive the round-trip like the style colours below.
+                    w(&mut out, win.terminators.len() as u32);
+                    for &t in &win.terminators {
+                        w(&mut out, t);
+                    }
+                    w(&mut out, win.echo_line as u32);
                     // Per-window Normal-style colour snapshot (SQ-0334, v6): a HOST
                     // snapshot resumes the VM without the game re-establishing hints,
                     // so the window's own colours must survive the round-trip.
@@ -3860,6 +3869,21 @@ impl Model {
             let char_req = if r.u32()? != 0 { Some(CharReq { unicode: r.u32()? != 0 }) } else { None };
             let mouse_req = r.u32()? != 0;
             let hyperlink_req = r.u32()? != 0;
+            // Line-input terminators + echo-line setting (v7+). Older snapshots
+            // default (empty terminator list, echo on) — the pre-SQ-1616 behaviour,
+            // and the same "accepted break, no migration" shape as every other
+            // version bump in this file.
+            let (terminators, echo_line) = if version >= 7 {
+                let nterm = r.u32()?;
+                let mut terminators = Vec::new();
+                for _ in 0..nterm {
+                    terminators.push(r.u32()?);
+                }
+                let echo_line = r.u32()? != 0;
+                (terminators, echo_line)
+            } else {
+                (Vec::new(), true)
+            };
             // Per-window Normal-style colour snapshot (v6+). Older snapshots default
             // (the game repaints on its own @restore); a host snapshot carries them.
             let mut styles = [StyleColour::default(); NUMSTYLES as usize];
@@ -3870,7 +3894,7 @@ impl Model {
             }
             windows.push(Some(Window {
                 id, wintype, rock, parent, stream, rect, grid, line_req, char_req, mouse_req,
-                hyperlink_req, terminators: Vec::new(), echo_line: true, echo: 0, child1, child2, key, method, size,
+                hyperlink_req, terminators, echo_line, echo: 0, child1, child2, key, method, size,
                 styles,
             }));
         }
@@ -4174,7 +4198,7 @@ fn read_blob(bytes: &[u8], p: &mut usize) -> Option<Vec<u8>> {
 }
 
 /// Version tag at the head of a `Glk ` snapshot chunk (bumped on a format change).
-const GLK_SNAPSHOT_VERSION: u32 = 6;
+const GLK_SNAPSHOT_VERSION: u32 = 7;
 
 /// Sequential big-endian-`u32` reader over a `Glk ` snapshot chunk. Underflow is
 /// an error, never a panic.
@@ -4594,12 +4618,12 @@ mod layout_snap_tests {
     }
 
     // ── format freeze (docs/release/save-format-policy.md) ──
-    // The Glk host-snapshot version is frozen at 6. Changing this constant must
+    // The Glk host-snapshot version is frozen at 7. Changing this constant must
     // be a deliberate format bump (update this pin + a migration/release note),
     // never accidental drift — the assert forces the decision to be conscious.
     #[test]
     fn snapshot_version_constant_is_frozen() {
-        assert_eq!(GLK_SNAPSHOT_VERSION, 6, "Glk snapshot version changed — see docs/release/save-format-policy.md");
+        assert_eq!(GLK_SNAPSHOT_VERSION, 7, "Glk snapshot version changed — see docs/release/save-format-policy.md");
     }
 
     #[test]
@@ -4706,6 +4730,116 @@ mod layout_snap_tests {
             Some(0xABCD),
             "the stream's current link value survived the round-trip",
         );
+    }
+
+    // A live line-terminator set + a non-default echo-line flag must survive a
+    // Glk-chunk save/restore (SQ-1616): before this fix, `deserialize`
+    // unconditionally rebuilt every window with `terminators: Vec::new(),
+    // echo_line: true`, discarding whatever the game had registered via
+    // `glk_set_terminators_line_event`/`glk_set_echo_line_event`. This is exactly
+    // the round trip `GlulxSession::silent_look` performs on every `look`-driven
+    // room-name probe (`crates/app/src/glulx_session.rs`).
+    #[test]
+    fn terminators_and_echo_line_round_trip_through_serialize() {
+        let mut m = Model::new();
+        let grid = m.window_open(0, 0, 0, 4, 0).unwrap(); // TextGrid root
+        assert!(m.set_line_terminators(grid, &[keycode::FUNC1]));
+        m.set_window_echo_line(grid, false);
+        assert!(m.is_line_terminator(grid, keycode::FUNC1), "armed before save");
+        assert!(!m.window_echo_line(grid), "armed before save");
+
+        let restored = Model::deserialize(&m.serialize()).expect("round-trip");
+        assert!(
+            restored.is_line_terminator(grid, keycode::FUNC1),
+            "line terminator survived the round-trip"
+        );
+        assert!(!restored.window_echo_line(grid), "echo-line setting survived the round-trip");
+    }
+
+    // A pre-SQ-1616 (version 6) snapshot — no terminators/echo_line fields on a
+    // window record — must still deserialize, defaulting to the pre-fix
+    // behaviour (empty terminator list, echo on) rather than erroring. Pinned
+    // wire bytes, hand-built to the v6 layout, so this exercises the real
+    // `version >= 7` gate rather than whatever `serialize()` currently emits —
+    // and proves the gate works in both directions (this test plus the
+    // round-trip test above).
+    #[test]
+    fn deserializes_pinned_version_6_snapshot_without_terminators_or_echo_line() {
+        let mut b = Vec::new();
+        let w = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_be_bytes());
+        let zero_style_colour = |b: &mut Vec<u8>| {
+            for _ in 0..5 {
+                w(b, 0);
+            } // fg(opt) + bg(opt) + reverse
+        };
+        let zero_style_attrs = |b: &mut Vec<u8>| {
+            for _ in 0..10 {
+                w(b, 0);
+            } // weight/oblique/indent/para_indent/justify, each opt
+        };
+
+        w(&mut b, 6); // version 6 (pre SQ-1616 terminators/echo_line)
+        w(&mut b, 1); // root window id
+        w(&mut b, 1); // current stream
+        w(&mut b, 1); // window count
+        // One window slot: a TextGrid leaf, present.
+        w(&mut b, 1); // present
+        w(&mut b, 1); // id
+        w(&mut b, WinType::TextGrid.to_arg()); // wintype
+        w(&mut b, 0); // rock
+        w(&mut b, 0); // parent
+        w(&mut b, 1); // stream (owns stream id 1)
+        w(&mut b, 0); // child1
+        w(&mut b, 0); // child2
+        w(&mut b, 0); // key
+        w(&mut b, 0); // method
+        w(&mut b, 0); // size
+        w(&mut b, 0); w(&mut b, 0); w(&mut b, 80); w(&mut b, 24); // rect
+        w(&mut b, 80); w(&mut b, 24); w(&mut b, 0); w(&mut b, 0); // grid
+        w(&mut b, 0); // no line_req
+        w(&mut b, 0); // no char_req
+        w(&mut b, 0); // mouse_req
+        w(&mut b, 0); // hyperlink_req
+        // v6 ends the window record HERE — no terminators/echo_line follow
+        // before the per-window style colours.
+        for _ in 0..NUMSTYLES {
+            zero_style_colour(&mut b);
+        }
+        // One stream slot: the window's own output stream.
+        w(&mut b, 1); // stream count
+        w(&mut b, 1); // present
+        w(&mut b, 1); // id
+        w(&mut b, 0); // rock
+        w(&mut b, 0); // style Normal
+        w(&mut b, 0); // link
+        w(&mut b, 0); // read_count
+        w(&mut b, 0); // write_count
+        w(&mut b, 0); // kind = Window
+        w(&mut b, 1); // win id
+        w(&mut b, 0); // file count
+        w(&mut b, 0); // fileref count
+        w(&mut b, 0); // file_streams count
+        w(&mut b, 0); // resource_streams count (v5+)
+        // (e) global style state (v6+): 2 rows x NUMSTYLES colours, then 2 rows x
+        // NUMSTYLES attrs.
+        for _ in 0..(2 * NUMSTYLES) {
+            zero_style_colour(&mut b);
+        }
+        for _ in 0..(2 * NUMSTYLES) {
+            zero_style_attrs(&mut b);
+        }
+
+        let m = Model::deserialize(&b).expect("a v6 snapshot still restores");
+        assert!(
+            !m.is_line_terminator(1, keycode::FUNC1),
+            "a pre-SQ-1616 snapshot carries no terminators — defaults to empty"
+        );
+        assert!(m.window_echo_line(1), "a pre-SQ-1616 snapshot defaults echo-line to on");
+
+        // And the restored model re-serializes as v7, round-tripping cleanly.
+        let again = Model::deserialize(&m.serialize()).expect("v7 re-serialize round-trips");
+        assert!(!again.is_line_terminator(1, keycode::FUNC1));
+        assert!(again.window_echo_line(1));
     }
 
     // A pre-SQ-0308 (version 4) snapshot — no trailing resource_streams table,
