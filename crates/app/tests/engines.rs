@@ -204,4 +204,6 @@ mod walkthrough_lostpig;
 mod walkthrough_hhgg;
 #[path = "suites/walkthrough_zork0.rs"]
 mod walkthrough_zork0;
+#[path = "suites/walkthrough_lurking_horror.rs"]
+mod walkthrough_lurking_horror;
 
