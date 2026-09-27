@@ -152,7 +152,11 @@ const SAVES: &[Row] = &[
             "evicting the oldest. Bounds memory on a long session; no 0 = unbounded.",
         ],
     ),
-    d("undo_levels", "16", &["Undo depth: retained in-memory snapshots. 0 disables undo."]),
+    d(
+        "undo_levels",
+        "16",
+        &["Undo depth for the game's own UNDO command: retained in-memory snapshots. 0 disables undo."],
+    ),
     d(
         "aux_storage",
         "\"ask\"",

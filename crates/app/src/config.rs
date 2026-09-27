@@ -1805,7 +1805,11 @@ pub struct Config {
     /// launch that actually failed to ask ever writes it.
     #[serde(default)]
     pub font_check_pending: bool,
-    /// Undo depth: max retained in-memory undo snapshots (default 16; 0 disables).
+    /// Undo depth for the story's own in-game `UNDO` command (the Z-machine
+    /// `save_undo`/`restore_undo` opcodes): max retained in-memory undo
+    /// snapshots (default 16; 0 disables). Distinct from
+    /// `record_turn_history`'s separate Rewind/replay history — the two share
+    /// no state.
     #[serde(default = "default_undo_levels")]
     pub undo_levels: usize,
     /// The prefix character that triggers slash-command routing (default: '/').
