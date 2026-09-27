@@ -2926,8 +2926,10 @@ pub struct V6FrameInputs<'a> {
     /// frame that is not Journey's shape ([`menu_strip_below_story`]).
     pub bottom_anchor_menu: bool,
     /// Native-pixel row TOPS a Hybrid host already lays out itself in terminal
-    /// cells — [`hybrid_chrome_layout`]'s own `runs`, each mapped through
-    /// `run.y.max(1) - 1` — published for a host that draws its own chrome
+    /// cells — [`hybrid_chrome_layout`]'s own [`V6HybridChromeLayout::text_rows`]
+    /// (`runs` AND `story_overlay` alike, SQ-1611 — a host that derives this by
+    /// hand from `runs` only misses any row `story_overlay` owns) — published
+    /// for a host that draws its own chrome
     /// under [`V6TextMode::RecordOnly`](crate::render::v6_layout::V6TextMode::RecordOnly)
     /// and so cannot reach the terminal's private glyph-row set itself
     /// (SQ-1609 Gap 2). Empty (every constructor's default) reproduces
@@ -5846,6 +5848,41 @@ impl V6HybridChromeLayout {
             divider_fills,
             story_overlay,
         }
+    }
+
+    /// The native-pixel row-top set [`V6FrameInputs::hybrid_text_rows`] wants
+    /// from a Hybrid-drawing host (SQ-1609 Gap 2, widened SQ-1611): every
+    /// [`runs`](Self::runs) entry's own `run.y`, mapped through
+    /// `run.y.max(1) - 1` — [`compose_v6_frame_into`]'s own `glyph_rows` key —
+    /// folded together with [`story_overlay`](Self::story_overlay)'s entries
+    /// through the SAME mapping.
+    ///
+    /// Both `Vec`s are chrome the host lays out itself in terminal cells —
+    /// `runs` is the ring's own text, `story_overlay` is chrome printed OVER
+    /// the story slot (Shogun's boot menu: "START the game" and its selection
+    /// bar) — so both need protecting from `compose_v6_frame_into`'s
+    /// reversed-gap fill the same way, or the composite bakes a stray block
+    /// under whichever one a host omitted. SQ-1609's own fix only walked
+    /// `runs`, which happened to be every chrome run on its one specimen
+    /// (Arthur, which never populates `story_overlay`); a host that copied
+    /// that walk verbatim for a frame that DOES populate `story_overlay`
+    /// (Shogun's boot menu) would silently miss those rows.
+    ///
+    /// Deliberately reads `.run.y` on both types, never either one's own
+    /// published `row` field: `V6HybridChromeRun::row` and
+    /// `V6HybridStoryOverlayRun::row` are two DIFFERENT terminal-cell spaces
+    /// (the chrome ring's own cells and the story box's own cells
+    /// respectively, via two different scale/offset computations), and
+    /// neither equals `run.y.max(1) - 1` — only `.run.y`, the shared
+    /// native-pixel value both types carry unchanged from the game's own
+    /// [`PxText`](crate::engine::PxText), is the key `TextLayer::SkipGlyphRows`
+    /// (`crate::render::v6_layout`) needs.
+    pub fn text_rows(&self) -> std::collections::HashSet<u16> {
+        self.runs
+            .iter()
+            .map(|r| r.run.y.max(1) - 1)
+            .chain(self.story_overlay.iter().map(|r| r.run.y.max(1) - 1))
+            .collect()
     }
 }
 
