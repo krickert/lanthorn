@@ -14,6 +14,7 @@
 use ratatui::layout::Rect;
 
 use crate::engine::Engine;
+use crate::engine_helpers::{glulx_session_opt, zvm_session_opt};
 use crate::glulx_session::GlulxSession;
 use crate::state::AppState;
 
@@ -115,9 +116,109 @@ pub fn set_glk_cell_px(session: &mut dyn Engine, state: &mut AppState, char_px: 
 /// Tell the story its pane is `(cols, rows)` cells, whatever the engine: the
 /// Z-machine header (when it changed) or a Glulx resize. Returns `true` when the
 /// story was told something new. A zero-area pane is ignored.
+///
+/// Honors `state.min_story_screen` (SQ-1596/SQ-1606): when set, `pane` is first
+/// bumped up to [`min_story_pane_for_floor`] before either engine call, so a
+/// live resize automatically re-derives the same floor boot/`@restart` already
+/// apply — a host only has to set `TerminalFacts::min_story_screen` once, at
+/// launch, and every later resize honors it with no extra work on its part.
+/// `None` (the default) leaves `pane` untouched, exactly as before this floor
+/// existed.
 pub fn set_story_pane(session: &mut dyn Engine, state: &AppState, pane: (u16, u16)) -> bool {
     if pane.0 == 0 || pane.1 == 0 {
         return false;
     }
+    let pane = match state.min_story_screen {
+        Some(floor) => min_story_pane_for_floor(session, state, pane, floor),
+        None => pane,
+    };
     sync_zvm_screen_dims(session, state, pane) | resize_glulx(session, pane)
+}
+
+/// The smallest story PANE `(cols, rows)` — at or above `real`, each dimension
+/// bumped independently — whose story-facing screen dims clear `floor` in
+/// that dimension, computed in PANE space rather than terminal space
+/// (SQ-1606).
+///
+/// [`boot::min_terminal_size_for_story_floor`](crate::host::boot::min_terminal_size_for_story_floor)
+/// answers the same question for a host that holds a TERMINAL size and calls
+/// it before `compute_pane_layout` runs (boot, `@restart`). A live resize's
+/// entry point, [`set_story_pane`], is downstream of that split already — its
+/// caller hands it the pane a host's own layout already carved (SQ-1539) — so
+/// a host at a live resize has no terminal size to feed the terminal-space
+/// search, and would otherwise have to re-derive one, or make a second call
+/// just to learn what pane the terminal-space answer yields (exactly the
+/// friction `sq1596_min_story_screen_floor.rs`'s
+/// `a_host_can_call_the_search_directly_at_a_live_resize` test has to route
+/// around).
+///
+/// Engine-aware, mirroring [`sync_zvm_screen_dims`]/[`resize_glulx`]'s own
+/// downcasts, since the chrome a pane crosses before reaching the story
+/// differs by engine:
+/// - a v4+, non-v6 Z-machine session applies the SAME
+///   [`declared_story_screen_dims`](crate::render::screen::declared_story_screen_dims)
+///   subtraction a live resize already applies to this exact pane
+///   ([`sync_zvm_screen_dims`]), searched one cell at a time via
+///   [`boot::bump_dim_for_floor`](crate::host::boot::bump_dim_for_floor) — the
+///   subtraction is fixed chrome, not a ratio, but this reuses that exact
+///   search rather than inverting it by hand;
+/// - a v1-3 or v6 session is exempt, matching `declared_story_screen_dims`'s
+///   own exemption: no floor applies to either, and `real` is returned
+///   unchanged;
+/// - a Glulx session has NO chrome subtraction at all — `resize_glulx`
+///   delivers the pane verbatim — so clearing the floor is the identity
+///   mapping: bump `real` directly against `floor`, no search needed;
+/// - neither engine (including a session this crate does not recognize)
+///   leaves `real` unchanged.
+///
+/// A pinned `virtual_screen_cols`/`virtual_screen_rows` wins over the floor in
+/// that dimension, exactly as it already wins in
+/// `min_terminal_size_for_story_floor` and in `story_screen_dims` itself.
+pub fn min_story_pane_for_floor(
+    session: &dyn Engine,
+    state: &AppState,
+    real: (u16, u16),
+    floor: (u16, u16),
+) -> (u16, u16) {
+    let (real_cols, real_rows) = real;
+    let (floor_cols, floor_rows) = floor;
+
+    if let Some(gs) = zvm_session_opt(session) {
+        let version = gs.machine.mem.version();
+        if version < 4 || version == 6 {
+            return real;
+        }
+        let boot_cols = gs.boot_screen_cols;
+        let probe = |pane: (u16, u16)| {
+            crate::render::screen::declared_story_screen_dims(
+                Rect::new(0, 0, pane.0, pane.1),
+                state,
+                version,
+                boot_cols,
+            )
+        };
+        let cols = if floor_cols == 0 || state.config.virtual_screen_cols.is_some() {
+            real_cols
+        } else {
+            crate::host::boot::bump_dim_for_floor(real_cols, floor_cols, |candidate| {
+                probe((candidate, real_rows.max(1))).map(|(_, cols)| cols)
+            })
+        };
+        let rows = if floor_rows == 0 || state.config.virtual_screen_rows.is_some() {
+            real_rows
+        } else {
+            crate::host::boot::bump_dim_for_floor(real_rows, floor_rows, |candidate| {
+                probe((real_cols.max(1), candidate)).map(|(rows, _)| rows)
+            })
+        };
+        return (cols, rows);
+    }
+
+    if glulx_session_opt(session).is_some() {
+        let cols = if floor_cols == 0 { real_cols } else { real_cols.max(floor_cols) };
+        let rows = if floor_rows == 0 { real_rows } else { real_rows.max(floor_rows) };
+        return (cols, rows);
+    }
+
+    real
 }

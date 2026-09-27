@@ -51,11 +51,14 @@
 use std::path::{Path, PathBuf};
 
 use app::config::Config;
+use app::engine::Engine;
 use app::engine_helpers::zvm_session_opt;
 use app::host::{
     boot_story, story_screen_in, BootRequest, BootedStory, LaunchFlags, QuietBoot, TerminalFacts,
 };
 use app::launch_options::LaunchOverrides;
+
+use crate::fixture_paths::fixture_path;
 
 const STORY: &str = "bureaucracy-r116-s870602.z4";
 
@@ -421,5 +424,224 @@ fn a_host_can_call_the_search_directly_at_a_live_resize() {
         "the terminal size returned by a direct host call must clear the floor once fed back \
          through the same pane-derivation the boot path uses: seeded={seeded:?} floor={FLOOR:?}"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ── SQ-1606 (reopened): the search reachable in PANE space, at a live resize ─
+//
+// A host at a live resize holds a PANE (the rect its own layout already carved
+// past the help bar and any other chrome), not a terminal size — exactly what
+// `host::screen::set_story_pane` takes. The case above still needs a second
+// call (`story_screen_in`) to learn what pane its terminal-space answer
+// yields; the cases below drive `set_story_pane` directly, in ONE call, the
+// way a host's resize poll actually would.
+
+/// The acceptance case: boot Bureaucracy with a floor in force, then simulate
+/// a LIVE RESIZE — a `set_story_pane` call at a too-small PANE, with no
+/// terminal size in sight — and confirm that ONE call lands the story's own
+/// declared header ($20/$21) at or above the floor.
+///
+/// `LIVE_RESIZE_PANE` is `NARROW`'s own ~14x9 derived pane (this suite's own
+/// module doc, confirmed empirically against `story_screen_in`), fed here
+/// directly as a pane rather than rederived from a terminal size — the whole
+/// point being that this test never calls `story_screen_in` or any
+/// terminal-space function at all.
+///
+/// Falsified by short-circuiting `set_story_pane`'s new
+/// `state.min_story_screen` floor-application step back to the pane
+/// unmodified: the resize below then leaves the header's row count under
+/// `FLOOR.1`, which this test's assertion catches.
+#[test]
+fn set_story_pane_at_a_live_resize_clears_the_floor_in_one_call() {
+    if !story_path().is_file() {
+        eprintln!("SKIP: {} absent", story_path().display());
+        return;
+    }
+    let home = app::scratch_dir("sq1606-zmachine-live-resize");
+    let (mut b, turn1) = boot_and_first_turn(
+        headless_config(&home),
+        TerminalFacts { size: Some((80, 24)), min_story_screen: Some(FLOOR), ..TerminalFacts::default() },
+        &home,
+    );
+    assert!(
+        !turn1.contains("[Screen too small.]"),
+        "premise: boots fine at a comfortable size; turn was {turn1:?}"
+    );
+
+    const LIVE_RESIZE_PANE: (u16, u16) = (14, 9);
+    let changed = app::host::screen::set_story_pane(&mut *b.session, &b.state, LIVE_RESIZE_PANE);
+    assert!(changed, "the resize down to a too-small pane must change the Z-machine header");
+
+    let (rows, cols) = declared_screen(&b);
+    assert!(
+        cols >= FLOOR.0 && rows >= FLOOR.1,
+        "one call to set_story_pane at a too-small LIVE pane must still clear the floor: \
+         got (rows={rows}, cols={cols}), floor={FLOOR:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Negative control for the case above: with `state.min_story_screen` cleared,
+/// the SAME too-small live pane is applied verbatim (today's unchanged
+/// behaviour) — proving the floor above is what does the work, not some
+/// unrelated floor already baked into the boot.
+#[test]
+fn set_story_pane_with_no_floor_applies_the_live_pane_verbatim() {
+    if !story_path().is_file() {
+        eprintln!("SKIP: {} absent", story_path().display());
+        return;
+    }
+    let home = app::scratch_dir("sq1606-zmachine-live-resize-no-floor");
+    let (mut b, _) = boot_and_first_turn(
+        headless_config(&home),
+        TerminalFacts { size: Some((80, 24)), ..TerminalFacts::default() },
+        &home,
+    );
+    assert_eq!(b.state.min_story_screen, None, "premise: no floor carried");
+
+    const LIVE_RESIZE_PANE: (u16, u16) = (14, 9);
+    app::host::screen::set_story_pane(&mut *b.session, &b.state, LIVE_RESIZE_PANE);
+
+    let (rows, _cols) = declared_screen(&b);
+    assert!(
+        rows < FLOOR.1,
+        "with no floor set, the too-small live pane's row count must NOT be bumped: got rows={rows}, floor={FLOOR:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// v1-3/v6 exemption: `min_story_pane_for_floor` mirrors
+/// `declared_story_screen_dims`'s own exemption — a v1-3 Z-machine story has
+/// no $20/$21 fields at all, so no floor logic can apply to one. This drives
+/// a minimal in-memory v3 story (the same shape `sq1598_glk_cell_px.rs`'s own
+/// `set_glk_cell_px_is_a_no_op_for_a_non_glulx_engine` builds) directly through
+/// `GameSession::new`, sets a floor on a throwaway `AppState`, and confirms
+/// `set_story_pane` applies the live pane completely unchanged.
+#[test]
+fn v1_to_3_stories_are_exempt_from_the_pane_space_floor_too() {
+    let mut buf = vec![0u8; 0x0100];
+    buf[0x00] = 3;
+    buf[0x04] = 0x00; // high memory
+    buf[0x06] = 0x40; // initial PC (v3: PC itself, not PC-1)
+    buf[0x08] = 0x40; // dictionary (empty-ish, unused)
+    buf[0x0A] = 0x10; // objects
+    buf[0x0C] = 0x20; // globals
+    buf[0x0E] = 0x00; // static memory
+    buf[0x40] = 0xBA; // QUIT
+    let mut sess = app::session::GameSession::new(buf, true, false, None).expect("a minimal v3 story boots");
+    let mut state = app::state::AppState::default();
+    state.min_story_screen = Some((80, 40)); // an outlandish floor no real pane clears
+    let tiny_pane = (10, 5);
+    app::host::screen::set_story_pane(&mut sess, &state, tiny_pane);
+    // v1-3 never writes $20/$21 in the first place — `sync_zvm_screen_dims`
+    // itself is a no-op for this version — so the only observable proof here
+    // is that the call does not panic and the header stays at its construction
+    // default (zvm never wrote it).
+    assert_eq!(sess.machine.mem.read_byte(0x20), 0, "v3: $20 is never written, floor or no floor");
+    assert_eq!(sess.machine.mem.read_byte(0x21), 0, "v3: $21 is never written, floor or no floor");
+}
+
+// ── Glulx: the identity mapping (no chrome subtraction at all) ─────────────
+
+/// Bureaucracy's own floor from above is meaningless to Glulx (a different
+/// story, a different screen model); this is its own specimen and its own
+/// floor, chosen only to be comfortably inside `chlorophyll.gblorb`'s usable
+/// range at a plain headless boot.
+const GLULX_FLOOR: (u16, u16) = (60, 30);
+
+fn glulx_story_path() -> PathBuf {
+    fixture_path("chlorophyll.gblorb")
+}
+
+fn boot_glulx(home: &Path, size: (u16, u16), min_story_screen: Option<(u16, u16)>) -> Option<BootedStory> {
+    let story = glulx_story_path();
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return None;
+    }
+    let overrides = LaunchOverrides::default();
+    let req = BootRequest {
+        story_path: story,
+        disk_entry: None,
+        overrides: &overrides,
+        cfg: headless_config(home),
+        data_base: home.join("saves"),
+        flags: LaunchFlags::default(),
+        terminal: TerminalFacts { size: Some(size), min_story_screen, ..TerminalFacts::default() },
+    };
+    Some(boot_story(req, &mut QuietBoot).expect("chlorophyll boots headlessly"))
+}
+
+/// The actual laid-out screen size gvm's own window tree covers — since
+/// SQ-1220 this is the whole pane for a plain single-window layout, so it is
+/// exactly what a resize's `(cols, rows)` argument becomes once
+/// `GlulxSession::resize` (no chrome subtraction, unlike the Z-machine side)
+/// applies it.
+fn glulx_content_size(session: &dyn Engine) -> (u16, u16) {
+    session.screen().content_size
+}
+
+/// The Glulx pane-space case: a too-small live pane must be bumped up to the
+/// floor with NO chrome subtraction at all — `GlulxSession::resize` applies
+/// whatever `set_story_pane` hands it verbatim, so this is the "identity"
+/// half of `min_story_pane_for_floor`'s contract.
+///
+/// Falsified the same way as the Z-machine case: short-circuit
+/// `set_story_pane`'s floor step and this test's assertion catches the
+/// pane landing at the too-small size instead of the floor.
+#[test]
+fn glulx_set_story_pane_bumps_a_too_small_pane_to_the_floor() {
+    let home = app::scratch_dir("sq1606-glulx-too-small");
+    let Some(mut b) = boot_glulx(&home, (80, 24), Some(GLULX_FLOOR)) else { return };
+
+    let too_small = (20, 10);
+    let changed = app::host::screen::set_story_pane(&mut *b.session, &b.state, too_small);
+    assert!(changed, "the resize to a too-small pane must change the Glulx screen");
+
+    let got = glulx_content_size(&*b.session);
+    assert!(
+        got.0 >= GLULX_FLOOR.0 && got.1 >= GLULX_FLOOR.1,
+        "a too-small live pane must be bumped to at least the floor with no chrome subtraction: \
+         got={got:?} floor={GLULX_FLOOR:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A pane already at/above the floor is left completely untouched — the
+/// identity mapping does not distort an already-adequate pane the way a
+/// naive "always clamp to floor" might.
+#[test]
+fn glulx_set_story_pane_leaves_an_already_adequate_pane_untouched() {
+    let home = app::scratch_dir("sq1606-glulx-already-adequate");
+    let Some(mut b) = boot_glulx(&home, (80, 24), Some(GLULX_FLOOR)) else { return };
+
+    let already_big = (90, 40);
+    assert!(already_big.0 >= GLULX_FLOOR.0 && already_big.1 >= GLULX_FLOOR.1, "premise");
+    app::host::screen::set_story_pane(&mut *b.session, &b.state, already_big);
+
+    let got = glulx_content_size(&*b.session);
+    assert_eq!(
+        got, already_big,
+        "a pane already clearing the floor must be applied EXACTLY as given, not distorted"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ── Default-unchanged: no floor set behaves byte-identical to before ───────
+
+/// `set_story_pane` with `state.min_story_screen == None` must behave exactly
+/// as it did before this floor mechanism existed: the pane it is handed is
+/// exactly the pane both engine calls receive, nothing bumped.
+#[test]
+fn set_story_pane_with_no_floor_is_unchanged_for_glulx_too() {
+    let home = app::scratch_dir("sq1606-glulx-no-floor");
+    let Some(mut b) = boot_glulx(&home, (80, 24), None) else { return };
+    assert_eq!(b.state.min_story_screen, None, "premise: no floor carried");
+
+    let pane = (20, 10); // deliberately below GLULX_FLOOR — must NOT be bumped
+    app::host::screen::set_story_pane(&mut *b.session, &b.state, pane);
+
+    let got = glulx_content_size(&*b.session);
+    assert_eq!(got, pane, "with no floor set, the pane is applied completely verbatim");
     let _ = std::fs::remove_dir_all(&home);
 }

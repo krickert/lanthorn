@@ -415,7 +415,14 @@ pub fn min_terminal_size_for_story_floor(
 /// under its own floor exactly as it would with no `min_story_screen` set —
 /// this function only ever WIDENS the seeded terminal size, never narrows it
 /// or fails the boot outright.
-fn bump_dim_for_floor(current: u16, floor: u16, probe: impl Fn(u16) -> Option<u16>) -> u16 {
+///
+/// `pub(super)` since SQ-1606: [`host::screen::min_story_pane_for_floor`]'s
+/// pane-space search reuses this exact one-cell-at-a-time sweep rather than
+/// forking it — only what it probes differs (a pane's own chrome subtraction
+/// instead of a terminal's pre-boot pane derivation).
+///
+/// [`host::screen::min_story_pane_for_floor`]: super::screen::min_story_pane_for_floor
+pub(super) fn bump_dim_for_floor(current: u16, floor: u16, probe: impl Fn(u16) -> Option<u16>) -> u16 {
     if probe(current).is_some_and(|v| v >= floor) {
         return current;
     }

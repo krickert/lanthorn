@@ -3656,14 +3656,19 @@ pub struct AppState {
     /// boundary a game's own bytecode can observe, e.g. `glk_window_get_size`)
     /// rounds once, since gvm's own layout model is integer pixels.
     pub glk_cell_px: Option<(f64, f64)>,
-    /// The host's own stated floor on the pre-boot story pane, carried from
+    /// The host's own stated floor on the story pane, carried from
     /// `TerminalFacts::min_story_screen` (SQ-1596) — `None` when the host left
-    /// no floor in force. Not itself read for anything past boot; kept so an
-    /// `@restart` (`host::reset`) re-applies the SAME floor the launch used
-    /// rather than silently reverting to the real terminal size, which for a
-    /// story below its own minimum (Bureaucracy's 40x19) means hitting
-    /// `[Screen too small.]` again on a restart the host already worked around
-    /// once (SQ-1602). Mirrors `glk_cell_px` just above.
+    /// no floor in force. Kept so an `@restart` (`host::reset`) re-applies the
+    /// SAME floor the launch used rather than silently reverting to the real
+    /// terminal size, which for a story below its own minimum (Bureaucracy's
+    /// 40x19) means hitting `[Screen too small.]` again on a restart the host
+    /// already worked around once (SQ-1602). Mirrors `glk_cell_px` just above.
+    ///
+    /// Also read at every LIVE resize (SQ-1606): `host::screen::set_story_pane`
+    /// consults this before either engine call, via
+    /// `host::screen::min_story_pane_for_floor`'s pane-space search, so a
+    /// resize honors the same floor with no extra work from the host beyond
+    /// setting this once at launch.
     pub min_story_screen: Option<(u16, u16)>,
     /// Bytes and frame flushes the ratatui backend has written to the terminal,
     /// for `/dump-terminal` (SQ-0994). `None` in every headless harness, which
