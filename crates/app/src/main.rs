@@ -86,40 +86,6 @@ impl From<app::state::ExitTarget> for RunOutcome {
     }
 }
 
-// ── Arrow-key withholding (SQ-0460) ──────────────────────────────────────────
-
-/// Whether an arrow keypress should be forwarded to the story as a ZSCII
-/// cursor code (129-132; ZMSD §3.8). Some v6 games bind arrows to movement;
-/// `v6_arrow_keys = false` withholds them so the key falls through to
-/// app-side handling (scrollback / map panning) instead. Only v6 is gated —
-/// v1-5 and Glulx stories always get arrows, regardless of `version`'s value
-/// for a non-Z-machine session (callers pass a version of 0 in that case).
-fn forward_arrow_to_v6(v6_arrow_keys: bool, version: u8) -> bool {
-    version != 6 || v6_arrow_keys
-}
-
-/// Whether `ki` is an arrow that `v6_arrow_keys = false` withholds from a v6
-/// story. Withholding applies ONLY at a line (`>`) prompt (`is_line_input`) —
-/// that's where movement-vs-panning conflicts, and v6 games list arrows in
-/// their terminating-characters table (SQ-0188), so an arrow would otherwise
-/// move the player from the prompt regardless of the setting. During CHAR
-/// input (`is_line_input = false`: menus, "press any key") arrows are NEVER
-/// withheld — those screens are unnavigable without them, so the setting has
-/// no say there and arrows always reach a v6 story (SQ-0483).
-fn withhold_arrow_from_v6(
-    ki: Option<app::engine::KeyInput>,
-    v6_arrow_keys: bool,
-    version: u8,
-    is_line_input: bool,
-) -> bool {
-    is_line_input
-        && ki.is_some_and(|ki| {
-            matches!(ki, app::engine::KeyInput::Up | app::engine::KeyInput::Down
-                | app::engine::KeyInput::Left | app::engine::KeyInput::Right)
-                && !forward_arrow_to_v6(v6_arrow_keys, version)
-        })
-}
-
 // ── Terminal restore helpers ──────────────────────────────────────────────────
 
 /// Restore the terminal to cooked mode and leave the alternate screen.
@@ -3299,7 +3265,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         // Shogun's startup menu, hint menus, "press any key" — are
                         // unnavigable without arrows, so the char gate never withholds
                         // (SQ-0483). Kept as a call for symmetry with the line gate.
-                        let withhold_arrow = withhold_arrow_from_v6(
+                        let withhold_arrow = app::host::input::withhold_arrow_from_v6(
                             ki,
                             state.config.v6_arrow_keys,
                             zvm_session_opt(&*session).map_or(0, |z| z.machine.mem.version()),
@@ -3345,38 +3311,27 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
                     );
                     if plain {
-                        let ki = app::engine::key_event_to_input(*k);
-                        // Withheld v6 arrows never act as line terminators either
-                        // (SQ-0460): without this, a v6 game listing arrows in its
-                        // terminating-characters table still moved the player from
-                        // the line prompt regardless of the setting.
-                        let withheld = withhold_arrow_from_v6(
-                            ki,
-                            state.config.v6_arrow_keys,
-                            zvm_session_opt(&*session).map_or(0, |z| z.machine.mem.version()),
-                            true,
-                        );
-                        let term = if withheld { None } else {
-                            ki.and_then(|ki| zvm_session_opt(&*session).and_then(|z| z.line_key_terminator(&ki)))
-                        };
-                        if let Some(term) = term {
-                            let cmd = state.take_input();
-                            // Command history, turn count and unsaved-progress
-                            // bookkeeping now live in `finish_command_turn`
-                            // itself (SQ-1545) — it runs first thing, before
-                            // the rest of that call below.
-                            let result = zvm_session_opt_mut(&mut *session)
-                                .expect("z-machine line read is pending")
-                                .submit_line_with_terminator(&cmd, term);
-                            if turn::finish_command_turn(
-                                // The read ended on a listed terminating
-                                // character, not a newline (SQ-0881).
-                                &cmd, false, result, &mut state, &mut mapper, &mut *session,
-                                &game_dir, &ifid, &arc_file, map_view(last_panes.map), &mut bg_tidy_counter,
-                            ).quit {
-                                break 'event_loop state.exit_target.into();
+                        // What a line-terminator key DOES — the v6-arrow
+                        // withholding gate (SQ-0460) and the story's own
+                        // terminating-characters table, applying the resulting
+                        // turn like a typed command — is the library's rule,
+                        // shared with every host (SQ-1610).
+                        if let Some(ki) = app::engine::key_event_to_input(*k) {
+                            let mut ctx = app::host::TurnCtx {
+                                game_dir: &game_dir,
+                                ifid: &ifid,
+                                arc_file: &arc_file,
+                                map_view: map_view(last_panes.map),
+                                bg_tidy_counter: &mut bg_tidy_counter,
+                            };
+                            if let Some(out) = app::host::input::deliver_line_key_terminator(
+                                &mut state, &mut mapper, &mut *session, &mut ctx, ki,
+                            ) {
+                                if out.quit {
+                                    break 'event_loop state.exit_target.into();
+                                }
+                                continue 'event_loop;
                             }
-                            continue 'event_loop;
                         }
                     }
                 }
@@ -4759,62 +4714,6 @@ mod tests {
         assert_eq!(super::term_exit_code(), 128 + signal_hook::consts::SIGTERM);
         // Leave the global back at its default so no other test observes a stray value.
         super::TERM_SIGNUM.store(0, Ordering::SeqCst);
-    }
-
-    // ── SQ-0460: withhold arrow keys from v6 stories ───────────────────────────
-
-    #[test]
-    fn forward_arrow_to_v6_gates_only_v6_when_disabled() {
-        // v6_arrow_keys = true: every version forwards arrows.
-        assert!(super::forward_arrow_to_v6(true, 6));
-        assert!(super::forward_arrow_to_v6(true, 5));
-        assert!(super::forward_arrow_to_v6(true, 0));
-
-        // v6_arrow_keys = false (the default, SQ-1087): only version 6 is
-        // withheld; v1-5 and the Glulx/no-session placeholder (version 0) still
-        // forward arrows.
-        assert!(!super::forward_arrow_to_v6(false, 6));
-        assert!(super::forward_arrow_to_v6(false, 5));
-        assert!(super::forward_arrow_to_v6(false, 3));
-        assert!(super::forward_arrow_to_v6(false, 0));
-    }
-
-    #[test]
-    fn withhold_arrow_from_v6_covers_all_arrows_and_only_arrows() {
-        use app::engine::KeyInput;
-        // The SQ-0188 line-terminator gate uses this predicate with
-        // is_line_input = true — v6 games list arrows as line terminators for
-        // movement, so gating read_char alone left arrows moving the player.
-        for arrow in [KeyInput::Up, KeyInput::Down, KeyInput::Left, KeyInput::Right] {
-            assert!(super::withhold_arrow_from_v6(Some(arrow), false, 6, true), "{arrow:?} withheld on v6 when off");
-            assert!(!super::withhold_arrow_from_v6(Some(arrow), true, 6, true), "{arrow:?} forwarded when on");
-            assert!(!super::withhold_arrow_from_v6(Some(arrow), false, 5, true), "{arrow:?} forwarded on v5");
-        }
-        // Non-arrows and no-input keys are never withheld.
-        assert!(!super::withhold_arrow_from_v6(Some(KeyInput::Enter), false, 6, true));
-        assert!(!super::withhold_arrow_from_v6(Some(KeyInput::Func(1)), false, 6, true));
-        assert!(!super::withhold_arrow_from_v6(None, false, 6, true));
-    }
-
-    #[test]
-    fn withhold_arrow_from_v6_never_withholds_during_char_input() {
-        use app::engine::KeyInput;
-        // SQ-0483: the char-input (read_char) gate calls the predicate with
-        // is_line_input = false. Menus (Shogun's startup menu, hint menus,
-        // "press any key") are unnavigable without arrows, so v6 arrows are
-        // ALWAYS delivered there — the setting has no say during char input.
-        for arrow in [KeyInput::Up, KeyInput::Down, KeyInput::Left, KeyInput::Right] {
-            // (a) setting off + char input pending → arrow IS delivered.
-            assert!(
-                !super::withhold_arrow_from_v6(Some(arrow), false, 6, false),
-                "{arrow:?} must reach a v6 menu even with the setting off",
-            );
-            // (c) setting on → delivered during char input too.
-            assert!(!super::withhold_arrow_from_v6(Some(arrow), true, 6, false));
-        }
-        // Contrast (b): the SAME arrow + setting off IS withheld at a line
-        // prompt — that path is covered above with is_line_input = true.
-        assert!(super::withhold_arrow_from_v6(Some(KeyInput::Up), false, 6, true));
     }
 
     // ── SQ-0297: map-export slash commands must actually write the file ────────

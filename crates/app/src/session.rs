@@ -5319,12 +5319,6 @@ impl GameSession {
         }
     }
 
-    /// While a Z-machine *line* read is active, decide whether a special key the
-    /// player pressed is one the game listed as a line terminator (v5+ table).
-    /// Only arrow keys and function keys are candidate terminators; Enter (13)
-    /// flows through the normal submit path, and all other keys are never
-    /// terminators. Returns the ZSCII terminator code to submit with, or `None`
-    /// to leave the key to its normal app behavior.
     /// Does the story want mouse input? ZMSD §11.1 "Flags 2" bit 5, which a game
     /// sets when it intends to read clicks (`read_mouse`, the header extension's
     /// X/Y words). Zork Zero, Arthur, Shogun, Journey and Scopa all set it;
@@ -5349,6 +5343,12 @@ impl GameSession {
         (self.wants_mouse() && self.is_terminator(SINGLE_CLICK as u16)).then_some(SINGLE_CLICK)
     }
 
+    /// While a Z-machine *line* read is active, decide whether a special key the
+    /// player pressed is one the game listed as a line terminator (v5+ table).
+    /// Only arrow keys and function keys are candidate terminators; Enter (13)
+    /// flows through the normal submit path, and all other keys are never
+    /// terminators. Returns the ZSCII terminator code to submit with, or `None`
+    /// to leave the key to its normal app behavior.
     pub fn line_key_terminator(&self, ki: &KeyInput) -> Option<u8> {
         match ki {
             KeyInput::Up | KeyInput::Down | KeyInput::Left | KeyInput::Right | KeyInput::Func(_) => {}
