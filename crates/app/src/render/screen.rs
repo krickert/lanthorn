@@ -910,6 +910,13 @@ fn render_node(
                 // is what SQ-0750 asks for and what the composite structurally cannot
                 // do — it rasterises every character on the screen.
                 if state.config.v6_render == crate::config::V6RenderMode::Hybrid {
+                    // Hoisted above the takeover decision below (SQ-1620): that
+                    // decision now needs the host's own font metrics too, to ask
+                    // `story_slot_grid_wider_than_viewport` whether a story-slot
+                    // GRID fits the viewport at this pane. Reused at its old spot
+                    // further down instead of recomputed.
+                    let fs = picker.font_size();
+                    let cell_px = (fs.width, fs.height);
                     // WHICH arm decided this frame's route, published for
                     // `/dump-terminal` (SQ-0994). The routing test already computes
                     // it and used to throw it away, so a `Cell` store costs the
@@ -917,9 +924,22 @@ fn render_node(
                     // because by the time a command runs the live frame is the
                     // palette's. `None` with no story window at all: that is a
                     // fall-through the hatch never got to judge.
-                    let takeover = layout
-                        .story
-                        .and_then(|s| picture_takeover_reason(s, &layout.chrome, layout.story_gfx, native));
+                    //
+                    // SQ-1620: `story_slot_grid_wider_than_viewport` ORs in — cheaply,
+                    // it bails before building anything unless the story slot is
+                    // actually a `Grid` — the one shape `picture_takeover_reason`
+                    // itself cannot see (it has no pane/cell_px to size a viewport
+                    // with at all): a story-slot GRID whose own columns outrun the
+                    // terminal viewport this pane's font would give it. Without this,
+                    // the ring below draws the grid 1:1 via `draw_grid_transparent`,
+                    // which clips silently to the viewport width exactly as
+                    // `hybrid_story_slot_grid` does — see that function and
+                    // `story_slot_grid_wider_than_viewport`'s own doc for the full
+                    // reasoning and the InvisiClues specimen this fixes.
+                    let takeover = layout.story.and_then(|s| {
+                        picture_takeover_reason(s, &layout.chrome, layout.story_gfx, native)
+                            .or_else(|| story_slot_grid_wider_than_viewport(&layout, s, native, area, cell_px, state))
+                    });
                     state.v6_takeover_reason.set(takeover);
                     if let Some(story) = layout.story.filter(|_| takeover.is_none()) {
                         // The op log's frame boundary (SQ-0590) opens HERE, not at
@@ -980,8 +1000,6 @@ fn render_node(
                         // cost 3-8 ms per redraw on a 640x400 press and was paid per
                         // keystroke and per frame of any animation.
                         let hkey = v6_hybrid_gen(items, state, area, picker, story);
-                        let fs = picker.font_size();
-                        let cell_px = (fs.width, fs.height);
                         let cached = state.graphics_render.borrow_mut().hybrid.take().filter(|f| f.key == hkey);
                         let replayed = cached.is_some();
                         let frame = match cached {
@@ -6074,6 +6092,16 @@ pub fn hybrid_chrome_layout(
     // recomputes, exactly like `compose_v6_frame` does for the raster path, so
     // any value here is fine; 0 is simplest.
     let frame = build_hybrid_frame_with(0, layout, story, native, pane, cell_px, true, true, 0, default_fg, default_bg, state);
+    // SQ-1620: a story-slot GRID wider (in its own native columns) than the
+    // viewport just built for it has no ring to draw either — see
+    // [`story_slot_grid_wider_than_viewport`], the same check the terminal's
+    // own draw and [`hybrid_story_slot_grid`] make, reusing the frame already
+    // built here instead of a second one.
+    if let WinNode::Grid(g) = &story.node {
+        if frame.scale.s >= 1.0 && g.cols > frame.viewport.width {
+            return None;
+        }
+    }
     Some(V6HybridChromeLayout::from_frame(&frame, layout, pane, native, cell_px, state.v6_text.cell()))
 }
 
@@ -6439,6 +6467,20 @@ pub fn hybrid_story_slot_grid(
     let frame = build_hybrid_frame_with(0, layout, story, native, pane, cell_px, true, true, 0, default_fg, default_bg, state);
     let viewport = frame.viewport;
     if viewport.width == 0 || viewport.height == 0 {
+        return None;
+    }
+    // SQ-1620: the grid's own columns outrun what this pane's viewport can
+    // show at all, AND this pane is upscaling the native screen (not just too
+    // small to show it all — see [`story_slot_grid_wider_than_viewport`]'s own
+    // doc for why that second condition matters) — clipping to
+    // `viewport.width` below would silently drop the grid's right-hand column
+    // (the InvisiClues menu at a narrow pane / large font).
+    // `picture_takeover_reason` cannot see this itself (it has no pane/cell_px
+    // to compute a viewport with); this is the same check
+    // [`story_slot_grid_wider_than_viewport`] makes for the terminal's own
+    // draw and [`hybrid_chrome_layout`], reusing the frame already built here
+    // instead of building a second one.
+    if frame.scale.s >= 1.0 && g.cols > viewport.width {
         return None;
     }
     let rows = viewport.height.min(g.rows);
@@ -7389,6 +7431,22 @@ fn hybrid_raster_fallback_reason(
     if story_present && takeover.is_none() {
         return None; // the chrome ring draws this frame
     }
+    // SQ-1620: the painted-screen path below walks CHROME runs only
+    // (`paint_runs(&layout.chrome)`) — right for every OTHER reason this
+    // function fires, because each of those means the story window's own
+    // content is either a full-screen PICTURE (nothing to lose by skipping
+    // straight to the composite) or altogether absent (`"no_story_window"`,
+    // SQ-0711's own Scopa/hint case, where the whole screen genuinely IS
+    // chrome). A story-slot GRID too wide for its viewport is neither: the
+    // story window is real, on-screen, and carries its own topic list that
+    // the painted-screen path never looks at — so unlike every other reason
+    // here, taking that shortcut for THIS one would draw the header banner
+    // and silently drop the whole grid instead of the one clipped column the
+    // ring itself would have dropped. Skip the shortcut and fall straight to
+    // the raster composite, which draws the grid's own text like any other.
+    if takeover == Some("grid_wider_than_viewport") {
+        return takeover;
+    }
     if !painted_ground && runs_have_text {
         return None; // the coherent all-text painted-screen path draws it
     }
@@ -7563,6 +7621,86 @@ pub fn picture_takeover_reason(
         }
     }
     None
+}
+
+/// SQ-1620: does a story-slot GRID's own column count outrun the terminal
+/// viewport Hybrid would actually place it in, at THIS pane?
+///
+/// A sibling to [`picture_takeover_reason`] rather than a fourth arm inside
+/// it, because it asks a different kind of question: every arm in that
+/// function reasons over native PIXELS alone (is there art, does it fill or
+/// enclose the screen) and needs no pane or font metrics at all — which is
+/// why `hybrid_bottom_plan_for` (SQ-1574) can call it with nothing but
+/// `native`. This check is the opposite shape: the story window carries no
+/// art of its own and is exactly where the game put it, but the GRID inside
+/// it is wider, in its own native columns, than the TERMINAL cells
+/// `build_hybrid_frame_with`'s own viewport — the same one
+/// [`hybrid_story_slot_grid`] publishes to a host and the real hybrid-ring
+/// draw places the grid's cells at — would give it at this pane's font size.
+/// Zork Zero's Amiga InvisiClues topic list (58 native columns) at a 59-column
+/// pane with a 20x44px cell computes a 43-column viewport (measured;
+/// `sq1620_grid_wider_than_viewport.rs`'s
+/// `narrow_pane_falls_to_raster_and_shows_the_whole_grid` pins it), and
+/// [`draw_grid_transparent`](crate::render::upper_window::draw_grid_transparent)'s
+/// `cols.min(grid.cols)` clip (identical to `hybrid_story_slot_grid`'s own)
+/// then silently drops the right-hand column of topics — "AS A LAST RESORT",
+/// "FOR YOUR AMUSEMENT" — with no ring geometry anywhere on the frame able to
+/// show it.
+///
+/// Needing `pane`/`cell_px`/`state` to answer this is exactly why it cannot
+/// live inside `picture_takeover_reason` itself without forcing every one of
+/// that function's callers to acquire them — `hybrid_bottom_plan_for` has
+/// neither and answers a question ("which bottom plan") that does not need
+/// them for its other three callers. The three callers that DO already carry
+/// this geometry (the terminal's own hybrid-ring dispatch, [`hybrid_chrome_layout`],
+/// [`hybrid_story_slot_grid`]) each OR this into their own
+/// `picture_takeover_reason` call instead, so a host reading either published
+/// function and the terminal's real draw cannot disagree.
+///
+/// Deliberately builds the same [`HybridFrame`] `hybrid_story_slot_grid`
+/// builds to answer this — not a cheaper approximation from the story
+/// window's own declared box — because the viewport it must match is that
+/// exact one: `story_text_native`'s art inset can narrow it further than the
+/// window's raw `w_px`, and a narrower approximation could pass a grid this
+/// check would have caught.
+///
+/// **Only fires when this pane is UPSCALING the native screen
+/// (`frame.scale.s >= 1.0`)** — measured, this is what tells the reported
+/// defect apart from `v6_hint_menu_mouse.rs`'s own pinned 50-column pane
+/// (8x16 cell), which ALSO clips this same grid (58/62 native columns into a
+/// viewport nowhere near that wide) and must NOT change route: at 50 columns
+/// the pane's own device-pixel width is smaller than the native 640px screen
+/// (`scale.s` measures 0.625 there), so nothing — raster included — can show
+/// more of the grid without shrinking it past legibility; the clip is the
+/// pane genuinely not having the room, exactly like any other terminal too
+/// small for the content it is asked to show, and today's ring still answers
+/// mouse clicks on it (`v6_hint_menu_mouse.rs`'s whole premise). At the
+/// reported 59-column pane with its 20x44px cell, `scale.s` measures 1.84 —
+/// the native screen is being ENLARGED into a pane that already has more
+/// device pixels than the game's own picture — so the story window's 58/62
+/// native columns, once scaled, occupy far more device-pixel width than the
+/// viewport's cell-quantized answer credits them with; the shortfall is
+/// `native_viewport_box`'s inward-rounding throwing away real resolution the
+/// pane already has, not the pane being too small. Raster does not round to
+/// whole terminal cells at all, so it recovers exactly that thrown-away
+/// resolution.
+///
+/// `None` whenever the story slot is not a `Grid` at all (every ordinary
+/// gameplay screen, checked first and cheaply — the frame is built only for
+/// the rare Grid-story-slot case), this pane is downscaling, or the grid's
+/// columns fit anyway.
+fn story_slot_grid_wider_than_viewport(
+    layout: &crate::render::v6_layout::V6Layout<'_>,
+    story: &crate::engine::PositionedWindow,
+    native: (u16, u16),
+    pane: Rect,
+    cell_px: (u16, u16),
+    state: &AppState,
+) -> Option<&'static str> {
+    let WinNode::Grid(g) = &story.node else { return None };
+    let (default_fg, default_bg) = v6_host_pair(state);
+    let frame = build_hybrid_frame_with(0, layout, story, native, pane, cell_px, true, true, 0, default_fg, default_bg, state);
+    (frame.scale.s >= 1.0 && g.cols > frame.viewport.width).then_some("grid_wider_than_viewport")
 }
 
 /// Does the story window's own plate paint anything at all (SQ-0725)?
