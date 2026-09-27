@@ -584,3 +584,119 @@ fn reset_game_does_not_pause_when_the_new_banner_fits() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── `resume_from_turn` (SQ-1619) ────────────────────────────────────────────
+
+/// `host::persist::resume_from_turn` is the library core `Action::ReplayResume`
+/// now calls: restore the engine to a recorded turn's snapshot, rewind the
+/// transcript/map/history to match it, and re-observe (and recenter on) the
+/// resumed room. Exercised directly here, the way a non-terminal host would —
+/// not only through the TUI's key handler.
+///
+/// Driven against minizork, a v3 story: its location is Global Variable 0, read
+/// straight out of restored dynamic memory, so it resolves immediately after a
+/// rewind's bare Quetzal snapshot with no screen carried alongside it (unlike a
+/// v4+ status-line story, whose location needs the upper window `restore_state`
+/// deliberately blanks — see its own doc comment — so it stays undetected until
+/// the game's next repaint; that is a pre-existing, separate limitation of a
+/// snapshot with no screen, not something this test is about).
+#[test]
+fn resume_from_turn_rewinds_engine_transcript_map_and_recenters() {
+    let story = fixture_path("minizork-r34-s871124.z3");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-resume-from-turn");
+    let mut b = boot(story, &home);
+    b.state.config.record_turn_history = true;
+
+    let start_room = here(&b);
+    assert_eq!(start_room.as_deref(), Some("West of House"));
+    let _ = command(&mut b, "south"); // turn 1: a new room -> map snapshot recorded
+    assert_eq!(here(&b).as_deref(), Some("South of House"));
+    let _ = command(&mut b, "west"); // turn 2: back to the start
+    assert_eq!(here(&b), start_room);
+    let _ = command(&mut b, "south"); // turn 3: forward again
+    assert_eq!(here(&b).as_deref(), Some("South of House"));
+
+    assert_eq!(b.state.history.len(), 3, "premise: three recorded turns");
+    assert!(b.state.history[0].map_snapshot.is_some(), "premise: turn 1 added a room");
+    assert_eq!(b.state.turns, 3);
+
+    // Rewind to turn 1 (history index 0): back in South of House, one turn in.
+    b.state.scroll = (999, 999); // sentinel: proves the recenter below actually moved it
+    let result = app::host::persist::resume_from_turn(
+        &mut *b.session, &mut b.mapper, &mut b.state, 0, Some((80, 24)),
+    );
+    assert!(result.ok && result.redraw, "a resume within range succeeds: {result:?}");
+    assert_eq!(here(&b).as_deref(), Some("South of House"), "the engine restored to turn 1's snapshot");
+    assert_eq!(b.state.turns, 1, "the turn counter rewound with it");
+    assert_eq!(b.state.history.len(), 1, "later turns are discarded (linear rewind)");
+    assert_eq!(
+        b.state.transcript_kinds.len(), b.state.transcript.len(),
+        "transcript and its kinds stay length-matched"
+    );
+    assert_eq!(
+        b.state.transcript_runs.len(), b.state.transcript.len(),
+        "and its style-run/paragraph sidecars"
+    );
+    assert_eq!(b.state.transcript_para.len(), b.state.transcript.len());
+    let transcript = b.state.transcript.join("\n");
+    assert!(transcript.contains("> south"), "the echoed command survives the rebuild: {transcript:?}");
+    assert!(
+        transcript.contains("facing the south side"),
+        "and turn 1's own output: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("mailbox") && !transcript.contains("> west"),
+        "only turn 1 is rebuilt, nothing from the discarded turns 2-3: {transcript:?}"
+    );
+    assert_ne!(b.state.scroll, (999, 999), "the map pane recenters on the resumed room");
+    assert_eq!(
+        b.state.notifications.latest_text(), Some("Resumed from turn 1"),
+        "a notice names the turn resumed to"
+    );
+    assert!(!b.state.unsaved_progress, "resuming a recorded (already-saved) turn leaves nothing unsaved");
+
+    // Perturb, then assert (restore tests must move past the resume point before
+    // trusting it): the resumed session plays on from turn 1, not from where it
+    // was before the rewind.
+    let _ = command(&mut b, "west");
+    assert_eq!(here(&b), start_room, "play continues from the resumed turn");
+    assert_eq!(b.state.turns, 2);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `idx` past the end of `state.history` is a no-op: nothing about the engine,
+/// transcript, map or history is touched, and no notice is pushed.
+#[test]
+fn resume_from_turn_out_of_range_index_is_a_no_op() {
+    let story = fixture_path("minizork-r34-s871124.z3");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-resume-from-turn-oob");
+    let mut b = boot(story, &home);
+    b.state.config.record_turn_history = true;
+    let _ = command(&mut b, "south");
+    assert_eq!(b.state.history.len(), 1, "premise: one recorded turn");
+
+    let before_loc = here(&b);
+    let before_turns = b.state.turns;
+    let before_transcript = b.state.transcript.clone();
+
+    let result = app::host::persist::resume_from_turn(
+        &mut *b.session, &mut b.mapper, &mut b.state, 1, Some((80, 24)),
+    );
+    assert_eq!(result, app::host::persist::Rewound::default(), "out of range: nothing happened");
+    assert_eq!(here(&b), before_loc);
+    assert_eq!(b.state.turns, before_turns);
+    assert_eq!(b.state.transcript, before_transcript);
+    assert_eq!(b.state.history.len(), 1, "history untouched");
+    assert_eq!(b.state.notifications.latest_text(), None, "no notice for a no-op");
+
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -37,7 +37,7 @@ use mapper::layer::LayerId;
 use app::render::screen::render_story_pane;
 use app::render::draw_str_clipped;
 use app::engine::Engine;
-use app::session::{apply_turn, TurnResult};
+use app::session::TurnResult;
 use app::hints;
 use app::keymap::Context;
 use app::render::hintbar::{hint_bar, ANIM_HINTS, GAME_HINTS};
@@ -62,8 +62,8 @@ use app::host::turn::{format_rfc3339, reobserve_location};
 use crate::ingame_io::{delete_save_confirmed, handle_save_as};
 use crate::reset::reset_game;
 use app::engine_helpers::{
-    engine_supports_save, engine_tag, glulx_session_opt_mut, restore_error_msg, zvm_session_mut,
-    zvm_session_opt, zvm_session_opt_mut,
+    engine_supports_save, glulx_session_opt_mut, restore_error_msg, zvm_session_mut, zvm_session_opt,
+    zvm_session_opt_mut,
 };
 
 // ── Run outcome ─────────────────────────────────────────────────────────────
@@ -4077,64 +4077,16 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
 
             // ── Replay/rewind: linear resume from the selected turn ────────────
             Action::ReplayResume => {
+                // What resuming from a picked turn does is the library's rule
+                // (`host::persist::resume_from_turn`, SQ-1619) — shared with every
+                // other host instead of hand-rolled here.
                 if let Some(r) = state.overlays.replay.take() {
-                    if r.idx < state.history.len() {
-                        let plan = app::history::resume_plan(&state.history, r.idx);
-                        // History snapshots come from the running engine; wrap them
-                        // with its tag so restore_state accepts them (both engines).
-                        let es = app::engine::EngineSave::new(engine_tag(&*session), 1, plan.save.clone());
-                        match session.restore_state(&es) {
-                            Ok(()) => {
-                                if let Some(json) = &plan.map_json {
-                                    if let Ok(m) = mapper::persist::from_json(json) {
-                                        mapper = m;
-                                    }
-                                }
-                                // Linear: discard later turns.
-                                state.history.truncate(r.idx + 1);
-                                let (lines, kinds) =
-                                    app::history::rebuild_transcript(&state.history, r.idx);
-                                state.transcript = lines;
-                                state.clear_anchor = None;
-                                state.transcript_kinds = kinds;
-                                // History replay carries no style runs; keep the
-                                // parallel vecs length-synced (unstyled, left rows).
-                                state.transcript_runs = vec![Vec::new(); state.transcript.len()];
-                                state.transcript_para = vec![app::state::ParaFmt::default(); state.transcript.len()];
-                                state.reset_transcript_sidecars();
-                                // Rebuilt from the replayed transcript (SQ-1135): a
-                                // rewind to turn 4 offers the words turn 4 had printed.
-                                app::input::refresh_seen_words(&mut state, &*session);
-                                state.turns = plan.turn;
-                                state.unsaved_progress = false; // resumed a past (saved) turn
-                                // A rewind may have swapped `mapper` in wholesale above (when
-                                // `plan.map_json` parsed); its `struct_gen` starts back at 0, so a
-                                // generation-number check alone could coincidentally match the
-                                // stale cache's — drop it outright instead (SQ-1544).
-                                state.invalidate_map_render();
-                                // Resuming a past turn is a restore: the watch describes a death
-                                // in a timeline this one has replaced (SQ-0671, SQ-0673).
-                                state.death_watch = Default::default();
-                                // Re-observe current location (mirror the restore path).
-                                if let Some(snap) = session.current_location() {
-                                    let rid = snap.number as mapper::graph::RoomId;
-                                    let restore_result = TurnResult::observation(snap);
-                                    apply_turn(
-                                        &mut mapper,
-                                        "",
-                                        &restore_result,
-                                        &mut state.death_watch,
-                                    );
-                                    state.set_viewed_layer(None);
-                                    state.select_room(Some(rid));
-                                }
-                                state.push_notice(&format!("[Resumed from turn {}]", plan.turn));
-                            }
-                            Err(e) => {
-                                state.push_notice(&format!("[Resume failed: {}]", restore_error_msg(e)));
-                            }
-                        }
-                    }
+                    // Nothing left to react to: the event loop already forces a
+                    // redraw for every dispatched action, and a failed/out-of-range
+                    // resume already pushed its own notice.
+                    let _ = app::host::persist::resume_from_turn(
+                        &mut *session, &mut mapper, &mut state, r.idx, map_view(last_panes.map),
+                    );
                 }
             }
 

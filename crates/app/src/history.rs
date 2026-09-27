@@ -78,6 +78,32 @@ pub fn map_at_turn(history: &[Arc<TurnRecord>], turn: u32) -> Option<&str> {
         .find_map(|r| r.map_snapshot.as_deref())
 }
 
+/// One recorded turn, read-only: enough for a host to list what's in
+/// `history` and know which entries changed the map, without reaching into
+/// `TurnRecord`'s own fields (its `save`/`map_snapshot` bytes included).
+#[derive(Debug, Clone)]
+pub struct TurnSummary {
+    pub turn: u32,
+    pub command: String,
+    /// Whether this turn's own `map_snapshot` is present — the same
+    /// only-stored-when-changed invariant [`record_turn`] and [`TurnRecord`]
+    /// document, so a `true` here is exactly a turn [`map_at_turn`] can serve.
+    pub map_changed: bool,
+}
+
+/// Summarize every recorded turn, in order, for a host that wants to list
+/// `history` (a rewind/replay picker) without touching `TurnRecord` directly.
+pub fn turn_summaries(history: &[Arc<TurnRecord>]) -> Vec<TurnSummary> {
+    history
+        .iter()
+        .map(|rec| TurnSummary {
+            turn: rec.turn,
+            command: rec.command.clone(),
+            map_changed: rec.map_snapshot.is_some(),
+        })
+        .collect()
+}
+
 /// What a linear resume from `history[idx]` needs: the VM save to restore, the
 /// reconstructed map JSON at-or-before that turn (if any), and the turn number.
 #[derive(Debug, Clone)]
