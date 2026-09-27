@@ -202,4 +202,6 @@ mod walkthrough_adventureland;
 mod walkthrough_lostpig;
 #[path = "suites/walkthrough_hhgg.rs"]
 mod walkthrough_hhgg;
+#[path = "suites/walkthrough_zork0.rs"]
+mod walkthrough_zork0;
 
