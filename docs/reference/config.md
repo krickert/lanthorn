@@ -22,7 +22,7 @@ Every setting `~/.lanthorn/config.toml` accepts, grouped the way the seeded temp
 | `prompt_load_on_launch` | `true` |  | When auto_load is off, offer to resume a save found on launch. |
 | `record_turn_history` | `false` |  | Record a per-turn rewind/replay history into the archive. Opt-in: it grows the archive and keeps per-turn blobs in memory. |
 | `history_turns` | `500` |  | How many of the most recent turns record_turn_history retains before evicting the oldest. Bounds memory on a long session; no 0 = unbounded. |
-| `undo_levels` | `16` |  | Undo depth: retained in-memory snapshots. 0 disables undo. |
+| `undo_levels` | `16` |  | Undo depth for the game's own UNDO command: retained in-memory snapshots. 0 disables undo. |
 | `aux_storage` | `"ask"` |  | Where v5 auxiliary save data goes: "ask" (default), "archive", "global". |
 
 ## Interface
