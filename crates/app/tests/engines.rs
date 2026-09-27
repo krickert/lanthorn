@@ -198,4 +198,6 @@ mod sq1598_glk_cell_px;
 mod walkthroughs;
 #[path = "suites/walkthrough_adventureland.rs"]
 mod walkthrough_adventureland;
+#[path = "suites/walkthrough_lostpig.rs"]
+mod walkthrough_lostpig;
 
