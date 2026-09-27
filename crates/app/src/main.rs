@@ -707,15 +707,22 @@ fn draw_frame(
         *state.v6_paint.borrow_mut() = engine.paint_surface();
         // During replay the map shows the reconstructed snapshot for the selected turn.
         let replay_graph: Option<mapper::graph::MapGraph> = state.overlays.replay.as_ref().map(|r| {
-            let snap = state
-                .history
-                .get(r.idx)
+            let rec = state.history.get(r.idx);
+            let snap = rec
                 .map(|rec| rec.turn)
                 .and_then(|turn| app::history::map_at_turn(&state.history, turn))
                 .and_then(|json| mapper::persist::from_json(json).ok());
             // Replaying a turn before the first map snapshot has no recorded
             // map — show an empty map, never the live (future) graph.
-            snap.map(|m| m.graph).unwrap_or_default()
+            let mut graph = snap.map(|m| m.graph).unwrap_or_default();
+            // The snapshot's own `current` is frozen at whichever (possibly
+            // earlier, structurally-changing) turn produced it — override with
+            // the SELECTED turn's own recorded location (SQ-1621), never
+            // perturbing `struct_gen` (`MapGraph::set_current` doesn't bump it).
+            if let Some(loc) = rec.and_then(|rec| rec.location) {
+                graph.set_current(loc);
+            }
+            graph
         });
 
         // During tidy-animation playback the map shows the current captured stage, not the live graph.

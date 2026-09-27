@@ -390,6 +390,13 @@ struct HistoryIndexEntry {
     turn: u32,
     command: String,
     has_map: bool,
+    /// [`crate::history::TurnRecord::location`] / `location_name` (SQ-1621).
+    /// `#[serde(default)]`: an archive written before these existed has
+    /// neither key, which deserializes as `None` for both.
+    #[serde(default)]
+    location: Option<mapper::graph::RoomId>,
+    #[serde(default)]
+    location_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -965,6 +972,8 @@ pub(crate) fn build_archive_bytes(
                 turn: r.turn,
                 command: r.command.clone(),
                 has_map: r.map_snapshot.is_some(),
+                location: r.location,
+                location_name: r.location_name.clone(),
             })
             .collect();
         let index_json =
@@ -1410,6 +1419,8 @@ pub fn load_archive(path: &Path) -> io::Result<ArchiveContents> {
                     save,
                     map_snapshot,
                     transcript,
+                    location: e.location,
+                    location_name: e.location_name,
                 }));
             }
             out
@@ -1895,9 +1906,11 @@ mod tests {
         let map_json = mapper::persist::to_json(&mapper);
         let history = vec![
             std::sync::Arc::new(TurnRecord { turn: 1, command: "look".into(), save: vec![1, 2, 3],
-                map_snapshot: Some(map_json.clone()), transcript: "West of House".into() }),
+                map_snapshot: Some(map_json.clone()), transcript: "West of House".into(),
+                location: Some(1), location_name: Some("West of House".into()) }),
             std::sync::Arc::new(TurnRecord { turn: 2, command: "wait".into(), save: vec![4, 5, 6, 7],
-                map_snapshot: None, transcript: "Time passes.".into() }),
+                map_snapshot: None, transcript: "Time passes.".into(),
+                location: None, location_name: None }),
         ];
 
         let path = temp_archive_path("history-rt");
@@ -1912,9 +1925,13 @@ mod tests {
         assert_eq!(ac.history[0].save, vec![1, 2, 3], "save bytes byte-identical");
         assert_eq!(ac.history[0].map_snapshot.as_deref(), Some(map_json.as_str()));
         assert_eq!(ac.history[0].transcript, "West of House");
+        // SQ-1621: `location`/`location_name` round-trip through the archive too.
+        assert_eq!(ac.history[0].location, Some(1));
+        assert_eq!(ac.history[0].location_name.as_deref(), Some("West of House"));
         assert_eq!(ac.history[1].save, vec![4, 5, 6, 7]);
         assert!(ac.history[1].map_snapshot.is_none(), "no-change turn has no map");
         assert_eq!(ac.history[1].transcript, "Time passes.");
+        assert!(ac.history[1].location.is_none(), "a record built with no location loads as None");
     }
 
     #[test]
@@ -2017,10 +2034,12 @@ mod tests {
             std::sync::Arc::new(TurnRecord {
                 turn: 1, command: "look".into(), save: vec![1, 2, 3],
                 map_snapshot: None, transcript: "West of House".into(),
+                location: None, location_name: None,
             }),
             std::sync::Arc::new(TurnRecord {
                 turn: 2, command: "wait".into(), save: vec![4, 5, 6, 7],
                 map_snapshot: None, transcript: "Time passes.".into(),
+                location: None, location_name: None,
             }),
         ];
         let path = temp_archive_path("reuse-basic");
@@ -2045,6 +2064,7 @@ mod tests {
             std::sync::Arc::new(TurnRecord {
                 turn: 3, command: "north".into(), save: vec![8, 9],
                 map_snapshot: None, transcript: "Forest".into(),
+                location: None, location_name: None,
             }),
         ];
         let session2 = SessionRecord { history: &history2, ..SessionRecord::empty() };
@@ -2107,6 +2127,7 @@ mod tests {
         let history: Vec<std::sync::Arc<TurnRecord>> = vec![std::sync::Arc::new(TurnRecord {
             turn: 1, command: "look".into(), save: vec![9, 9, 9],
             map_snapshot: None, transcript: "A room.".into(),
+            location: None, location_name: None,
         })];
         let session = SessionRecord { history: &history, ..SessionRecord::empty() };
 
@@ -2137,6 +2158,7 @@ mod tests {
         let other_history: Vec<std::sync::Arc<TurnRecord>> = vec![std::sync::Arc::new(TurnRecord {
             turn: 1, command: "xyzzy".into(), save: vec![1, 1, 1, 1, 1],
             map_snapshot: None, transcript: "Somewhere else entirely, a long way from here.".into(),
+            location: None, location_name: None,
         })];
         let other_session = SessionRecord { history: &other_history, ..SessionRecord::empty() };
         let other_bytes = build_archive_bytes(
@@ -2202,10 +2224,12 @@ mod tests {
             std::sync::Arc::new(TurnRecord {
                 turn: 1, command: "one".into(), save: save1.clone(),
                 map_snapshot: None, transcript: "First turn text.".into(),
+                location: None, location_name: None,
             }),
             std::sync::Arc::new(TurnRecord {
                 turn: 2, command: "two".into(), save: save2.clone(),
                 map_snapshot: None, transcript: "Second turn text.".into(),
+                location: None, location_name: None,
             }),
         ];
         let path = temp_archive_path("reuse-rewind-replay");

@@ -700,3 +700,146 @@ fn resume_from_turn_out_of_range_index_is_a_no_op() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── SQ-1621 / SQ-1622 ────────────────────────────────────────────────────────
+
+/// `TurnRecord::location_name` (SQ-1621) reflects the room the player actually
+/// stood in on THAT turn, even when the turn made no structural change and so
+/// has no `map_snapshot` of its own. And the replay overlay's map reconstruction
+/// — `from_json` off the latest at-or-before snapshot, then `MapGraph::set_current`
+/// with the SELECTED turn's own `location` (the fix landed in `main.rs`'s
+/// `replay_graph`) — flags the correct room current, not whichever room was
+/// current when that older snapshot was serialized.
+///
+/// Minizork's own geography: `n` → North of House (new room), `e` → Behind
+/// House (new room), `open window` (no move), `west` → Kitchen (new room,
+/// through the window), `west` → Living Room (new room), `east` → back to
+/// Kitchen — an ALREADY-KNOWN room, so this last turn makes no structural
+/// change and gets no `map_snapshot` of its own; the latest snapshot
+/// at-or-before it is Living Room's.
+#[test]
+fn replay_location_names_the_turns_own_room_not_an_older_snapshots() {
+    let story = fixture_path("minizork-r34-s871124.z3");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-replay-location");
+    let mut b = boot(story, &home);
+    b.state.config.record_turn_history = true;
+
+    let _ = command(&mut b, "n"); // turn 1: North of House (new room, new conn)
+    let _ = command(&mut b, "e"); // turn 2: Behind House (new room, new conn)
+    let _ = command(&mut b, "open window"); // turn 3: no move
+    let _ = command(&mut b, "west"); // turn 4: Kitchen (new room, new conn)
+    assert_eq!(here(&b).as_deref(), Some("Kitchen"));
+    let _ = command(&mut b, "west"); // turn 5: Living Room (new room, new conn Kitchen--west-->LivingRoom)
+    assert_eq!(here(&b).as_deref(), Some("Living Room"));
+    let _ = command(&mut b, "east"); // turn 6: Kitchen again — already-known room, but the
+    // REVERSE connection (LivingRoom--east-->Kitchen) hasn't been walked before, so this still
+    // counts as a structural change and gets its OWN snapshot (current = Kitchen at turn 6).
+    assert_eq!(here(&b).as_deref(), Some("Kitchen"));
+    let _ = command(&mut b, "west"); // turn 7: Living Room — the SAME connection as turn 5's
+    // (Kitchen--west-->LivingRoom), already known, so this turn is truly non-structural: no new
+    // room, no new connection, no map_snapshot of its own.
+    assert_eq!(here(&b).as_deref(), Some("Living Room"));
+
+    assert_eq!(b.state.history.len(), 7, "premise: seven recorded turns");
+    let last = &b.state.history[6];
+    assert_eq!(last.turn, 7);
+    assert!(last.map_snapshot.is_none(), "premise: turn 7 made no structural change");
+    assert_eq!(
+        last.location_name.as_deref(), Some("Living Room"),
+        "SQ-1621: this turn's own room, not Kitchen's (turn 6's frozen snapshot)"
+    );
+
+    // Reconstruct the map exactly the way `main.rs`'s fixed `replay_graph` does:
+    // the latest at-or-before snapshot, then override `current` with THIS
+    // turn's own recorded location.
+    let snap = app::history::map_at_turn(&b.state.history, last.turn)
+        .and_then(|json| mapper::persist::from_json(json).ok())
+        .expect("a baseline snapshot exists at-or-before turn 7 (turn 6's)");
+    let mut graph = snap.graph;
+    let living_room_id = last.location.expect("turn 7 recorded a location");
+    let kitchen_id = graph.current().expect("turn 6's snapshot has a current room");
+    assert_ne!(
+        living_room_id, kitchen_id,
+        "premise: turn 6's frozen snapshot's own baked `current` (Kitchen) differs from turn 7's \
+         own room (Living Room) — the bug this fix closes"
+    );
+    assert_eq!(graph.room(kitchen_id).map(|r| r.name.as_str()), Some("Kitchen"));
+    graph.set_current(living_room_id);
+
+    let rm = mapper::render::render(&graph);
+    let living_room_row = rm.rooms.iter().find(|r| r.id == living_room_id)
+        .expect("Living Room is in the reconstructed graph");
+    assert!(living_room_row.is_current, "the reconstructed graph flags Living Room — this turn's room — current");
+    for r in &rm.rooms {
+        if r.id != living_room_id {
+            assert!(!r.is_current, "only Living Room is current, not room {} ({})", r.id, r.label);
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1622: recording history switched on mid-game — after the mapper has
+/// already explored rooms — must not leave the retained history with zero
+/// `map_snapshot`s anywhere until the map next structurally changes. The
+/// quest's own named repro: Lost Pig, explore first with recording off, turn
+/// recording on, then make one move that finds no new room.
+///
+/// Lost Pig opens in pitch dark: Grunk must `smell` (repeatedly — the direction
+/// is randomized per attempt, but `random_seed: Some(1)` in `headless_config`
+/// makes the sequence deterministic run to run) until it reveals which way the
+/// pig went, then walk that way to fall into the Hole — the mapper's second
+/// room. Recording then switches on, and `look` (no move) is the first
+/// recorded turn: no structural change of its own.
+#[test]
+fn recording_switched_on_mid_game_still_has_a_baseline_snapshot() {
+    let story = fixture_path("LostPig.z8");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-recording-mid-game");
+    let mut b = boot(story, &home);
+    assert!(!b.state.config.record_turn_history, "premise: recording starts off");
+
+    // Explore a little with recording off — the mapper accumulates rooms, but
+    // nothing lands in `state.history`.
+    let mut dir = None;
+    for _ in 0..10 {
+        let before = b.state.transcript.len();
+        let _ = command(&mut b, "smell");
+        let new_lines = &b.state.transcript[before..];
+        dir = ["northeast", "northwest", "southeast", "southwest", "north", "south", "east", "west"]
+            .into_iter()
+            .find(|d| new_lines.iter().any(|l| l.contains(d)));
+        if dir.is_some() {
+            break;
+        }
+    }
+    let _ = command(&mut b, dir.expect("smell reveals a direction within 10 tries (deterministic seed)"));
+    assert!(b.state.history.is_empty(), "premise: nothing recorded yet");
+    assert!(b.mapper.graph.rooms().count() >= 2, "premise: the mapper already has rooms (fell into the Hole)");
+
+    // Switch recording on, then make a move that finds no new room — `look`
+    // never moves — no structural change on this first recorded turn.
+    b.state.config.record_turn_history = true;
+    let rooms_before = b.mapper.graph.rooms().count();
+    let _ = command(&mut b, "look");
+    assert_eq!(b.mapper.graph.rooms().count(), rooms_before, "premise: no new room this turn");
+
+    assert_eq!(b.state.history.len(), 1, "premise: exactly one recorded turn so far");
+    assert!(
+        b.state.history[0].map_snapshot.is_some(),
+        "SQ-1622: the very first recorded turn always carries a baseline snapshot"
+    );
+    assert!(
+        app::history::map_at_turn(&b.state.history, b.state.turns).is_some(),
+        "SQ-1622: so a viewer of the current turn has a map to show, not an empty one"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
