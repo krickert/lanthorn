@@ -17,7 +17,7 @@ Every setting `~/.lanthorn/config.toml` accepts, grouped the way the seeded temp
 | Key | Default | Note | Description |
 |---|---|---|---|
 | `auto_load` | `true` |  | Restore game state from the archive on startup so play resumes where it left off. Set false to start fresh while keeping the accumulated map. |
-| `auto_save` | `false` |  | Save the archive after every turn, on top of the exit-save and Ctrl+S. |
+| `auto_save` | `true` |  | Save the archive after every turn, on top of the exit-save and Ctrl+S quick-save. |
 | `prompt_save_on_quit` | `true` |  | When auto_save is off, offer to save on quit. |
 | `prompt_load_on_launch` | `true` |  | When auto_load is off, offer to resume a save found on launch. |
 | `record_turn_history` | `false` |  | Record a per-turn rewind/replay history into the archive. Opt-in: it grows the archive and keeps per-turn blobs in memory. |

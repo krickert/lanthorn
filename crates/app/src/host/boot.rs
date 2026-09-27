@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use mapper::mapper::Mapper;
 use ratatui::layout::Rect;
 
-use crate::archive::load_archive;
+use crate::archive::{load_archive, read_archive_meta};
 use crate::config::{Cli, Config};
 use crate::engine::Engine;
 use crate::engine_helpers::{restore_error_msg, zvm_session_opt_mut};
@@ -34,7 +34,7 @@ use crate::hints;
 use crate::ifid::compute_ifid;
 use crate::session::{apply_turn, GameSession};
 use crate::state::AppState;
-use crate::storage::{default_state_path, game_dir as story_game_dir, story_key_for, DiskBuild};
+use crate::storage::{default_state_path, game_dir as story_game_dir, quick_save_state_path, story_key_for, DiskBuild};
 
 use super::{flush_screen_trace, flush_v6_trace};
 
@@ -183,8 +183,18 @@ pub struct BootedStory {
     pub state: AppState,
     pub game_dir: PathBuf,
     pub ifid: String,
-    /// `<game_dir>/default.lanthorn`, the auto-save / resume archive.
+    /// `<game_dir>/default.lanthorn`, the per-turn/exit auto-save slot.
     pub arc_file: PathBuf,
+    /// `<game_dir>/quick-save.lanthorn`, the manual quick-save slot (Ctrl+S /
+    /// bare `/save-state` / the quit dialog's "Save State & quit") — kept apart
+    /// from `arc_file` so a quick-save survives the next auto-save (SQ-1624).
+    pub quick_save_file: PathBuf,
+    /// Whichever of `arc_file` / `quick_save_file` THIS boot actually resumed
+    /// from (the newer of the two, by `Meta::saved_at`) — the archive the
+    /// launch-resume dialog's stashed save/transcript came from, so accepting
+    /// it (`apply_launch_resume`) re-reads the map/turns from the SAME file
+    /// rather than always `arc_file` (SQ-1624).
+    pub resume_source_file: PathBuf,
     pub story_bytes: Vec<u8>,
     pub story_path: PathBuf,
     pub data_base: PathBuf,
@@ -1283,6 +1293,22 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     // and created before the engine build too. The IFID stays for title/hint/
     // display and the per-game style reload below.
     let arc_file = default_state_path(&game_dir);
+    let quick_save_file = quick_save_state_path(&game_dir);
+
+    // Two reserved slots can each hold a resume point (SQ-1624): the auto-save's
+    // `arc_file` and the manual quick-save's `quick_save_file`. Boot picks
+    // whichever was saved more recently (by `Meta::saved_at`, which is a
+    // zero-padded RFC3339 string — chronological order IS string order) as the
+    // one to auto-load/offer, so a manual Ctrl+S checkpoint isn't buried by the
+    // very next per-turn auto-save landing in the OTHER file. Falls back to
+    // `arc_file` when neither is readable, so the `.exists()` check below still
+    // reports "nothing to resume" exactly as before.
+    let resume_path = match (read_archive_meta(&arc_file), read_archive_meta(&quick_save_file)) {
+        (Ok(a), Ok(q)) if q.saved_at > a.saved_at => quick_save_file.clone(),
+        (Ok(_), _) => arc_file.clone(),
+        (Err(_), Ok(_)) => quick_save_file.clone(),
+        (Err(_), Err(_)) => arc_file.clone(),
+    };
 
     // Load mapper (and optionally restore the game save) from the archive.
     let mut startup_transcript: crate::state::LoadedTranscript = None;
@@ -1304,8 +1330,8 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     // Whether this boot actually resumed a past game (auto_load on, a save
     // present, and the restore succeeded) — `BootedStory::resumed` (SQ-1545).
     let mut resumed = false;
-    let mut mapper = if arc_file.exists() {
-        match load_archive(&arc_file) {
+    let mut mapper = if resume_path.exists() {
+        match load_archive(&resume_path) {
             Ok(ac) => {
                 // Restore the machine from the saved game state only when auto_load is enabled.
                 if cfg.auto_load {
@@ -1352,7 +1378,7 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
                 if cfg.auto_load { ac.mapper } else { Mapper::default() }
             }
             Err(e) => {
-                hooks.console(&format!("warning: could not load archive {}: {}", arc_file.display(), e));
+                hooks.console(&format!("warning: could not load archive {}: {}", resume_path.display(), e));
                 Mapper::default()
             }
         }
@@ -1837,6 +1863,8 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
         game_dir,
         ifid,
         arc_file,
+        quick_save_file,
+        resume_source_file: resume_path,
         story_bytes,
         story_path,
         data_base,

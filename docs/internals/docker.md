@@ -135,8 +135,10 @@ longer costs the player anything.
 `--auto-save on`, so the resume archive in `/data` is rewritten as each turn
 completes and again on the way out. This is a flag on the command line rather
 than a line written into `/data/.lanthorn/config.toml`, deliberately: the
-container's cadence must never silently become the player's own setting, and a
-desktop lanthorn still ships with `auto_save = false`. `LANTHORN_WEB_AUTOSAVE=off`
+container's cadence must never silently become the player's own setting, even
+though a desktop lanthorn now ships with `auto_save = true` by default too
+(SQ-1624) — the container's flag is a one-run override, not a config write, so
+it never depends on what the desktop default happens to be. `LANTHORN_WEB_AUTOSAVE=off`
 turns it off; an explicit `--auto-save off` after `serve` wins over both.
 
 **And the game outlives the connection.** Each visitor's page mints a session id

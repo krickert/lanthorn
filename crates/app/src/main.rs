@@ -1928,6 +1928,8 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         game_dir,
         ifid,
         arc_file,
+        quick_save_file,
+        resume_source_file,
         story_bytes,
         story_path,
         data_base,
@@ -2773,7 +2775,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         // & quit"; carry the reason out so it can be printed once
                         // the terminal is back (SQ-0651).
                         quit_save_warning =
-                            lifecycle::quit_dialog_save(&mut *session, &mapper, &state, &ifid, &arc_file);
+                            lifecycle::quit_dialog_save(&mut *session, &mapper, &state, &ifid, &quick_save_file);
                         break 'event_loop state.exit_target.into();
                     }
                     OverlayAct::QuitQuit => {
@@ -2791,7 +2793,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     OverlayAct::LaunchResume => {
                         if let Some((save, lines, kinds, screen)) = state.pending_resume.take() {
                             state.overlays.launch_dialog = false;
-                            turn::apply_launch_resume(&save, lines, kinds, screen, &mut *session, &mut mapper, &mut state, map_view(last_panes.map), &arc_file);
+                            turn::apply_launch_resume(&save, lines, kinds, screen, &mut *session, &mut mapper, &mut state, map_view(last_panes.map), &resume_source_file);
                         }
                     }
                     OverlayAct::LaunchNewGame => {
@@ -3360,7 +3362,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         let outcome = slash::parse_in_context(&s, state.config.command_prefix, ctx);
                         let should_break = dispatch_slash_outcome(
                             outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                            &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                            &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                             last_panes.map, last_panes.story, true,
                         );
                         if close_leader {
@@ -3524,7 +3526,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                 );
                                 let should_break = dispatch_slash_outcome(
                                     outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                                    &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                                    &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                                     last_panes.map, last_panes.story, true,
                                 );
                                 lifecycle::flush_pending_config_write(&mut state);
@@ -3573,7 +3575,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                     );
                                     let should_break = dispatch_slash_outcome(
                                         outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                                        &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                                        &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                                         last_panes.map, last_panes.story, true,
                                     );
                                     lifecycle::flush_pending_config_write(&mut state);
@@ -3635,7 +3637,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         );
                         let should_break = dispatch_slash_outcome(
                             outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                            &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                            &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                             last_panes.map, last_panes.story, true,
                         );
                         lifecycle::flush_pending_config_write(&mut state);
@@ -3867,7 +3869,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         let outcome = slash::parse(body, state.config.command_prefix);
                         let should_break = dispatch_slash_outcome(
                             outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                            &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                            &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                             last_panes.map, last_panes.story, false,
                         );
                         lifecycle::flush_pending_config_write(&mut state);
@@ -5432,7 +5434,11 @@ mod tests {
         use app::state::AppState;
 
         let mut s = AppState::default();
-        // Default: auto_save = false, prompt_save_on_quit = true, unsaved_progress = false
+        // SQ-1624 flipped the config default to auto_save = true; this case is
+        // about the auto_save=false branch specifically, so set it explicitly
+        // rather than relying on what the default happens to be.
+        s.config.auto_save = false;
+        // auto_save = false, prompt_save_on_quit = true, unsaved_progress = false
         // No prompt with no unsaved progress (fresh, or just saved/loaded).
         assert!(!should_prompt_save_on_quit(&s), "no unsaved progress => no prompt");
 

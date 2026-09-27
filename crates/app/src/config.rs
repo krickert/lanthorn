@@ -1564,8 +1564,8 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub auto_load: bool,
     /// When true, save the archive after every game turn (in addition to the
-    /// exit-save and Ctrl+S quick-save). Default false.
-    #[serde(default)]
+    /// exit-save and Ctrl+S quick-save). Default true.
+    #[serde(default = "default_true")]
     pub auto_save: bool,
     /// When true, invert mouse-wheel scroll direction (for terminals reporting
     /// "natural" scrolling). Default false = conventional direction.
@@ -2333,7 +2333,7 @@ impl Default for Config {
             user_dir: default_user_dir(),
             default_story_dir: None,
             auto_load: true,
-            auto_save: false,
+            auto_save: true,
             mouse_wheel_invert: false,
             mouse: true,
             command_bar: false,
@@ -3686,9 +3686,9 @@ use_defaults = false
     }
 
     #[test]
-    fn auto_save_defaults_false() {
+    fn auto_save_defaults_true() {
         let cfg = Config::default();
-        assert!(!cfg.auto_save, "auto_save must default to false");
+        assert!(cfg.auto_save, "auto_save must default to true (SQ-1624)");
     }
 
     #[test]
@@ -3950,7 +3950,7 @@ use_defaults = false
             user_dir: dir.clone(),
             default_story_dir: None,
             auto_load: false,
-            auto_save: true,
+            auto_save: false,
             mouse_wheel_invert: false,
             mouse: true,
             command_bar: false,
@@ -4023,7 +4023,7 @@ use_defaults = false
 
         // Scalars are set.
         assert_eq!(doc["auto_load"].as_bool(), Some(false));
-        assert_eq!(doc["auto_save"].as_bool(), Some(true));
+        assert_eq!(doc["auto_save"].as_bool(), Some(false));
         assert_eq!(doc["background_tidy"].as_str(), Some("on_overlap"));
         assert_eq!(doc["split_ratio"].as_integer(), Some(70));
         assert_eq!(doc["inv_dock_pct"].as_integer(), Some(25));
@@ -4906,7 +4906,8 @@ use_defaults = false
     /// `--auto-save on` turns the per-turn resume write on for ONE run, in both
     /// directions and without persisting — the shape the container's browser mode
     /// needs (SQ-1323), where a dropped websocket can end the process at any
-    /// moment and the stock `auto_save = false` means nothing was ever written.
+    /// moment and a config file that turns `auto_save` back off means nothing
+    /// was written for that run.
     #[test]
     fn auto_save_flag_overrides_the_file_for_one_run_only() {
         let dir = crate::scratch_dir("autosave-flag");

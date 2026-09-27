@@ -11,7 +11,7 @@ pub struct SaveInfo {
     /// Absolute path to the `.lanthorn` file.
     pub path: PathBuf,
     /// Human-readable name (slug-form for named saves, "(default)" for the
-    /// quick-save slot).
+    /// auto-save slot, "(quick save)" for the manual quick-save slot — SQ-1624).
     pub name: String,
     /// Turn counter at save time.
     pub turns: u32,
@@ -21,7 +21,10 @@ pub struct SaveInfo {
     pub location: Option<String>,
     /// Score at save time (None for v4+ Z-machine, Glulx, and legacy saves).
     pub score: Option<i32>,
-    /// True for the default (IFID-only) quick-save slot.
+    /// True for either reserved system slot — `default.lanthorn` (auto-save) or
+    /// `quick-save.lanthorn` (manual quick-save, SQ-1624) — never a name the
+    /// player typed. Sorted first by [`list_saves`] and excluded from
+    /// named-save lookup.
     pub is_default: bool,
     /// What wrote this save, and therefore whether its game bytes are portable
     /// (SQ-0531). A bare `.qzl` is always `Ingame` — it IS a standard game save;
@@ -31,10 +34,12 @@ pub struct SaveInfo {
 
 /// List all Save-State files in a game dir (SQ-0284).
 ///
-/// Discovers `default.lanthorn` (default slot) and `<slug>.lanthorn` (named
-/// slots) inside `game_dir`, reads their `Meta`, and returns sorted results:
-/// default slot first, then named saves sorted by `saved_at` descending (newest
-/// first). Files that fail to parse are silently skipped.
+/// Discovers `default.lanthorn` (auto-save slot), `quick-save.lanthorn`
+/// (manual quick-save slot, SQ-1624) and `<slug>.lanthorn` (named slots)
+/// inside `game_dir`, reads their `Meta`, and returns sorted results: the two
+/// reserved slots first (default, then quick-save), then named saves sorted
+/// by `saved_at` descending (newest first). Files that fail to parse are
+/// silently skipped.
 pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
     let entries = match std::fs::read_dir(game_dir) {
         Ok(e) => e,
@@ -50,7 +55,8 @@ pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
         if !fname.ends_with(".lanthorn") {
             continue;
         }
-        let is_default = fname == "default.lanthorn";
+        let is_quick_save = fname == "quick-save.lanthorn";
+        let is_default = fname == "default.lanthorn" || is_quick_save;
 
         // Read only meta.json; skip on failure (corrupt/unsupported → not listed).
         let meta = match crate::archive::read_archive_meta(&path) {
@@ -58,7 +64,9 @@ pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
             Err(_) => continue,
         };
 
-        let name = if is_default {
+        let name = if is_quick_save {
+            "(quick save)".to_string()
+        } else if is_default {
             "(default)".to_string()
         } else {
             // The slug is the filename stem (`<slug>.lanthorn`).
@@ -79,12 +87,19 @@ pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
         });
     }
 
-    // Sort: default first, then by saved_at descending (newer saves sort earlier).
+    // Sort: the two reserved slots first (default before quick-save), then
+    // named saves by saved_at descending (newer saves sort earlier).
     infos.sort_by(|a, b| {
         match (a.is_default, b.is_default) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => b.saved_at.cmp(&a.saved_at),
+            (false, false) => b.saved_at.cmp(&a.saved_at),
+            (true, true) => {
+                // "(default)" sorts before "(quick save)" among the reserved
+                // pair (ascending string order already gives this); named
+                // saves never reach this arm.
+                a.name.cmp(&b.name)
+            }
         }
     });
 
@@ -190,7 +205,7 @@ pub fn named_save_path(game_dir: &Path, name: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "save name is empty after sanitization"));
     }
     if crate::storage::is_reserved_slug(&slug) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "\"default\" is a reserved save name"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("\"{slug}\" is a reserved save name")));
     }
     Ok(game_dir.join(format!("{}.lanthorn", slug)))
 }
@@ -232,10 +247,13 @@ pub fn existing_save_display_name(path: &Path) -> Option<String> {
 /// cosmetically different string that slugifies the same) is a no-op on the
 /// file and just rewrites `meta.json` in place.
 pub fn rename_save(path: &Path, new_name: &str) -> io::Result<()> {
-    if path.file_name().and_then(|n| n.to_str()) == Some("default.lanthorn") {
+    if matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("default.lanthorn") | Some("quick-save.lanthorn")
+    ) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the default save slot cannot be renamed",
+            "a reserved save slot cannot be renamed",
         ));
     }
     let game_dir = path.parent().ok_or_else(|| {
@@ -443,7 +461,7 @@ fn game_save_path(game_dir: &Path, name: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "save name is empty after sanitization"));
     }
     if crate::storage::is_reserved_slug(&slug) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "\"default\" is a reserved save name"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("\"{slug}\" is a reserved save name")));
     }
     Ok(game_dir.join(format!("{}.qzl", slug)))
 }
@@ -710,6 +728,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// SQ-1624: "Quick Save" slugifies to "quick-save" — reserved for the
+    /// manual quick-save slot exactly like "default" is for the auto-save slot.
+    #[test]
+    fn save_named_rejects_reserved_quick_save_slug() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("reserved-quick-save");
+        let mapper = Mapper::default();
+        let ifid = "ZCODE-1-TEST00-0011";
+
+        let err = super::save_named(&dir, ifid, "Quick Save", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty())
+            .expect_err("reserved slug must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dir.join("quick-save.lanthorn").exists(), "must not clobber the quick-save slot");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn list_saves_ordering_default_first() {
         let Some(machine) = fake_machine() else { return };
@@ -737,6 +772,33 @@ mod tests {
         let names: Vec<&str> = saves[1..].iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"save-a"), "save-a should be present");
         assert!(names.contains(&"save-b"), "save-b should be present");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1624: the manual quick-save slot is a SECOND reserved entry, labeled
+    /// distinctly from the auto-save slot and sorted right after it — ahead of
+    /// any named save regardless of timestamp.
+    #[test]
+    fn list_saves_labels_and_orders_the_quick_save_slot() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("quick-save-label");
+        let mapper = Mapper::default();
+        let ifid = "ZCODE-1-TEST00-0010";
+
+        let default_path = crate::storage::default_state_path(&dir);
+        crate::archive::save_archive(&default_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("default save ok");
+        let quick_save_path = crate::storage::quick_save_state_path(&dir);
+        crate::archive::save_archive(&quick_save_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("quick-save ok");
+        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+
+        let saves = super::list_saves(&dir);
+        assert_eq!(saves.len(), 3, "should find 3 saves (default + quick-save + 1 named)");
+        assert!(saves[0].is_default && saves[0].name == "(default)", "default slot sorts first: {saves:?}");
+        assert!(saves[1].is_default && saves[1].name == "(quick save)", "quick-save slot sorts second: {saves:?}");
+        assert!(!saves[2].is_default && saves[2].name == "save-a", "named save sorts last: {saves:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -907,6 +969,25 @@ mod tests {
         let err = super::rename_save(&default_path, "My Quicksave").expect_err("default slot must refuse rename");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(default_path.exists(), "default file untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1624: the manual quick-save slot is reserved exactly like the
+    /// default/auto-save slot — renaming it would desync `list_saves`'s
+    /// hard-coded "(quick save)" label from `Meta::name`.
+    #[test]
+    fn rename_save_rejects_the_quick_save_slot() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("rename-quick-save");
+        let mapper = Mapper::default();
+        let quick_save_path = crate::storage::quick_save_state_path(&dir);
+        crate::archive::save_archive(&quick_save_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("quick-save ok");
+
+        let err = super::rename_save(&quick_save_path, "My Checkpoint").expect_err("quick-save slot must refuse rename");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(quick_save_path.exists(), "quick-save file untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

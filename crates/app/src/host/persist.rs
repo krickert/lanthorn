@@ -72,11 +72,12 @@ fn write_save_state(
     .map_err(|e| e.to_string())
 }
 
-/// Save on exit ONLY when auto_save is enabled. With auto_save off (the default),
-/// nothing is saved automatically — the user controls saving via the quit prompt's
-/// "Save State & quit", the /save-state command, or named save slots. This keeps
-/// "Quit without saving" honest and avoids silently overwriting an explicit save
-/// point on exit.
+/// Save on exit ONLY when auto_save is enabled (the default, since SQ-1624).
+/// With auto_save off, nothing is saved automatically on exit — the user
+/// controls saving via the quit prompt's "Save State & quit", the
+/// /save-state command, or named save slots. This keeps "Quit without
+/// saving" honest and avoids silently overwriting an explicit save point on
+/// exit.
 ///
 /// Exit auto-save is engine-neutral: the save routes through Engine::save_state
 /// (Quetzal for zvm, the gvm snapshot for Glulx); screen.bin is written for

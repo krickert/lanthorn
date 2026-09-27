@@ -326,6 +326,37 @@ fn write_resume_archive(b: &mut BootedStory) {
     .expect("the resume archive writes");
 }
 
+/// [`write_resume_archive`] to an arbitrary path with an explicit `saved_at`
+/// (SQ-1624): boot compares the two reserved slots by this timestamp, so a
+/// case proving "the newer one wins" needs to set it directly rather than
+/// relying on wall-clock ordering between two fast in-process writes.
+fn write_resume_archive_to(b: &mut BootedStory, path: &Path, saved_at: &str) {
+    let meta = app::archive::Meta {
+        format_version: app::archive::CURRENT_FORMAT_VERSION,
+        ifid: Some(b.ifid.clone()),
+        name: None,
+        turns: b.state.turns,
+        saved_at: saved_at.to_string(),
+        location: b.state.current_room_name.clone(),
+        score: None,
+        trigger: app::archive::SaveTrigger::HostState,
+    };
+    let screen = app::engine_helpers::zvm_session_opt(&*b.session).map(|z| z.machine.screen.clone());
+    app::archive::save_archive_meta_pics(
+        path,
+        &b.mapper,
+        &b.session.save_state(),
+        screen.as_ref(),
+        b.session.aux_data(),
+        meta,
+        &app::archive::SessionRecord::of(&b.state),
+        &[],
+        None,
+        None,
+    )
+    .expect("the resume archive writes");
+}
+
 fn tail(b: &BootedStory, n: usize) -> Vec<String> {
     let t = &b.state.transcript;
     t[t.len().saturating_sub(n)..].to_vec()
@@ -375,6 +406,79 @@ fn a_second_boot_resumes_the_first_and_plays_on_identically() {
     play(&mut second, "north");
     assert_eq!(here(&second), here(&first), "the next move lands in the same room");
     assert_eq!(tail(&second, 4), tail(&first, 4), "and prints the same reply");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1624: two reserved slots can each hold a resume point now — the
+/// auto-save's `default.lanthorn` (`arc_file`) and the manual quick-save's
+/// `quick-save.lanthorn` (`quick_save_file`). Boot picks whichever was saved
+/// more recently (`Meta::saved_at`), so a quick-save that happens to be NEWER
+/// than the auto-save wins, rather than the auto-save slot winning
+/// unconditionally just because it existed first / is checked first.
+#[test]
+fn boot_auto_load_prefers_the_newer_of_the_two_reserved_slots() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-newer-slot");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    play(&mut first, "look");
+    // The OLDER write lands in the auto-save slot.
+    let arc_path = first.arc_file.clone();
+    write_resume_archive_to(&mut first, &arc_path, "2020-01-01T00:00:00Z");
+    let room_at_older = here(&first);
+
+    play(&mut first, "south");
+    // The NEWER write lands in the quick-save slot, at a DIFFERENT room, so
+    // the two are distinguishable.
+    let quick_save_path = first.quick_save_file.clone();
+    write_resume_archive_to(&mut first, &quick_save_path, "2030-01-01T00:00:00Z");
+    let room_at_newer = here(&first);
+    assert_ne!(room_at_older, room_at_newer, "premise: the two saves differ");
+
+    let second = boot(story, headless_config(&home), &data_base);
+    assert!(second.resumed, "a save exists to resume from (SQ-1545)");
+    assert_eq!(
+        second.resume_source_file, quick_save_path,
+        "the NEWER slot (quick-save) is the one boot actually read from, not arc_file unconditionally"
+    );
+    assert_eq!(here(&second), room_at_newer, "and its room is the newer save's room, not the older auto-save's");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The single-file case (SQ-1624): with only the auto-save slot present (no
+/// quick-save.lanthorn at all — today's shape, before this quest, and still
+/// the common case for a player who never hits Ctrl+S), boot must still
+/// auto-load it exactly as before. `a_second_boot_resumes_the_first_and_plays_on_identically`
+/// above already covers this end-to-end; this case additionally pins
+/// `resume_source_file` directly, the fact the newer-of-two comparison reads.
+#[test]
+fn boot_auto_load_falls_back_to_the_only_slot_present() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-single-slot");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    play(&mut first, "look");
+    write_resume_archive(&mut first);
+    assert!(!first.quick_save_file.exists(), "premise: no quick-save slot was ever written");
+
+    let second = boot(story, headless_config(&home), &data_base);
+    assert!(second.resumed, "the only slot present is still auto-loaded (SQ-1545)");
+    assert_eq!(
+        second.resume_source_file, second.arc_file,
+        "with no quick-save file, the auto-save slot is the resume source"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

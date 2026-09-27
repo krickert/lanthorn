@@ -131,8 +131,8 @@ const SAVES: &[Row] = &[
     ),
     d(
         "auto_save",
-        "false",
-        &["Save the archive after every turn, on top of the exit-save and Ctrl+S."],
+        "true",
+        &["Save the archive after every turn, on top of the exit-save and Ctrl+S quick-save."],
     ),
     d("prompt_save_on_quit", "true", &["When auto_save is off, offer to save on quit."]),
     d("prompt_load_on_launch", "true", &["When auto_load is off, offer to resume a save found on launch."]),

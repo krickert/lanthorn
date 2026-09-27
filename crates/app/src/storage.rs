@@ -34,14 +34,27 @@ pub fn game_dir(base: &Path, key: &str) -> PathBuf {
     base.join(format!("{key}.save"))
 }
 
-/// The default (auto/singleton) Save-State slot inside a game dir.
+/// The default (auto/singleton) Save-State slot inside a game dir. Written by
+/// the per-turn and exit-time auto-save ONLY (SQ-1624) — a manual quick-save
+/// (Ctrl+S / bare `/save-state`) goes to [`quick_save_state_path`] instead, so
+/// the player's own checkpoint is never immediately overwritten by the next
+/// turn's auto-save landing on the same file.
 pub fn default_state_path(game_dir: &Path) -> PathBuf {
     game_dir.join("default.lanthorn")
 }
 
-/// `default` is reserved for the auto/singleton slot; a user save may not use it.
+/// The manual quick-save slot inside a game dir (SQ-1624): Ctrl+S, bare
+/// `/save-state`, and the quit dialog's "Save State & quit" all write here.
+/// Kept apart from [`default_state_path`] so a quick-save survives the next
+/// per-turn auto-save instead of being clobbered by it.
+pub fn quick_save_state_path(game_dir: &Path) -> PathBuf {
+    game_dir.join("quick-save.lanthorn")
+}
+
+/// `default` is reserved for the auto/singleton slot and `quick-save` for the
+/// manual quick-save slot (SQ-1624); a user save may not use either.
 pub fn is_reserved_slug(slug: &str) -> bool {
-    slug == "default"
+    slug == "default" || slug == "quick-save"
 }
 
 /// Delete the game's AUTO persistent data so the next boot starts from scratch:
@@ -243,9 +256,22 @@ mod tests {
     }
 
     #[test]
+    fn quick_save_state_path_is_in_game_dir() {
+        assert_eq!(
+            quick_save_state_path(Path::new("/base/Zork1.z5.save")),
+            PathBuf::from("/base/Zork1.z5.save/quick-save.lanthorn")
+        );
+    }
+
+    #[test]
     fn default_is_reserved() {
         assert!(is_reserved_slug("default"));
         assert!(!is_reserved_slug("quicksave"));
+    }
+
+    #[test]
+    fn quick_save_is_reserved() {
+        assert!(is_reserved_slug("quick-save"));
     }
 
     /// `delete_auto_persistent` removes exactly the three reserved `default.*`
