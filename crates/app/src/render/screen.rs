@@ -3671,7 +3671,7 @@ fn compose_v6_frame_into(
                 let adv = inputs.face.advance(ch);
                 glyphs.blit(
                     &mut canvas, ch, pen, sy + last_row * u32::from(cell.h()), adv, u32::from(cell.h()), prompt_ink, Some(block), 0, inputs.face,
-                    v6::V6RunSource::Pager, false, false,
+                    v6::V6RunSource::Pager, false, false, false,
                 );
                 pen += adv;
             }
@@ -8908,6 +8908,7 @@ fn fill_menu_flank_extension(
                                 v6::V6RunSource::Chrome,
                                 opaque,
                                 bar,
+                                false,
                             );
                             y += cell_h;
                         }
@@ -8963,7 +8964,7 @@ fn fill_menu_flank_extension(
                             while y < avail_h.min(canvas.height()) {
                                 let h = cell_h.min(avail_h - y).min(canvas.height() - y);
                                 let opaque = v6::region_has_opaque(gfx, gnx0, y, cw, h);
-                                glyphs.blit(canvas, glyph, gnx0, y, cw, h, fg, None, t.style, face, v6::V6RunSource::Chrome, opaque, bar);
+                                glyphs.blit(canvas, glyph, gnx0, y, cw, h, fg, None, t.style, face, v6::V6RunSource::Chrome, opaque, bar, false);
                                 y += cell_h;
                             }
                         }

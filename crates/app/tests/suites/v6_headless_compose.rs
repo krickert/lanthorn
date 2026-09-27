@@ -1627,6 +1627,64 @@ fn hybrid_text_rows_agree_with_what_the_real_hybrid_render_draws() {
     assert!(checked > 0, "arthur churchyard: no in-bounds non-blank run to check — premise failed");
 }
 
+/// **SQ-1612 regression.** `hybrid_text_rows_clears_the_status_bar_gap_fill_arthur_reproduces`
+/// above proves the CANVAS half of the row-skip contract: a row it names no
+/// longer gets the reversed gap-fill block baked under it. But
+/// `build_chrome_canvas_into`'s glyph loop is also the ONE place a chrome
+/// run's characters ever reach `GlyphSink::blit`, which is the only place a
+/// [`V6TextRun`] is ever pushed — before
+/// SQ-1612 that loop walked the same skip-FILTERED list the two flood fills
+/// use, so a row `hybrid_text_rows` named vanished from `V6Frame::text`
+/// entirely, not merely from the canvas. A host reading `V6Frame::text` to
+/// draw Arthur's status bar itself (per this composite's whole reason for
+/// existing) got nothing for it.
+///
+/// So this asserts the row's runs come back **byte-identical** whether
+/// `hybrid_text_rows` is empty or names row 192 — same text, boxes, colours,
+/// style, `over_art` and `bar` — while the canvas at the same pixel still
+/// differs (baked vs. transparent), confirming paint and recording were
+/// decoupled rather than recording simply never having regressed.
+#[test]
+fn hybrid_text_rows_still_records_the_status_bar_row_it_stops_painting() {
+    let Some(b) = boot_arthur_at_churchyard() else { return };
+    for honor in [true, false] {
+        let state = tui_state(&b, honor);
+        let (rows, _hyb) = hybrid_rows(&b, &state);
+        assert!(
+            rows.contains(&192),
+            "arthur churchyard honor={honor}: premise failed, row 192 missing from the derived set: {rows:?}"
+        );
+
+        let baked = arthur_compose_record_only(&b, honor, std::collections::HashSet::new());
+        let cleared = arthur_compose_record_only(&b, honor, rows);
+
+        // The canvas half of the existing fix must stay intact: naming the row
+        // still clears the baked block at (414, 200).
+        assert_ne!(
+            *cleared.canvas.get_pixel(414, 200),
+            HOST_INK,
+            "arthur churchyard honor={honor}: hybrid_text_rows no longer clears the canvas at (414,200) — \
+             the SQ-1609/1611 fix regressed"
+        );
+
+        // The recording half (SQ-1612): every run this composite recorded at
+        // native row-top 192 in the baseline (empty `hybrid_text_rows`) must
+        // still be there, unchanged, once that row is named.
+        let baked_192: Vec<&V6TextRun> = baked.text.iter().filter(|r| r.y == 192).collect();
+        let cleared_192: Vec<&V6TextRun> = cleared.text.iter().filter(|r| r.y == 192).collect();
+        assert!(
+            !baked_192.is_empty(),
+            "arthur churchyard honor={honor}: premise failed, no baseline run recorded at row 192: {:?}",
+            baked.text
+        );
+        assert_eq!(
+            baked_192, cleared_192,
+            "arthur churchyard honor={honor}: hybrid_text_rows dropped or altered row 192's recorded runs \
+             (baseline: {baked_192:?})"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SQ-1611: `hybrid_rows`/`V6FrameInputs::hybrid_text_rows`'s derivation above
 // walked only `hyb.runs` — the chrome ring's own text. Arthur (this file's only
