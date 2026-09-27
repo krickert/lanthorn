@@ -597,6 +597,123 @@ fn fill_margin(area: Rect, inner: Rect, model: &ScreenModel, state: &AppState, b
     paint(bottom, buf);
 }
 
+/// Whether a v6 `Layered` frame is a painted MENU takeover that must be routed
+/// to the cell path rather than the hybrid ring — `render_node`'s own
+/// `WinNode::Layered` arm calls this instead of recomputing the condition
+/// inline (SQ-1614), and [`hybrid_chrome_layout`] and [`hybrid_painted_menu_layout`]
+/// both read it too, so none of the three can drift from what this arm
+/// actually does for the same frame. A MOVE of the arm's own inline logic,
+/// unchanged — see each comment below for the specimen that pinned it.
+///
+/// A painted MENU screen prints chrome text INSIDE the story window's box,
+/// below the status band — Shogun's boot menu paints rows 21–23 over its story
+/// buffer (rows 21–25). In HYBRID mode such a takeover screen must NOT take the
+/// pixel chrome ring: the ring path splits the menu across the raster ring
+/// (items mapping above the terminal viewport) and the terminal overlay (items
+/// inside it), the exact mixed raster/text defect (SQ-0484). Routing it to the
+/// cell path renders it as one coherent all-text screen.
+/// BOTH conditions matter (SQ-0494): a grid run that is merely deep but sits
+/// OUTSIDE the story box is ordinary gameplay chrome — Arthur paints its status
+/// bar at row 12 above a story buffer starting at row 13, and classing that as
+/// a menu dropped Arthur's whole ring (top image panel + side bars). RASTER
+/// mode deliberately keeps its pixel composite for menus (the reverse-video
+/// selection block is fixed in `build_chrome_canvas` instead, SQ-0487) — a
+/// raster-mode user wants the pixel aesthetic even on menus, which is why
+/// `hybrid` is a real parameter here rather than folded away.
+///
+/// Takes the already-classified [`V6Layout`](crate::render::v6_layout::V6Layout)
+/// rather than the raw `items` slice `render_node`'s own inline logic used to
+/// read directly — `layout.story`/`layout.chrome` is what
+/// [`hybrid_chrome_layout`] and [`hybrid_painted_menu_layout`] both already
+/// hold (a host builds this once via `classify_windows` and hands it to every
+/// one of these functions), and iterating `layout.chrome` finds exactly the
+/// same `Grid`/`Graphics` windows the old `items` walk did: the two entries
+/// [`classify_windows`](crate::render::v6_layout::classify_windows) pulls OUT
+/// of `chrome` — the primary `Buffer` and window 0's own `Graphics` — never
+/// match either match arm below, so their absence from `chrome` changes
+/// nothing this predicate checks. The primary-buffer story box is
+/// `layout.story` filtered to that same `Buffer` shape, for the same reason.
+fn hybrid_painted_menu_takeover_route(
+    layout: &crate::render::v6_layout::V6Layout<'_>,
+    hybrid: bool,
+    cell: zvm::screen::V6Cell,
+) -> bool {
+    let story_box = layout.story.and_then(|pw| {
+        // The PRIMARY buffer only: a v6 game can publish a second, non-primary
+        // prose window (SQ-0585), and taking its rows as the story box made an
+        // ordinary split look like a menu takeover.
+        matches!(&pw.node, WinNode::Buffer(b) if b.primary).then(|| {
+            let top = cell.row_of_origin0(pw.y_px);
+            (top, top + pw.h_px.max(1).div_ceil(16), pw.x_px as u32, pw.x_px as u32 + pw.w_px as u32)
+        })
+    });
+    let has_menu = layout.chrome.iter().any(|pw| {
+        matches!(&pw.node, WinNode::Grid(g)
+            if g.px_texts.iter().any(|t| {
+                let row = cell.row_of(t.y);
+                // SQ-0742: the run must be inside the story box on BOTH axes. The
+                // row test alone calls any chrome glyph that merely shares a row
+                // with the story a takeover — and a game whose frame is drawn with
+                // LINE-DRAWING characters rather than reverse-video spaces has one
+                // on every row of the box. Journey under the Amiga profile draws
+                // exactly that: `│` rules at native x 0 / 256 / 632, all outside
+                // its story box (264..632), on every one of its rows. That routed a
+                // perfectly ordinary gameplay screen to the cell path, which draws
+                // the game's 80 columns 1:1 into a pane of any width — the frame
+                // stopped short of the pane edge and the click map (proportional
+                // over the whole pane) no longer matched where anything was drawn.
+                // Under the IBM PC profile the same rules are reverse-video SPACES,
+                // which trim to empty and never tripped the gate, which is why only
+                // the Amiga route showed it.
+                let x0 = t.x.max(1) as u32 - 1;
+                let x1 = x0 + cell.run_px(&t.text).max(u32::from(cell.w()));
+                !t.text.trim().is_empty()
+                    && row >= STATUS_BAND_ROWS
+                    && story_box.is_some_and(|(top, bot, left, right)| {
+                        row >= top && row < bot && x1 > left && x0 < right
+                    })
+            }))
+    });
+    // SQ-0886: …but the cell path DRAWS NO ART, so it is the wrong
+    // destination for a takeover screen the game framed with artwork.
+    // Shogun's boot menu is exactly that: its credits and its three items
+    // sit on the machine's own ground between two ornate side panels, and
+    // routing the screen to cells discarded both — no panels anywhere, and
+    // the story window's page flooded across the pane (measured on
+    // `James Clavell's Shogun.adf` release 295 and on the Blorb release 322
+    // alike: `#000000` across 761 of 800 columns where the Amiga's colour 12
+    // ground belongs).
+    //
+    // SQ-0892 RE-POINTED WHERE IT SENDS THEM. It sent them to the COMPOSITE,
+    // because the ring could not lay this screen out — the reason recorded
+    // below at the hybrid branch, and true until now: the ring drew the menu
+    // one CHARACTER per independently rounded cell (`SI(RT th e ga me`). Both
+    // halves of that are gone. SQ-0894 built the ring from content, so the
+    // ornaments are one flank down the whole pane on either press; SQ-0892
+    // groups a row's runs before placing them, so the menu is intact. The
+    // frame now takes the RING, which draws the panels as art and the credits
+    // and menu as CRISP GLYPHS — SQ-0750's rule, which the composite cannot
+    // honour because it rasterises every character on the screen.
+    //
+    // What this predicate still decides, and why it is kept: a menu takeover
+    // with NO art goes to the coherent all-text cell path (SQ-0484), and one
+    // WITH art must not, because the cell path draws no art. That is the
+    // distinction it was always making. Only its destination changed.
+    //
+    // ART, specifically — a chrome GRAPHICS window with opaque pixels in it.
+    // An `erase_window` fill is not art: the cell path draws those itself
+    // (`draw_erase_fills`), which is what keeps advent's boot popup — a
+    // painted panel over a story with no artwork in the game at all — on the
+    // coherent all-text path SQ-0484 put it on.
+    let menu_over_art = has_menu
+        && hybrid
+        && layout.chrome.iter().any(|pw| {
+            matches!(&pw.node, WinNode::Graphics(g)
+                if g.win != 0 && g.canvas.pixels().any(|p| p[3] >= 128))
+        });
+    has_menu && hybrid && !menu_over_art
+}
+
 /// Recursively render a tree node into `area`. Returns the primary buffer's
 /// metrics when this subtree contains it. Grid-window hyperlink cells are pushed
 /// into `links` (the primary buffer's own links ride on its returned metrics).
@@ -747,79 +864,16 @@ fn render_node(
             // SQ-0487) — a raster-mode user wants the pixel aesthetic even
             // on menus.
             let hybrid = state.config.v6_render == crate::config::V6RenderMode::Hybrid;
-            let story_box = items.iter().find_map(|pw| {
-                // The PRIMARY buffer only: a v6 game can publish a second, non-primary
-                // prose window (SQ-0585), and taking its rows as the story box made an
-                // ordinary split look like a menu takeover.
-                matches!(&pw.node, WinNode::Buffer(b) if b.primary).then(|| {
-                    let top = state.v6_text.cell().row_of_origin0(pw.y_px);
-                    (top, top + pw.h_px.max(1).div_ceil(16), pw.x_px as u32, pw.x_px as u32 + pw.w_px as u32)
-                })
-            });
-            let has_menu = items.iter().any(|pw| {
-                matches!(&pw.node, WinNode::Grid(g)
-                    if g.px_texts.iter().any(|t| {
-                        let row = state.v6_text.cell().row_of(t.y);
-                        // SQ-0742: the run must be inside the story box on BOTH axes. The
-                        // row test alone calls any chrome glyph that merely shares a row
-                        // with the story a takeover — and a game whose frame is drawn with
-                        // LINE-DRAWING characters rather than reverse-video spaces has one
-                        // on every row of the box. Journey under the Amiga profile draws
-                        // exactly that: `│` rules at native x 0 / 256 / 632, all outside
-                        // its story box (264..632), on every one of its rows. That routed a
-                        // perfectly ordinary gameplay screen to the cell path, which draws
-                        // the game's 80 columns 1:1 into a pane of any width — the frame
-                        // stopped short of the pane edge and the click map (proportional
-                        // over the whole pane) no longer matched where anything was drawn.
-                        // Under the IBM PC profile the same rules are reverse-video SPACES,
-                        // which trim to empty and never tripped the gate, which is why only
-                        // the Amiga route showed it.
-                        let x0 = t.x.max(1) as u32 - 1;
-                        let x1 = x0 + state.v6_text.cell().run_px(&t.text).max(u32::from(state.v6_text.cell().w()));
-                        !t.text.trim().is_empty()
-                            && row >= STATUS_BAND_ROWS
-                            && story_box.is_some_and(|(top, bot, left, right)| {
-                                row >= top && row < bot && x1 > left && x0 < right
-                            })
-                    }))
-            });
-            // SQ-0886: …but the cell path DRAWS NO ART, so it is the wrong
-            // destination for a takeover screen the game framed with artwork.
-            // Shogun's boot menu is exactly that: its credits and its three items
-            // sit on the machine's own ground between two ornate side panels, and
-            // routing the screen to cells discarded both — no panels anywhere, and
-            // the story window's page flooded across the pane (measured on
-            // `James Clavell's Shogun.adf` release 295 and on the Blorb release 322
-            // alike: `#000000` across 761 of 800 columns where the Amiga's colour 12
-            // ground belongs).
-            //
-            // SQ-0892 RE-POINTED WHERE IT SENDS THEM. It sent them to the COMPOSITE,
-            // because the ring could not lay this screen out — the reason recorded
-            // below at the hybrid branch, and true until now: the ring drew the menu
-            // one CHARACTER per independently rounded cell (`SI(RT th e ga me`). Both
-            // halves of that are gone. SQ-0894 built the ring from content, so the
-            // ornaments are one flank down the whole pane on either press; SQ-0892
-            // groups a row's runs before placing them, so the menu is intact. The
-            // frame now takes the RING, which draws the panels as art and the credits
-            // and menu as CRISP GLYPHS — SQ-0750's rule, which the composite cannot
-            // honour because it rasterises every character on the screen.
-            //
-            // What this predicate still decides, and why it is kept: a menu takeover
-            // with NO art goes to the coherent all-text cell path (SQ-0484), and one
-            // WITH art must not, because the cell path draws no art. That is the
-            // distinction it was always making. Only its destination changed.
-            //
-            // ART, specifically — a chrome GRAPHICS window with opaque pixels in it.
-            // An `erase_window` fill is not art: the cell path draws those itself
-            // (`draw_erase_fills`), which is what keeps advent's boot popup — a
-            // painted panel over a story with no artwork in the game at all — on the
-            // coherent all-text path SQ-0484 put it on.
-            let menu_over_art = has_menu
-                && hybrid
-                && items.iter().any(|pw| {
-                    matches!(&pw.node, WinNode::Graphics(g)
-                        if g.win != 0 && g.canvas.pixels().any(|p| p[3] >= 128))
-                });
+            // SQ-1614: a single call, never recomputed inline — see
+            // `hybrid_painted_menu_takeover_route`'s own doc for the full
+            // reasoning (moved here verbatim). `hybrid_chrome_layout`'s `None`
+            // and `hybrid_painted_menu_layout`'s `Some` for this same frame both
+            // read this exact predicate, so neither can drift from what this
+            // arm actually does. Classified once, up front, purely so this
+            // predicate's own input matches the shape a host already holds —
+            // both branches below still classify their own copy, unchanged.
+            let takeover_layout = crate::render::v6_layout::classify_windows(items, state.v6_text.cell());
+            let takeover_route = hybrid_painted_menu_takeover_route(&takeover_layout, hybrid, state.v6_text.cell());
             // MODAL overlays only (SQ-0587). The fall-through exists because image
             // placements draw above terminal cells in classic protocols, so a
             // menu/dialog over the story pane would be invisible under the v6 image.
@@ -829,7 +883,7 @@ fn render_node(
             // move — which re-tidies the map and starts its animation — dropped the
             // whole v6 pixel path for the duration, and Arthur's header art vanished
             // with it.
-            if !state.any_modal_overlay_open() && !(has_menu && hybrid && !menu_over_art) {
+            if !state.any_modal_overlay_open() && !takeover_route {
             if let Some(picker) = state.game_picker.as_ref() {
                 let (default_fg, default_bg) = v6_host_pair(state);
                 use crate::render::v6_layout as v6;
@@ -1869,7 +1923,7 @@ fn render_node(
                 // Amiga Zork Zero's DEFINE menu is the frame that showed it (release 366,
                 // serial 890323). Reached by keys until a line read, `define`, then one
                 // character to clear "[Hit any key to continue.]", it is routed here
-                // rather than to the hybrid ring by `has_menu && hybrid && !menu_over_art`.
+                // rather than to the hybrid ring by `hybrid_painted_menu_takeover_route`.
                 // Its story window is black on `Standard(10)`, light grey; all 526 of its
                 // single-character runs name a foreground of black and no background at
                 // all; and its window carries an `ErasedFill`. So the fill and every run
@@ -2044,7 +2098,7 @@ fn render_node(
                                 format!("modal overlay open: {}", modals.join(", "))
                             } else if state.game_picker.is_none() {
                                 "no image protocol".to_string()
-                            } else if has_menu && hybrid && !menu_over_art {
+                            } else if takeover_route {
                                 "painted menu takeover routed here".to_string()
                             } else {
                                 "no story window, or a full-screen picture takeover".to_string()
@@ -5899,9 +5953,11 @@ impl V6HybridChromeLayout {
 ///
 /// `None` wherever the terminal Hybrid renderer itself would draw no chrome
 /// ring for this frame at all: no story window [`V6Layout::classify_windows`]
-/// could find, or a full-picture takeover
-/// ([`picture_takeover_reason`] — a host should fall back to its raster answer,
-/// [`compose_v6_frame`], on either).
+/// could find, a full-picture takeover
+/// ([`picture_takeover_reason`]), or a painted MENU takeover with no artwork
+/// framing it ([`hybrid_painted_menu_takeover_route`], SQ-1614) — a host
+/// should fall back to [`hybrid_painted_menu_layout`] on the third and to its
+/// raster answer, [`compose_v6_frame`], on either of the first two.
 ///
 /// Two picker-derived decisions [`build_hybrid_frame`] would otherwise ask a
 /// real `Picker` about have no host equivalent, so this decides them outright
@@ -5933,6 +5989,20 @@ pub fn hybrid_chrome_layout(
     if picture_takeover_reason(story, &layout.chrome, layout.story_gfx, native).is_some() {
         return None;
     }
+    // SQ-1614: closes this function's own promised gap above — a painted MENU
+    // takeover with no artwork framing it never reaches the terminal ring
+    // either. `render_node`'s own `WinNode::Layered` arm routes exactly this
+    // frame to the cell path instead
+    // ([`hybrid_painted_menu_takeover_route`]), so answering `Some` here for it
+    // published a ring the real renderer never draws. `hybrid` is unconditionally
+    // `true`: this function's whole premise is "what would the Hybrid renderer
+    // draw", never gated on the live `state.config.v6_render`, the same way
+    // `picture_takeover_reason` above is checked regardless of it.
+    // [`hybrid_painted_menu_layout`] is the answer for this frame instead —
+    // Zork Zero's Amiga DEFINE menu is the specimen.
+    if hybrid_painted_menu_takeover_route(layout, true, state.v6_text.cell()) {
+        return None;
+    }
     let (default_fg, default_bg) = v6_host_pair(state);
     // `hkey` is a cache key for the TUI's per-frame replay (`v6_hybrid_gen`) and
     // plays no part in the computation itself — this call is pure and always
@@ -5940,6 +6010,285 @@ pub fn hybrid_chrome_layout(
     // any value here is fine; 0 is simplest.
     let frame = build_hybrid_frame_with(0, layout, story, native, pane, cell_px, true, true, 0, default_fg, default_bg, state);
     Some(V6HybridChromeLayout::from_frame(&frame, layout, pane, native, cell_px, state.v6_text.cell()))
+}
+
+/// One flood [`draw_erase_fills`] paints (SQ-1614) — the resolved twin,
+/// published without a `Buffer` to paint into. `rect` is already clipped to
+/// the pane, exactly as the real draw's own loop bounds are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct V6PaintedMenuFill {
+    pub rect: Rect,
+    pub fg: ratatui::style::Color,
+    pub bg: ratatui::style::Color,
+}
+
+/// One stamp [`draw_painted_screen`] paints (SQ-1614) — either its row-FLOOD
+/// pass (`text` empty, `rect` spanning the full pane width — a status/title
+/// bar `full_width_flood_rows` recognised) or its per-run STAMP pass (`text`
+/// the run's own printable text, `rect` one cell tall at the run's own placed
+/// column). `rect`'s width is a plain character count, not a display width —
+/// every specimen this route's own corpus carries prints ASCII, so the two
+/// never differ here; a host measuring a run with combining or wide
+/// characters should re-measure `text` itself rather than trust the count.
+///
+/// Order matters and matches the real draw: apply every entry in this list in
+/// sequence, each one overwriting whatever an earlier entry left in its own
+/// cells — every flood row before any run stamp, exactly as
+/// [`draw_painted_screen`]'s own two loops run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct V6PaintedMenuStamp {
+    pub rect: Rect,
+    pub text: String,
+    pub fg: ratatui::style::Color,
+    pub bg: ratatui::style::Color,
+}
+
+/// The cell path's OWN layout for a painted MENU takeover with no artwork
+/// framing it (SQ-1614) — the pure-data twin of [`hybrid_chrome_layout`] for
+/// the route that function's own `None` now excludes
+/// ([`hybrid_painted_menu_takeover_route`]). Published so a host that draws
+/// its own text can reproduce this route's entirely different layout MODEL —
+/// a native row plus one signed shift, no scale/strip/flank whatsoever — from
+/// data, rather than by re-deriving `render_node`'s own arithmetic for it.
+/// `base_fg`/`base_bg`, `fills` and `stamps` are resolved through
+/// `status_style`, [`draw_erase_fills`] and [`draw_painted_screen`]'s own two
+/// passes respectively — the same functions and the same
+/// [`v6_run_style`]/[`full_width_flood_rows`] calls the real draw makes — so a
+/// host's answer cannot drift from what actually gets drawn for the SAME
+/// frame.
+///
+/// A host tries [`hybrid_chrome_layout`] first; if that answers `None` too,
+/// this is the next thing to try, before falling back to
+/// [`compose_v6_frame`]'s raster path — exactly the sequence
+/// [`hybrid_chrome_layout`]'s own doc names.
+pub struct V6PaintedMenuLayout {
+    /// Where this route draws the story's own transcript — in the HOST's
+    /// terminal cells. Unlike [`V6HybridChromeLayout::viewport`], never scaled
+    /// or letterboxed: this route places everything 1:1 in native rows plus
+    /// one signed shift (`render_node`'s own `story_shift`).
+    pub viewport: Rect,
+    /// `status_style`'s own resolved base, before any fill or run overrides
+    /// it per channel (SQ-0906) — the story window's own page when the game
+    /// dressed one and colours are honoured, the theme's `upper_window`
+    /// otherwise.
+    pub base_fg: ratatui::style::Color,
+    pub base_bg: ratatui::style::Color,
+    /// [`draw_erase_fills`]'s own fills, resolved, in the game's own paint
+    /// order (`ErasedFill::seq`).
+    pub fills: Vec<V6PaintedMenuFill>,
+    /// [`draw_painted_screen`]'s own two passes, resolved, for both the
+    /// in-story-box call (`render_node`'s `story_top..story_bot`) and — when
+    /// the frame carries a below-story command band — the second call for
+    /// it, in the same order `render_node` itself makes them.
+    pub stamps: Vec<V6PaintedMenuStamp>,
+}
+
+/// See [`V6PaintedMenuLayout`] for the full reasoning. `native` and `pane`
+/// match [`hybrid_chrome_layout`]'s own — the v6 screen's native pixel extent
+/// and the story pane's cell rect.
+pub fn hybrid_painted_menu_layout(
+    layout: &crate::render::v6_layout::V6Layout<'_>,
+    native: (u16, u16),
+    pane: Rect,
+    state: &AppState,
+) -> Option<V6PaintedMenuLayout> {
+    let cell = state.v6_text.cell();
+    if !hybrid_painted_menu_takeover_route(layout, true, cell) {
+        return None;
+    }
+    // Every specimen this route reaches keeps a primary buffer (Zork Zero's
+    // Amiga DEFINE menu included — see `hybrid_painted_menu_takeover_route`'s
+    // own doc); a frame that withdrew it instead is the OTHER cell-path arm
+    // (`render_node`'s own "no streaming story window" branch), which this
+    // type does not cover.
+    let story = layout.story.filter(|pw| matches!(&pw.node, WinNode::Buffer(b) if b.primary))?;
+    let ink = TextInk::of(state);
+    // SQ-0906, moved verbatim from `render_node`'s own cell-path arm — see
+    // that arm's comment for the specimen (Zork Zero's Amiga DEFINE menu)
+    // that pinned this exact resolution.
+    let status_style = {
+        let s = state.colors.theme.get("upper_window").style;
+        match state
+            .config
+            .honor_game_colours
+            .then(|| crate::render::v6_layout::story_bg_rgba(layout.story, &state.colors))
+        {
+            Some(Some(p)) => s.bg(ratatui::style::Color::Rgb(p[0], p[1], p[2])),
+            _ => s,
+        }
+    };
+    let base_fg = status_style.fg.unwrap_or(ratatui::style::Color::Reset);
+    let base_bg = status_style.bg.unwrap_or(ratatui::style::Color::Reset);
+    let native_w = native.0;
+    let runs: Vec<&crate::engine::PxText> = layout
+        .chrome
+        .iter()
+        .filter_map(|it| match &it.node {
+            WinNode::Grid(g) => Some(g.px_texts.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    // The same geometry `render_node`'s own cell-path arm derives — see that
+    // arm's own comments for why each step is what it is; this is a MOVE of
+    // that arithmetic, not a new derivation of it.
+    let story_top = cell.row_of_origin0(story.y_px);
+    let story_bot = ((story.y_px as u32 + story.h_px as u32).div_ceil(16)).min(u16::MAX as u32) as u16;
+    let top_used = anchored_band_rows(&runs, story_top, pane.height);
+    let chrome_bot = layout
+        .chrome
+        .iter()
+        .filter(|pw| pw.y_px.saturating_add(pw.h_px) <= story.y_px)
+        .map(|pw| ((pw.y_px as u32 + pw.h_px as u32).div_ceil(16)).min(u16::MAX as u32) as u16)
+        .max()
+        .unwrap_or(story_top);
+    let story_row = (top_used + story_top.saturating_sub(chrome_bot)).min(pane.height.saturating_sub(1));
+    let story_shift = story_row as i32 - story_top as i32;
+    let below: Vec<u16> = runs
+        .iter()
+        .filter(|t| !t.text.trim().is_empty())
+        .map(|t| cell.row_of(t.y))
+        .filter(|&r| r >= story_bot)
+        .collect();
+    let bottom_span = match (below.iter().min(), below.iter().max()) {
+        (Some(&f), Some(&l)) => Some((f, l - f + 1)),
+        _ => None,
+    };
+    let bottom_used = bottom_span.map(|(_, n)| n).unwrap_or(0).min(pane.height.saturating_sub(story_row));
+    let col_of = |px: u16| (pane.width as u32 * px as u32 / native_w.max(1) as u32) as u16;
+    let story_l = story.x_px;
+    let story_r = story.x_px.saturating_add(story.w_px);
+    let sides = crate::render::v6_layout::cell_path_side_columns(layout, pane, native_w);
+    let mut story_x = pane.x;
+    let mut story_right = pane.right();
+    for s in &sides {
+        if s.left {
+            story_x = story_x.max(pane.x + col_of(story_l));
+        } else {
+            story_right = story_right.min(pane.x + col_of(story_r));
+        }
+    }
+    let mid_y = pane.y + story_row;
+    let mid_h = pane.height.saturating_sub(story_row + bottom_used);
+    let viewport = Rect::new(story_x, mid_y, story_right.saturating_sub(story_x), mid_h);
+
+    let fills = painted_menu_erase_fills(&layout.chrome, status_style, ink, pane, story_shift);
+    let mut stamps =
+        painted_menu_screen_stamps(&runs, story_top..story_bot, story_shift, pane, status_style, ink, &layout.chrome, native_w, cell);
+    if let Some((first, n)) = bottom_span {
+        let shift = pane.height as i32 - n as i32 - first as i32;
+        stamps.extend(painted_menu_screen_stamps(
+            &runs,
+            story_bot..u16::MAX,
+            shift,
+            pane,
+            status_style,
+            ink,
+            &layout.chrome,
+            native_w,
+            cell,
+        ));
+    }
+
+    Some(V6PaintedMenuLayout { viewport, base_fg, base_bg, fills, stamps })
+}
+
+/// The resolved twin of [`draw_erase_fills`]'s own loop — see
+/// [`V6PaintedMenuFill`] and [`hybrid_painted_menu_layout`] for why this
+/// exists rather than a refactor of `draw_erase_fills` itself.
+fn painted_menu_erase_fills(
+    chrome: &[&PositionedWindow],
+    base: ratatui::style::Style,
+    ink: TextInk,
+    area: Rect,
+    shift: i32,
+) -> Vec<V6PaintedMenuFill> {
+    let mut fills: Vec<(&PositionedWindow, crate::engine::ErasedFill)> = chrome
+        .iter()
+        .filter_map(|pw| match &pw.node {
+            WinNode::Grid(g) => g.fill.map(|f| (*pw, f)),
+            _ => None,
+        })
+        .collect();
+    fills.sort_by_key(|(_, f)| f.seq);
+    fills
+        .into_iter()
+        .filter_map(|(pw, f)| {
+            let style = v6_run_style(base, 0, f.bg, 0, ink);
+            // `px_rect_to_cells` already clamps to `area` on every edge, the
+            // same clamp `draw_erase_fills`'s own loop bounds apply at draw
+            // time — nothing left to clip here.
+            let rect = px_rect_to_cells(pw, &crate::render::v6_layout::Scale { s: 1.0, off_x: 0, off_y: 0 }, (8, 16), area, shift);
+            (rect.width > 0 && rect.height > 0).then(|| V6PaintedMenuFill {
+                rect,
+                fg: style.fg.unwrap_or_else(|| base.fg.unwrap_or(ratatui::style::Color::Reset)),
+                bg: style.bg.unwrap_or_else(|| base.bg.unwrap_or(ratatui::style::Color::Reset)),
+            })
+        })
+        .collect()
+}
+
+/// The resolved twin of [`draw_painted_screen`]'s own two passes — see
+/// [`V6PaintedMenuStamp`] and [`hybrid_painted_menu_layout`] for why this
+/// exists rather than a refactor of `draw_painted_screen` itself. Reads
+/// [`full_width_flood_rows`] directly (already pure data, no `Buffer`
+/// involved) for the row-flood pass, and mirrors `draw_painted_screen`'s own
+/// per-run loop, unchanged, for the stamp pass.
+fn painted_menu_screen_stamps(
+    runs: &[&crate::engine::PxText],
+    rows: std::ops::Range<u16>,
+    shift: i32,
+    area: Rect,
+    base: ratatui::style::Style,
+    ink: TextInk,
+    chrome: &[&PositionedWindow],
+    native_w: u16,
+    cell: zvm::screen::V6Cell,
+) -> Vec<V6PaintedMenuStamp> {
+    let place = |row: u16| -> Option<u16> {
+        if !rows.contains(&row) {
+            return None;
+        }
+        let y = area.y as i32 + row as i32 + shift;
+        (y >= area.y as i32 && y < area.bottom() as i32).then_some(y as u16)
+    };
+    let mut out = Vec::new();
+    let flood = full_width_flood_rows(chrome, native_w, base, ink, cell);
+    // `HashMap` iteration order is not the real draw's own order (each flood
+    // row paints the whole pane width independently, so the real draw does
+    // not care either) — sorted here only so two calls on the same frame
+    // publish the same list.
+    let mut flood_rows: Vec<u16> = flood.keys().copied().collect();
+    flood_rows.sort_unstable();
+    for row in flood_rows {
+        let style = flood[&row];
+        let Some(y) = place(row) else { continue };
+        out.push(V6PaintedMenuStamp {
+            rect: Rect::new(area.x, y, area.width, 1),
+            text: String::new(),
+            fg: style.fg.unwrap_or_else(|| base.fg.unwrap_or(ratatui::style::Color::Reset)),
+            bg: style.bg.unwrap_or_else(|| base.bg.unwrap_or(ratatui::style::Color::Reset)),
+        });
+    }
+    for t in runs {
+        let row = t.grow;
+        let Some(y) = place(row) else { continue };
+        let col = t.gcol;
+        if area.x + col >= area.right() {
+            continue;
+        }
+        let style = v6_run_style(base, t.fg, t.bg, t.style, ink);
+        let max_w = (area.right() - (area.x + col)) as usize;
+        let text = crate::render::blank_control_chars(&t.text);
+        let width = text.chars().count().min(max_w) as u16;
+        out.push(V6PaintedMenuStamp {
+            rect: Rect::new(area.x + col, y, width, 1),
+            text: text.into_owned(),
+            fg: style.fg.unwrap_or_else(|| base.fg.unwrap_or(ratatui::style::Color::Reset)),
+            bg: style.bg.unwrap_or_else(|| base.bg.unwrap_or(ratatui::style::Color::Reset)),
+        });
+    }
+    out
 }
 
 /// Where a v6 STORY-SLOT `Grid` belongs on a host's own screen (SQ-1599) —
@@ -6413,7 +6762,7 @@ pub struct RasterMetrics {
 }
 
 /// How deep a chrome run must sit before the HYBRID path will treat a screen as a
-/// painted MENU takeover (see the `has_menu` gate in the `Layered` arm). A run
+/// painted MENU takeover (see [`hybrid_painted_menu_takeover_route`]). A run
 /// this shallow is ordinary top-of-screen status chrome even when it happens to
 /// land inside a story box that starts at row 0. (SQ-0478/SQ-0494)
 const STATUS_BAND_ROWS: u16 = 4;

@@ -995,3 +995,139 @@ fn chrome_inherits_the_page_the_game_dressed() {
     }
 }
 
+// ── The cell-path's own published layout for a painted MENU takeover
+//    (SQ-1614) ─────────────────────────────────────────────────────────────
+
+/// Zork Zero's Amiga DEFINE menu again — same specimen, same boot sequence as
+/// [`chrome_inherits_the_page_the_game_dressed`] — but this time checking the
+/// HOST-facing API a non-terminal embedder reads instead of the terminal's own
+/// buffer: [`app::render::screen::hybrid_chrome_layout`] must now answer
+/// `None` for this exact frame (closing that function's own documented
+/// promise gap, SQ-1614), and
+/// [`app::render::screen::hybrid_painted_menu_layout`] must answer `Some`
+/// whose fills/stamps resolve to EXACTLY the colours the real cell-path
+/// render stamps — verified by replaying them in order onto a scratch grid
+/// and comparing every cell that grid claims against the real render's own
+/// buffer, the same "layout agrees with the real render" shape
+/// `v6_hybrid_chrome_layout.rs`'s `verify_agreement` established for the ring.
+///
+/// Every one of the menu's 170 inked cells renders black-on-grey here — a
+/// probe driving arrow-key and Return input past this frame found no reverse-
+/// video cell in this build's headless-reachable state (menu SELECTION in this
+/// title is mouse-driven, which this harness cannot simulate), so this case
+/// asserts the single pair the specimen actually shows rather than assuming a
+/// second one it does not.
+#[test]
+fn zork_zero_define_menu_has_a_resolved_painted_menu_layout() {
+    let Some(mut s) = boot(&ZORK_ZERO, InterpreterProfile::Amiga, true) else { return };
+    let label = ctx(&ZORK_ZERO, InterpreterProfile::Amiga, true);
+    for _ in 0..8 {
+        if matches!(s.pending_input(), InputKind::Line) {
+            break;
+        }
+        let _ = s.submit_char(13);
+    }
+    let said = s.submit("define").transcript;
+    assert!(
+        said.to_lowercase().contains("key to define"),
+        "{label}: premise — `define` did not open the key-definition menu: {said:?}",
+    );
+    let _ = s.submit_char(b' ');
+
+    let model = app::engine::Engine::screen(&s);
+    let app::engine::WinNode::Layered(items) = &model.root else { panic!("{label}: Layered") };
+
+    let mut state = app::state::AppState::default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
+    state.config.honor_game_colours = true;
+    state.game_picker = Some(ratatui_image::picker::Picker::halfblocks());
+    let area = Rect::new(0, 0, 98, 37);
+
+    let layout = app::render::v6_layout::classify_windows(items.as_slice(), state.v6_text.cell());
+    let native = app::render::v6_layout::native_extent(items.as_slice(), &state.v6_text);
+    let cell_px = state
+        .game_picker
+        .as_ref()
+        .map(|p| {
+            let f = p.font_size();
+            (f.width, f.height)
+        })
+        .unwrap_or((8, 16));
+
+    // The promise this quest closes: the ring's own host-facing layout must
+    // no longer claim a frame the terminal never draws a ring for.
+    assert!(
+        app::render::screen::hybrid_chrome_layout(&layout, native, area, cell_px, &state).is_none(),
+        "{label}: hybrid_chrome_layout should answer None for a painted menu takeover — this is \
+         exactly the promise gap SQ-1614 closes",
+    );
+
+    let pm = app::render::screen::hybrid_painted_menu_layout(&layout, native, area, &state)
+        .unwrap_or_else(|| panic!("{label}: hybrid_painted_menu_layout should answer Some for this frame"));
+    assert!(!pm.fills.is_empty(), "{label}: premise — the DEFINE menu's window carries an ErasedFill");
+    assert!(!pm.stamps.is_empty(), "{label}: premise — the menu prints text");
+
+    // Standard 2 (black) and standard 10 (light grey), resolved through the
+    // SESSION's own table (SQ-1393) — the same two colours
+    // `a_game_that_named_its_own_pair_still_types_in_that_pair` and
+    // `chrome_inherits_the_page_the_game_dressed` both pin for this release.
+    let (br, bg_, bb) = app::colors::standard_colour_rgb(s.machine.palette(), 2).expect("standard 2 is black");
+    let (gr, gg, gb) = zvm::screen::grey_rgb(s.machine.palette(), 10);
+    let black = ratatui::style::Color::Rgb(br, bg_, bb);
+    let light_grey = ratatui::style::Color::Rgb(gr, gg, gb);
+
+    // Every erase fill's GROUND resolves to the game's own page (its `fg` is
+    // whatever the theme's own default is — the fill's own cells are blank,
+    // so nothing ever reads it, exactly as `draw_erase_fills` never sets an
+    // explicit fg for a fill whose window named none). Every stamp resolves
+    // to black text on that same page — never the theme's.
+    for f in &pm.fills {
+        assert_eq!(f.bg, light_grey, "{label}: erase fill {f:?} did not resolve to the game's page");
+    }
+    for st in &pm.stamps {
+        if st.text.trim().is_empty() {
+            continue;
+        }
+        assert_eq!((st.fg, st.bg), (black, light_grey), "{label}: stamp {st:?} did not resolve to the game's page");
+    }
+
+    // Replay `pm`'s fills then stamps onto a scratch grid, in order — the
+    // documented rule on `V6PaintedMenuStamp` — and check every cell that
+    // grid claims against what the real render actually put in the SAME
+    // buffer cell.
+    let mut sim: std::collections::HashMap<(u16, u16), (ratatui::style::Color, ratatui::style::Color)> =
+        Default::default();
+    for f in &pm.fills {
+        for y in f.rect.y..f.rect.bottom() {
+            for x in f.rect.x..f.rect.right() {
+                sim.insert((x, y), (f.fg, f.bg));
+            }
+        }
+    }
+    for st in &pm.stamps {
+        for y in st.rect.y..st.rect.bottom() {
+            for x in st.rect.x..st.rect.right() {
+                sim.insert((x, y), (st.fg, st.bg));
+            }
+        }
+    }
+    assert!(sim.len() > 100, "{label}: premise — the menu covers a meaningful number of cells, got {}", sim.len());
+
+    let mut buf = Buffer::empty(area);
+    let _ = app::render::screen::render_story_pane(&model, false, None, &state, area, &mut buf);
+    let mut mismatches = Vec::new();
+    for (&(x, y), &(fg, bg)) in &sim {
+        let real = &buf[(x, y)];
+        if (real.fg, real.bg) != (fg, bg) {
+            mismatches.push((x, y, (real.fg, real.bg), (fg, bg)));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{label}: {} of {} cells the published layout claims disagree with the real render \
+         (cell, real (fg,bg), published (fg,bg)): {:?}",
+        mismatches.len(),
+        sim.len(),
+        &mismatches[..mismatches.len().min(10)],
+    );
+}
