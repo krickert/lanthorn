@@ -93,6 +93,11 @@ const ZORK_ZERO: Floppy = Floppy {
 };
 const ARTHUR: Floppy =
     Floppy { file: "Arthur - The Quest for Excalibur.adf", release: 54, serial: "890606", turns: 12 };
+/// The Macintosh Zork Zero release, pinned in `real_media_releases.rs` — a
+/// DIFFERENT build than [`ZORK_ZERO`]'s Amiga floppy (296/881019 vs.
+/// 366/890323), so its own boot sequence to reach the DEFINE menu is
+/// verified empirically rather than assumed to match (SQ-1617).
+const ZORK_ZERO_MAC: Floppy = Floppy { file: "Zork Zero Disk.image", release: 296, serial: "881019", turns: 12 };
 
 fn ctx(f: &Floppy, profile: InterpreterProfile, honor: bool) -> String {
     format!(
@@ -1011,12 +1016,20 @@ fn chrome_inherits_the_page_the_game_dressed() {
 /// buffer, the same "layout agrees with the real render" shape
 /// `v6_hybrid_chrome_layout.rs`'s `verify_agreement` established for the ring.
 ///
-/// Every one of the menu's 170 inked cells renders black-on-grey here — a
-/// probe driving arrow-key and Return input past this frame found no reverse-
-/// video cell in this build's headless-reachable state (menu SELECTION in this
-/// title is mouse-driven, which this harness cannot simulate), so this case
-/// asserts the single pair the specimen actually shows rather than assuming a
-/// second one it does not.
+/// Every one of the menu's inked cells resolves to the same black-on-grey
+/// FG/BG pair here — `Style`'s reverse bit never swaps the colour channels
+/// themselves, only the `Modifier` a terminal later renders with — but the
+/// frame is NOT uniformly plain: the operation-description column ("take",
+/// "drop", "Save Defs", "Exit", and the rest of the right-hand text) carries
+/// [`ratatui::style::Modifier::REVERSED`] already, at rest, with no mouse or
+/// arrow-key interaction needed to reach it, while the left-hand key-name
+/// column ("F1", " UP", …) does not (SQ-1617; confirmed by rendering this
+/// exact frame through [`app::render::screen::render_story_pane`] and
+/// scanning its buffer for `Modifier::REVERSED` before trusting it below —
+/// 457 of this frame's cells carry it). So this case checks colour AND
+/// modifier on every cell, and separately asserts the reversed set is
+/// non-empty — a guard against a future change silently making this frame
+/// stop exercising reverse video.
 #[test]
 fn zork_zero_define_menu_has_a_resolved_painted_menu_layout() {
     let Some(mut s) = boot(&ZORK_ZERO, InterpreterProfile::Amiga, true) else { return };
@@ -1093,21 +1106,21 @@ fn zork_zero_define_menu_has_a_resolved_painted_menu_layout() {
 
     // Replay `pm`'s fills then stamps onto a scratch grid, in order — the
     // documented rule on `V6PaintedMenuStamp` — and check every cell that
-    // grid claims against what the real render actually put in the SAME
-    // buffer cell.
-    let mut sim: std::collections::HashMap<(u16, u16), (ratatui::style::Color, ratatui::style::Color)> =
+    // grid claims (colour AND modifier, SQ-1617) against what the real
+    // render actually put in the SAME buffer cell.
+    let mut sim: std::collections::HashMap<(u16, u16), (ratatui::style::Color, ratatui::style::Color, ratatui::style::Modifier)> =
         Default::default();
     for f in &pm.fills {
         for y in f.rect.y..f.rect.bottom() {
             for x in f.rect.x..f.rect.right() {
-                sim.insert((x, y), (f.fg, f.bg));
+                sim.insert((x, y), (f.fg, f.bg, f.modifier));
             }
         }
     }
     for st in &pm.stamps {
         for y in st.rect.y..st.rect.bottom() {
             for x in st.rect.x..st.rect.right() {
-                sim.insert((x, y), (st.fg, st.bg));
+                sim.insert((x, y), (st.fg, st.bg, st.modifier));
             }
         }
     }
@@ -1116,18 +1129,163 @@ fn zork_zero_define_menu_has_a_resolved_painted_menu_layout() {
     let mut buf = Buffer::empty(area);
     let _ = app::render::screen::render_story_pane(&model, false, None, &state, area, &mut buf);
     let mut mismatches = Vec::new();
-    for (&(x, y), &(fg, bg)) in &sim {
+    let mut reversed_compared = 0usize;
+    for (&(x, y), &(fg, bg, modifier)) in &sim {
         let real = &buf[(x, y)];
-        if (real.fg, real.bg) != (fg, bg) {
-            mismatches.push((x, y, (real.fg, real.bg), (fg, bg)));
+        if real.modifier.contains(ratatui::style::Modifier::REVERSED) {
+            reversed_compared += 1;
+        }
+        if (real.fg, real.bg, real.modifier) != (fg, bg, modifier) {
+            mismatches.push((x, y, (real.fg, real.bg, real.modifier), (fg, bg, modifier)));
         }
     }
     assert!(
         mismatches.is_empty(),
         "{label}: {} of {} cells the published layout claims disagree with the real render \
-         (cell, real (fg,bg), published (fg,bg)): {:?}",
+         (cell, real (fg,bg,modifier), published (fg,bg,modifier)): {:?}",
         mismatches.len(),
         sim.len(),
         &mismatches[..mismatches.len().min(10)],
+    );
+    // Non-vacuity guard (CLAUDE.md testing conventions): this frame must
+    // actually exercise reverse video, or the comparison above proves
+    // nothing about the `modifier` field it was added to check (SQ-1617).
+    assert!(
+        reversed_compared > 0,
+        "{label}: premise — this frame must carry at least one REVERSED cell the published \
+         layout also covers, or the modifier comparison above is vacuous",
+    );
+}
+
+/// The Macintosh half of the same specimen (SQ-1617). Release 296/serial
+/// 881019 is a DIFFERENT build than the Amiga floppy's 366/890323, but an
+/// empirical probe found the identical boot sequence — Return×≤8 past any
+/// remaining "hit any key" screens, `define`, one space — lands on the same
+/// "key to define" menu and the same reversed operation-description column
+/// (confirmed by driving the real fixture and printing its runs and its
+/// rendered buffer's `(fg, bg, Modifier::REVERSED)` triples before writing
+/// this case). Unlike the Amiga case, no earlier test in this file pins this
+/// release's exact page RGB pair, so this case checks INTERNAL consistency
+/// (every fill and every non-blank stamp shares one page pair) rather than
+/// asserting a specific hardcoded colour — the replay-vs-real-render
+/// comparison below is what actually exercises the `modifier` field this
+/// quest adds.
+#[test]
+fn zork_zero_define_menu_has_a_resolved_painted_menu_layout_on_macintosh() {
+    let Some(mut s) = boot(&ZORK_ZERO_MAC, InterpreterProfile::Macintosh, true) else { return };
+    let label = ctx(&ZORK_ZERO_MAC, InterpreterProfile::Macintosh, true);
+    for _ in 0..8 {
+        if matches!(s.pending_input(), InputKind::Line) {
+            break;
+        }
+        let _ = s.submit_char(13);
+    }
+    let said = s.submit("define").transcript;
+    assert!(
+        said.to_lowercase().contains("key to define"),
+        "{label}: premise — `define` did not open the key-definition menu: {said:?}",
+    );
+    let _ = s.submit_char(b' ');
+
+    let model = app::engine::Engine::screen(&s);
+    let app::engine::WinNode::Layered(items) = &model.root else { panic!("{label}: Layered") };
+
+    let mut state = app::state::AppState::default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
+    state.config.honor_game_colours = true;
+    state.game_picker = Some(ratatui_image::picker::Picker::halfblocks());
+    let area = Rect::new(0, 0, 98, 37);
+
+    let layout = app::render::v6_layout::classify_windows(items.as_slice(), state.v6_text.cell());
+    let native = app::render::v6_layout::native_extent(items.as_slice(), &state.v6_text);
+    let cell_px = state
+        .game_picker
+        .as_ref()
+        .map(|p| {
+            let f = p.font_size();
+            (f.width, f.height)
+        })
+        .unwrap_or((8, 16));
+
+    assert!(
+        app::render::screen::hybrid_chrome_layout(&layout, native, area, cell_px, &state).is_none(),
+        "{label}: hybrid_chrome_layout should answer None for a painted menu takeover",
+    );
+
+    let pm = app::render::screen::hybrid_painted_menu_layout(&layout, native, area, &state)
+        .unwrap_or_else(|| panic!("{label}: hybrid_painted_menu_layout should answer Some for this frame"));
+    assert!(!pm.fills.is_empty(), "{label}: premise — the DEFINE menu's window carries an ErasedFill");
+    assert!(!pm.stamps.is_empty(), "{label}: premise — the menu prints text");
+
+    // Every fill's background is the same single page colour, and every
+    // non-blank stamp's colours match it — the internal-consistency check
+    // this release substitutes for the Amiga case's hardcoded standard-2/10
+    // pin (no prior test in this file establishes this release's own pair).
+    let page_bg = pm.fills[0].bg;
+    for f in &pm.fills {
+        assert_eq!(f.bg, page_bg, "{label}: erase fill {f:?} disagrees with the menu's own page colour");
+    }
+    let mut page_pair: Option<(ratatui::style::Color, ratatui::style::Color)> = None;
+    for st in &pm.stamps {
+        if st.text.trim().is_empty() {
+            continue;
+        }
+        let pair = (st.fg, st.bg);
+        match page_pair {
+            None => page_pair = Some(pair),
+            Some(p) => assert_eq!(pair, p, "{label}: stamp {st:?} disagrees with the menu's own text pair"),
+        }
+    }
+    assert!(page_pair.is_some(), "{label}: premise — the menu prints at least one non-blank stamp");
+
+    // Replay `pm`'s fills then stamps onto a scratch grid, in order, and
+    // check every cell the grid claims (colour AND modifier, SQ-1617)
+    // against what the real render actually put in the SAME buffer cell.
+    let mut sim: std::collections::HashMap<(u16, u16), (ratatui::style::Color, ratatui::style::Color, ratatui::style::Modifier)> =
+        Default::default();
+    for f in &pm.fills {
+        for y in f.rect.y..f.rect.bottom() {
+            for x in f.rect.x..f.rect.right() {
+                sim.insert((x, y), (f.fg, f.bg, f.modifier));
+            }
+        }
+    }
+    for st in &pm.stamps {
+        for y in st.rect.y..st.rect.bottom() {
+            for x in st.rect.x..st.rect.right() {
+                sim.insert((x, y), (st.fg, st.bg, st.modifier));
+            }
+        }
+    }
+    assert!(sim.len() > 100, "{label}: premise — the menu covers a meaningful number of cells, got {}", sim.len());
+
+    let mut buf = Buffer::empty(area);
+    let _ = app::render::screen::render_story_pane(&model, false, None, &state, area, &mut buf);
+    let mut mismatches = Vec::new();
+    let mut reversed_compared = 0usize;
+    for (&(x, y), &(fg, bg, modifier)) in &sim {
+        let real = &buf[(x, y)];
+        if real.modifier.contains(ratatui::style::Modifier::REVERSED) {
+            reversed_compared += 1;
+        }
+        if (real.fg, real.bg, real.modifier) != (fg, bg, modifier) {
+            mismatches.push((x, y, (real.fg, real.bg, real.modifier), (fg, bg, modifier)));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{label}: {} of {} cells the published layout claims disagree with the real render \
+         (cell, real (fg,bg,modifier), published (fg,bg,modifier)): {:?}",
+        mismatches.len(),
+        sim.len(),
+        &mismatches[..mismatches.len().min(10)],
+    );
+    // Non-vacuity guard: this Macintosh frame must also carry at least one
+    // REVERSED cell the published layout covers, or the modifier comparison
+    // above proves nothing (SQ-1617).
+    assert!(
+        reversed_compared > 0,
+        "{label}: premise — this frame must carry at least one REVERSED cell the published \
+         layout also covers, or the modifier comparison above is vacuous",
     );
 }

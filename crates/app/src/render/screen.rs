@@ -6014,12 +6014,17 @@ pub fn hybrid_chrome_layout(
 
 /// One flood [`draw_erase_fills`] paints (SQ-1614) — the resolved twin,
 /// published without a `Buffer` to paint into. `rect` is already clipped to
-/// the pane, exactly as the real draw's own loop bounds are.
+/// the pane, exactly as the real draw's own loop bounds are. `modifier` is
+/// the bold/italic/reverse bits [`v6_run_style`] resolved into the `Style`
+/// this fill paints, patched onto an empty base exactly as
+/// [`ratatui::buffer::Cell::set_style`] resolves them onto a freshly-cleared
+/// cell (SQ-1617) — a real `draw_erase_fills` cell carries the same bits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct V6PaintedMenuFill {
     pub rect: Rect,
     pub fg: ratatui::style::Color,
     pub bg: ratatui::style::Color,
+    pub modifier: ratatui::style::Modifier,
 }
 
 /// One stamp [`draw_painted_screen`] paints (SQ-1614) — either its row-FLOOD
@@ -6030,6 +6035,11 @@ pub struct V6PaintedMenuFill {
 /// every specimen this route's own corpus carries prints ASCII, so the two
 /// never differ here; a host measuring a run with combining or wide
 /// characters should re-measure `text` itself rather than trust the count.
+/// `modifier` is the bold/italic/reverse bits [`v6_run_style`] resolved into
+/// the `Style` this stamp paints, patched onto an empty base exactly as
+/// [`ratatui::buffer::Cell::set_style`]/[`ratatui::buffer::Buffer::set_stringn`]
+/// resolve them onto a freshly-cleared cell (SQ-1617) — a real
+/// `draw_painted_screen` cell carries the same bits.
 ///
 /// Order matters and matches the real draw: apply every entry in this list in
 /// sequence, each one overwriting whatever an earlier entry left in its own
@@ -6041,6 +6051,7 @@ pub struct V6PaintedMenuStamp {
     pub text: String,
     pub fg: ratatui::style::Color,
     pub bg: ratatui::style::Color,
+    pub modifier: ratatui::style::Modifier,
 }
 
 /// The cell path's OWN layout for a painted MENU takeover with no artwork
@@ -6061,6 +6072,21 @@ pub struct V6PaintedMenuStamp {
 /// this is the next thing to try, before falling back to
 /// [`compose_v6_frame`]'s raster path — exactly the sequence
 /// [`hybrid_chrome_layout`]'s own doc names.
+///
+/// Each [`V6PaintedMenuFill`]/[`V6PaintedMenuStamp`] also carries a
+/// `modifier` — the bold/italic/reverse bits [`v6_run_style`] resolved into
+/// the `Style` the real draw applies, so a host that only read `fg`/`bg`
+/// used to draw Zork Zero's DEFINE (Function Keys) screen with no reverse
+/// video on its definition fields or its selected key label (SQ-1617).
+///
+/// **Out of scope, deliberately, for now**: this layout mirrors only the
+/// primary story buffer's fill/stamp passes. It has no equivalent for the
+/// cell path's side columns (`render_node`'s recursive call over
+/// [`crate::render::v6_layout::cell_path_side_columns`] for secondary chrome
+/// windows), for secondary prose buffers ([`draw_secondary_buffers`]), or for
+/// the anchored status band ([`draw_anchored_status_band`]) — fine for the
+/// DEFINE menu, which uses none of the three, but not a general promise that
+/// every painted-menu frame is fully covered.
 pub struct V6PaintedMenuLayout {
     /// Where this route draws the story's own transcript — in the HOST's
     /// terminal cells. Unlike [`V6HybridChromeLayout::viewport`], never scaled
@@ -6223,6 +6249,7 @@ fn painted_menu_erase_fills(
                 rect,
                 fg: style.fg.unwrap_or_else(|| base.fg.unwrap_or(ratatui::style::Color::Reset)),
                 bg: style.bg.unwrap_or_else(|| base.bg.unwrap_or(ratatui::style::Color::Reset)),
+                modifier: ratatui::style::Style::default().patch(style).add_modifier,
             })
         })
         .collect()
@@ -6268,6 +6295,7 @@ fn painted_menu_screen_stamps(
             text: String::new(),
             fg: style.fg.unwrap_or_else(|| base.fg.unwrap_or(ratatui::style::Color::Reset)),
             bg: style.bg.unwrap_or_else(|| base.bg.unwrap_or(ratatui::style::Color::Reset)),
+            modifier: ratatui::style::Style::default().patch(style).add_modifier,
         });
     }
     for t in runs {
@@ -6286,6 +6314,7 @@ fn painted_menu_screen_stamps(
             text: text.into_owned(),
             fg: style.fg.unwrap_or_else(|| base.fg.unwrap_or(ratatui::style::Color::Reset)),
             bg: style.bg.unwrap_or_else(|| base.bg.unwrap_or(ratatui::style::Color::Reset)),
+            modifier: ratatui::style::Style::default().patch(style).add_modifier,
         });
     }
     out
