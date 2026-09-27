@@ -489,6 +489,7 @@ fn raster_chrome_text() -> Option<Vec<app::render::v6_layout::V6TextRun>> {
         more_prompt_pair: host_pair,
         text: v6::V6TextMode::RasteriseAndRecord,
         bottom_anchor_menu: false,
+        hybrid_text_rows: std::collections::HashSet::new(),
     };
     let f = app::render::screen::compose_v6_frame(&layout, v6::RasterFrame::native(native), &inputs);
     Some(f.text)

@@ -399,6 +399,7 @@ fn menu_anchor_compose(
         more_prompt_pair: (HOST_INK, HOST_PAGE),
         text,
         bottom_anchor_menu,
+        hybrid_text_rows: std::collections::HashSet::new(),
     };
     compose_v6_frame(&layout, frame, &inputs)
 }

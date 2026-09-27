@@ -2925,6 +2925,30 @@ pub struct V6FrameInputs<'a> {
     /// beside it, and the story's prose box fills the gap above. No effect on a
     /// frame that is not Journey's shape ([`menu_strip_below_story`]).
     pub bottom_anchor_menu: bool,
+    /// Native-pixel row TOPS a Hybrid host already lays out itself in terminal
+    /// cells — [`hybrid_chrome_layout`]'s own `runs`, each mapped through
+    /// `run.y.max(1) - 1` — published for a host that draws its own chrome
+    /// under [`V6TextMode::RecordOnly`](crate::render::v6_layout::V6TextMode::RecordOnly)
+    /// and so cannot reach the terminal's private glyph-row set itself
+    /// (SQ-1609 Gap 2). Empty (every constructor's default) reproduces
+    /// today's behaviour exactly: [`compose_v6_frame_into`]'s three
+    /// `TextLayer` sites all read `TextLayer::All`, and
+    /// `fill_reverse_row_gaps` (`crate::render::v6_layout`) bakes its
+    /// reversed-gap fill into every row it finds — right for a host that
+    /// rasterises the whole composite itself, wrong for one whose OWN
+    /// cell-based layout already owns that row. Arthur's status bar is the
+    /// specimen: `fill_reverse_row_gaps` bakes an opaque `#dcdcdc` block into
+    /// the bare cell before "St Anne's Day" at native y 192-208, and a
+    /// Hybrid-drawing host's own cell-laid bar overlaps that pixel range at a
+    /// different scale, so the composite's baked-in copy shows as a stray
+    /// reversed block above or below the real bar depending on pane size.
+    /// Populate this only with rows the host's OWN Hybrid-style layout
+    /// already draws — a plain `RecordOnly` host with no cell layout of its
+    /// own (a GUI or web client rasterising everything itself) must leave it
+    /// empty, or it silently loses this fill with nothing recorded to
+    /// replace it, since `fill_reverse_row_gaps` paints straight onto the
+    /// canvas rather than through [`GlyphSink`](crate::render::v6_layout::GlyphSink).
+    pub hybrid_text_rows: std::collections::HashSet<u16>,
 }
 
 impl<'a> V6FrameInputs<'a> {
@@ -2984,6 +3008,7 @@ impl<'a> V6FrameInputs<'a> {
             more_prompt_pair: v6_default_pair(mp, state.term_default_colors.fg, state.term_default_colors.bg),
             text: crate::render::v6_layout::V6TextMode::Rasterise,
             bottom_anchor_menu: false,
+            hybrid_text_rows: std::collections::HashSet::new(),
         }
     }
 }
@@ -3379,14 +3404,25 @@ fn compose_v6_frame_into(
     let canvas_native =
         if moved.is_empty() { native } else { (native.0, frame.canvas_h as u16) };
     // Raster has no cells to draw text with, so it needs every run imaged: the
-    // empty set is not a default here, it is this path's answer (SQ-0903).
+    // empty set is this path's own default answer (SQ-0903) — UNLESS the host
+    // has opted in via `hybrid_text_rows` (SQ-1609 Gap 2), because it is drawing
+    // those exact rows itself in cells and does not want this canvas's copy.
+    // Computed once and reused at all three `TextLayer` sites below, mirroring
+    // how the terminal's own Hybrid draw computes `glyph_rows` once and threads
+    // one `TextLayer::SkipGlyphRows(&glyph_rows)` through its three analogous
+    // calls.
+    let text_layer = if inputs.hybrid_text_rows.is_empty() {
+        v6::TextLayer::All
+    } else {
+        v6::TextLayer::SkipGlyphRows(&inputs.hybrid_text_rows)
+    };
     let mut canvas = v6::build_chrome_canvas_into(
         &chrome,
         canvas_native,
         default_fg,
         default_bg,
         inputs.colors,
-        v6::TextLayer::All,
+        text_layer,
         inputs.face,
         glyphs,
     );
@@ -3405,14 +3441,14 @@ fn compose_v6_frame_into(
     // what is left, because a fill is the oldest thing on the screen: the game
     // filled its rectangle, then printed the label on top of it.
     let grounds = |c: &mut image::RgbaImage| {
-        v6::blit_paint_ground(c, inputs.paint, v6::TextLayer::All, inputs.face.cell());
+        v6::blit_paint_ground(c, inputs.paint, text_layer, inputs.face.cell());
         if honor {
             v6::fill_window_pages(
                 c,
                 &chrome,
                 layout.story,
                 inputs.colors,
-                v6::TextLayer::All,
+                text_layer,
                 inputs.face.cell(),
             );
         } else {
