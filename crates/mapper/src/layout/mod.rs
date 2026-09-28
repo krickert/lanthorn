@@ -427,10 +427,17 @@ fn edges_respected_at(
         };
         if axis_side_respected(actual.0, delta.0) && axis_side_respected(actual.1, delta.1) {
             // Reciprocal (bidirectional) links weigh more than one-way exits.
+            // Keyed off `c`'s own origin/dest (swapped), not the derived `other`/`id` pair:
+            // checking `other`/`id` directly re-finds this SAME one-way edge whenever `id`
+            // happens to be `c`'s destination, since `other == c.origin && id == c.dest` is
+            // trivially true of `c` itself — scoring one edge as reciprocal from one end and
+            // one-way from the other (SQ-1636). A genuine reciprocal pair needs a real edge
+            // walked the other way, `c.dest -> c.origin`, not `c` read from its destination's
+            // side.
             let reciprocal = graph
                 .connections()
                 .iter()
-                .any(|r| r.origin == other && r.dest == id && grid_offset(r.dir).is_some());
+                .any(|r| r.origin == c.dest && r.dest == c.origin && grid_offset(r.dir).is_some());
             sat += if reciprocal { RECIPROCAL_WEIGHT } else { 1 };
         }
     }
@@ -460,10 +467,17 @@ pub fn room_side_score(graph: &MapGraph, id: RoomId) -> usize {
             (p.0 - op.0, p.1 - op.1)
         };
         if axis_side_respected(actual.0, delta.0) && axis_side_respected(actual.1, delta.1) {
+            // Keyed off `c`'s own origin/dest (swapped), not the derived `other`/`id` pair:
+            // checking `other`/`id` directly re-finds this SAME one-way edge whenever `id`
+            // happens to be `c`'s destination, since `other == c.origin && id == c.dest` is
+            // trivially true of `c` itself — scoring one edge as reciprocal from one end and
+            // one-way from the other (SQ-1636). A genuine reciprocal pair needs a real edge
+            // walked the other way, `c.dest -> c.origin`, not `c` read from its destination's
+            // side.
             let reciprocal = graph
                 .connections()
                 .iter()
-                .any(|r| r.origin == other && r.dest == id && grid_offset(r.dir).is_some());
+                .any(|r| r.origin == c.dest && r.dest == c.origin && grid_offset(r.dir).is_some());
             sat += if reciprocal { RECIPROCAL_WEIGHT } else { 1 };
         }
     }
@@ -495,10 +509,17 @@ pub fn room_alignment_score(graph: &MapGraph, id: RoomId) -> usize {
             (p.0 - op.0, p.1 - op.1)
         };
         if axis_sign_ok(actual.0, delta.0) && axis_sign_ok(actual.1, delta.1) {
+            // Keyed off `c`'s own origin/dest (swapped), not the derived `other`/`id` pair:
+            // checking `other`/`id` directly re-finds this SAME one-way edge whenever `id`
+            // happens to be `c`'s destination, since `other == c.origin && id == c.dest` is
+            // trivially true of `c` itself — scoring one edge as reciprocal from one end and
+            // one-way from the other (SQ-1636). A genuine reciprocal pair needs a real edge
+            // walked the other way, `c.dest -> c.origin`, not `c` read from its destination's
+            // side.
             let reciprocal = graph
                 .connections()
                 .iter()
-                .any(|r| r.origin == other && r.dest == id && grid_offset(r.dir).is_some());
+                .any(|r| r.origin == c.dest && r.dest == c.origin && grid_offset(r.dir).is_some());
             sat += if reciprocal { RECIPROCAL_WEIGHT } else { 1 };
         }
     }
@@ -2507,6 +2528,81 @@ mod tests {
         // which is None for up/down).
         assert!(updown_score < reciprocal_ns_score,
             "up/down (={updown_score}) must score below a reciprocal N/S pair (={reciprocal_ns_score})");
+    }
+
+    // ── SQ-1636 ───────────────────────────────────────────────────────────────
+
+    /// SQ-1636: the reciprocity check used to be asymmetric — a one-way edge scored
+    /// `RECIPROCAL_WEIGHT` (2) when evaluated from its DESTINATION's side (because the old
+    /// check `r.origin == other && r.dest == id` trivially re-matched the very same one-way
+    /// edge sitting in the graph) but only 1 when evaluated from its ORIGIN's side. Forest
+    /// (#76) in a real Zork I Amiga save had exactly this shape: a one-way edge IN from Canyon
+    /// View and a one-way edge OUT to South of House, each genuinely one-way (no real return
+    /// edge either way) — the incoming edge was wrongly scored as reciprocal (weight 2) while
+    /// the outgoing edge was correctly scored one-way (weight 1), purely because of which end
+    /// the check was run from. Build the same shape (one incoming one-way edge, one outgoing
+    /// one-way edge, no real return edge for either) and confirm both now score identically as
+    /// one-way (weight 1 each), regardless of which side of the connection `id` sits on.
+    #[test]
+    fn one_way_edges_score_identically_regardless_of_which_end_is_scored() {
+        use crate::direction::Direction;
+        use crate::graph::MapGraph;
+
+        // A --W--> F (one-way in), F --NW--> B (one-way out). Neither has a real return edge.
+        let mut g = MapGraph::new();
+        g.upsert_room(1, "F".into()); // Forest-analog
+        g.upsert_room(2, "A".into()); // Canyon-View-analog (origin of the incoming edge)
+        g.upsert_room(3, "B".into()); // South-of-House-analog (dest of the outgoing edge)
+        g.set_pos(1, (0, 0));
+        g.set_pos(2, (2, 0)); // east of F, same row: satisfies A--W-->F
+        g.set_pos(3, (-3, -4)); // northwest of F: satisfies F--NW-->B
+        g.add_edge(2, Direction::W, 1);
+        g.add_edge(1, Direction::NW, 3);
+
+        // Both edges are satisfied at these positions, and both are genuinely one-way (no
+        // edge exists in the opposite direction for either pair) — so both must weigh 1, for
+        // a total of 2. Before the fix, the incoming edge scored 2 (wrongly "reciprocal") for
+        // a wrong total of 3.
+        assert_eq!(
+            room_alignment_score(&g, 1),
+            2,
+            "an incoming one-way edge must weigh the same (1) as an outgoing one-way edge"
+        );
+        assert_eq!(
+            room_side_score(&g, 1),
+            2,
+            "room_side_score must agree: both one-way edges weigh 1, not one of them weighing 2"
+        );
+    }
+
+    /// SQ-1636 companion: the fix must not collapse every edge to weight 1 — a GENUINE
+    /// reciprocal pair (a real edge walked in both directions) must still weigh
+    /// `RECIPROCAL_WEIGHT` (2), and must do so symmetrically from EITHER room's perspective,
+    /// not just the origin side that already happened to be correct before the fix.
+    #[test]
+    fn genuine_reciprocal_pair_still_scores_double_from_both_ends() {
+        use crate::direction::Direction;
+        use crate::graph::MapGraph;
+
+        let mut g = MapGraph::new();
+        g.upsert_room(1, "A".into());
+        g.upsert_room(2, "B".into());
+        g.set_pos(1, (0, 0));
+        g.set_pos(2, (0, -1)); // B directly north of A
+        g.add_edge(1, Direction::N, 2); // A --N--> B
+        g.add_edge(2, Direction::S, 1); // B --S--> A (real return edge)
+
+        // Each room touches BOTH directed edges of the pair (once as that edge's origin, once
+        // as its destination), and a genuine reciprocal pair must weigh RECIPROCAL_WEIGHT from
+        // EITHER end — so each room's total is `2 * RECIPROCAL_WEIGHT`. Critically, this checks
+        // BOTH directions of the asymmetry the bug had: A's N-edge is scored with A as origin
+        // (the branch that was never buggy) and A's incoming S-edge with A as destination
+        // (exactly the branch that used to be wrong) — same for B, mirrored.
+        let want = 2 * RECIPROCAL_WEIGHT;
+        assert_eq!(room_alignment_score(&g, 1), want, "A's side of a genuine reciprocal pair");
+        assert_eq!(room_alignment_score(&g, 2), want, "B's side of the same genuine reciprocal pair");
+        assert_eq!(room_side_score(&g, 1), want);
+        assert_eq!(room_side_score(&g, 2), want);
     }
 
     #[test]

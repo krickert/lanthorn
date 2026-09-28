@@ -6556,6 +6556,71 @@ mod tests {
             "repair must keep the reciprocal N/S pair 74<->76 column-locked: 74={:?} 76={:?}", p(&g,74), p(&g,76));
     }
 
+    /// SQ-1636: `repair_directional_hints` end-to-end, reproducing the Forest/#76 shape from a
+    /// real Zork I Amiga r88 save — a room (F) with one incoming one-way edge (from A) and one
+    /// outgoing one-way edge (to B), neither with a real return edge. F starts positioned so
+    /// A's incoming edge is satisfied and B's outgoing edge is not; the only improving move
+    /// available moves F to satisfy B's edge at the cost of A's (a genuine trade between two
+    /// edges that are BOTH one-way).
+    ///
+    /// Before the fix, `room_alignment_score`'s trial for this move was computed as a LOSS
+    /// (moving away from A cost `RECIPROCAL_WEIGHT` because the incoming edge was wrongly
+    /// scored reciprocal, while gaining B's edge only added 1), so `repair_directional_hints`
+    /// rejected it and F never moved. After the fix both edges score 1, the trade is a wash,
+    /// and the move is accepted.
+    ///
+    /// B is boxed in by five filler rooms occupying every cell it could otherwise reach that
+    /// would ALSO satisfy its own edge (the loop below, ids 200-204) — without them B, not F,
+    /// would be the one to move (a cheaper, bug-independent alternative that would trivially
+    /// pass either way and mask the defect this test exists to catch).
+    #[test]
+    fn repair_accepts_the_trade_a_one_way_edge_for_a_one_way_edge_after_the_reciprocity_fix() {
+        use mapper::graph::MapGraph;
+
+        const F: u32 = 100; // Forest-analog
+        const A: u32 = 101; // Canyon-View-analog: A --W--> F, one-way, satisfied at orig
+        const B: u32 = 102; // South-of-House-analog: F --S--> B, one-way, satisfied only after F moves
+
+        let mut g = MapGraph::new();
+        g.upsert_room(F, "F".into());
+        g.upsert_room(A, "A".into());
+        g.upsert_room(B, "B".into());
+        g.set_pos(F, (0, 0));
+        g.set_pos(A, (5, 0)); // same row, east of F: A--W-->F satisfied
+        g.set_pos(B, (0, -1)); // north of F: F--S-->B NOT satisfied (B must be south of F)
+        g.add_edge(A, Direction::W, F);
+        g.add_edge(F, Direction::S, B);
+
+        // Block every cell B could reach (radius 2) that would satisfy F--S-->B by B moving
+        // instead of F: with B at (0,-1), only y=+1 (i.e. (dx, 1) for dx in -2..=2) is reachable
+        // within radius 2 and puts B south of F's ORIGINAL position (0,0).
+        for (offset, dx) in (-2..=2).enumerate() {
+            let id = 200 + offset as u32;
+            g.upsert_room(id, "wall".into());
+            g.set_pos(id, (dx, 1));
+        }
+
+        let align_orig = mapper::layout::room_alignment_score(&g, F);
+        let base_score = mapper::layout::directional_hint_score(&g);
+
+        repair_directional_hints(&mut g, 2, 3);
+
+        let p = g.room(F).unwrap().pos.unwrap();
+        assert_eq!(
+            p,
+            (0, -2),
+            "F must move to (0,-2) — the only cell that satisfies F--S-->B while staying on \
+             A's required column — trading A's edge for B's: align_orig={align_orig} \
+             base_score={base_score}, got {p:?}",
+        );
+        assert_eq!(
+            mapper::layout::directional_hint_score(&g),
+            base_score + (g.connections().len() + 1),
+            "the global hint score must have gone up by exactly one compass edge's weight",
+        );
+        assert_eq!(render_overlap_stats(&g).0, 0, "the accepted move must not introduce an illegal overlap");
+    }
+
     #[test]
     fn yielded_updown_pair_draws_a_lane_connector_not_a_stub() {
         // Up/Down pair placed far apart (yielded from a clean stack). Task 6 routes Up/Down as a
