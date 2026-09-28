@@ -884,6 +884,13 @@ pub fn finish_resumed_turn(
     let struct_gen_before = mapper.graph.struct_gen();
     let room_before = mapper.graph.current();
     apply_turn(mapper, "", &result, &mut state.death_watch);
+    // SQ-1625: the resumed half of a turn drains through the SAME `finish_turn`/`drain_turn`
+    // a submitted command does (this function "mirrors the post-turn block in the `submit`
+    // path" per its own doc above), so it can carry a real `description` too — e.g. a Glulx
+    // `@save`/`@restore` continuation that goes on to print more of the room. `state.turns` was
+    // already advanced for this command by `finish_command_turn`; a resume is the second half
+    // of that SAME turn, not a new one.
+    crate::session::apply_room_description(mapper, state.turns, &result);
     // The resumed half of a turn can be where the death lands; it names no direction of its own,
     // so only the move still held from the submit path can be rolled back. (SQ-0671)
     crate::session::rollback_tried_on_death(
@@ -1093,8 +1100,10 @@ fn apply_turn_events(state: &mut AppState, result: &TurnResult) {
 /// beep/location/diagnostic events, applies the mapper turn, opens a
 /// game-initiated save/restore dialog if requested, and recenters on a location
 /// change. Deliberately skips `post_turn_bookkeeping` (history/inventory/
-/// auto-save): this is not a completed player turn. Returns `true` if the game
-/// quit (the caller should break the event loop).
+/// auto-save) AND `apply_room_description` (SQ-1625): this is not a completed
+/// player turn, and `state.turns` was never advanced for it, so there is no
+/// turn number a captured description could correctly be stamped with. Returns
+/// `true` if the game quit (the caller should break the event loop).
 pub fn apply_game_driven_result(
     state: &mut AppState,
     mapper: &mut Mapper,
