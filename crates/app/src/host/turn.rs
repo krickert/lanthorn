@@ -2056,7 +2056,7 @@ mod tests {
         let _ = super::finish_resumed_turn(result, &mut mapper, &mut state, &mut eng, &dir, "TEST-IFID", rect);
 
         let rec = mapper.graph.item(10).expect("the resumed turn's own item observation reached the mapper");
-        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true });
+        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true, container: None });
         assert_eq!(rec.origin_turn, 1);
 
         let _ = std::fs::remove_dir_all(&dir);

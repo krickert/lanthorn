@@ -36,16 +36,36 @@ pub enum ItemLocation {
         room: RoomId,
         /// See [`ItemLocation`]'s own doc — `true` only for a top-level sighting.
         direct: bool,
+        /// SQ-1632 Fix 1: the item this one is nested inside, when the observation could state
+        /// it — the brown sack, the table. Always `None` for a direct (`direct: true`) sighting,
+        /// since the room itself is the "container" there. `None` for a nested sighting too when
+        /// the engine that captured it has no containment model to ask (Glulx, Scott — see
+        /// `app::session::ObservedItemLocation::RoomNested`'s own doc) or when a structural check
+        /// found no REAL containment relationship at all — shared/local-global scenery visible
+        /// from many rooms but a child of none of them (`zvm::world::WorldModel::
+        /// real_container_in_room`, SQ-1632 Fix 5) is filtered out before it ever reaches here,
+        /// never recorded as an item with an absent container.
+        #[serde(default)]
+        container: Option<ItemKey>,
     },
     /// Last confirmed in the player's own inventory.
     Carried,
-    /// Last confirmed directly in a room, and a LATER direct (non-recursive) look at that same
-    /// room came up empty, with the item not carried either — a real, personally-observed
-    /// absence, not an inference about anywhere else. See [`MapGraph::note_items_absent`].
+    /// Last confirmed directly in `room` at `turn`, and a LATER observation — a direct
+    /// (non-recursive) look at that same room, or (SQ-1632 Fix 4) an inventory check while the
+    /// item was last known `Carried` — came up empty, with the item not carried either: a real,
+    /// personally-observed absence, not an inference about anywhere else. See
+    /// [`MapGraph::note_items_absent`].
+    ///
+    /// `room`/`turn` (SQ-1632 Fix 2) are the LAST place and moment the item was confirmed
+    /// present before it went missing — for an item that was carried when it disappeared
+    /// (eaten, burned, destroyed), that is the room the player themselves were standing in, since
+    /// that is where the item was last WITH them. Always the older `origin_room`/`origin_turn`
+    /// pair (where the item was FIRST ever seen) for a fact a host wants about where it went
+    /// missing FROM, not merely where it started.
     ///
     /// Deliberately does not try to distinguish "destroyed" from "moved somewhere unseen" — this
     /// is honest about not knowing which, rather than guessing.
-    Vanished,
+    Vanished { room: RoomId, turn: u32 },
 }
 
 /// One item's whole recorded history on the map (SQ-1627): where the player first noticed it,
@@ -81,6 +101,17 @@ pub struct ItemRecord {
     /// failed here at least once", not as a portability verdict.
     #[serde(default)]
     pub fixed_in_place: bool,
+    /// The turn this item last transitioned from not-carried to carried (SQ-1632 Fix 3) —
+    /// "picked up on move N", which `last_seen_turn` alone cannot state once turn N+1 passes,
+    /// because that field is re-stamped on every turn the item is STILL held, re-confirmed, not
+    /// only on the turn it was first taken. Set once on that transition
+    /// ([`MapGraph::note_item_carried`]), left untouched on every following turn the item stays
+    /// carried, and cleared back to `None` the moment it is ever seen NOT carried again — dropped
+    /// ([`MapGraph::note_item_seen`]) or vanished while held ([`MapGraph::note_items_absent`]).
+    /// `None` for an item never (yet) observed carried at all. Absent from a map file written
+    /// before this existed.
+    #[serde(default)]
+    pub carried_since_turn: Option<u32>,
 }
 
 /// Sentinel used only on the wire: a room whose save predates SQ-0685 has no `seq` field at all,
@@ -1369,19 +1400,32 @@ impl MapGraph {
     /// Record this turn's observation that item `key` is present in `room` (SQ-1627, Facet 1) —
     /// via either a direct top-level sighting (`direct = true`) or one reached only by recursing
     /// into an open container (`direct = false`); see [`ItemLocation`] for why the two are kept
-    /// apart. A first sighting mints a fresh record with `room` as its origin; a later one only
-    /// ever moves `last_seen`/`last_seen_turn` — `origin_room`/`origin_turn` are written once and
-    /// never revisited, however many rooms the item passes through afterward.
+    /// apart. `container` (SQ-1632 Fix 1) is the item's immediate container for a nested sighting
+    /// — `None` for a direct one, and `None` for a nested one the caller cannot or should not
+    /// state (see [`ItemLocation::Room`]'s own doc). A first sighting mints a fresh record with
+    /// `room` as its origin; a later one only ever moves `last_seen`/`last_seen_turn` —
+    /// `origin_room`/`origin_turn` are written once and never revisited, however many rooms the
+    /// item passes through afterward. `carried_since_turn` (SQ-1632 Fix 3) is cleared: seeing an
+    /// item in a room is seeing it NOT carried, whatever it was doing before.
     ///
     /// Deliberately does NOT call [`Self::touch_layout`] — see [`Self::set_description`]'s own
     /// doc for why an automatic per-turn capture must never feed `struct_gen`'s drawn-layout memo.
-    pub fn note_item_seen(&mut self, key: ItemKey, name: String, room: RoomId, direct: bool, turn: u32) {
-        let last_seen = ItemLocation::Room { room, direct };
+    pub fn note_item_seen(
+        &mut self,
+        key: ItemKey,
+        name: String,
+        room: RoomId,
+        direct: bool,
+        container: Option<ItemKey>,
+        turn: u32,
+    ) {
+        let last_seen = ItemLocation::Room { room, direct, container };
         match self.items.get_mut(&key) {
             Some(rec) => {
                 rec.name = name;
                 rec.last_seen = last_seen;
                 rec.last_seen_turn = turn;
+                rec.carried_since_turn = None;
             }
             None => {
                 self.items.insert(
@@ -1393,6 +1437,7 @@ impl MapGraph {
                         last_seen,
                         last_seen_turn: turn,
                         fixed_in_place: false,
+                        carried_since_turn: None,
                     },
                 );
             }
@@ -1407,11 +1452,18 @@ impl MapGraph {
     /// holding it, not a claim about where the story spawned it; an item already known keeps
     /// whatever origin it was first minted with.
     ///
+    /// `carried_since_turn` (SQ-1632 Fix 3) is stamped `turn` only on the transition INTO carried
+    /// — an item already `Carried` keeps whatever pick-up turn it already has, so re-confirming
+    /// "still held" on every following turn (this function's ordinary case) never overwrites it.
+    ///
     /// Deliberately does NOT call [`Self::touch_layout`] — same reasoning as [`Self::note_item_seen`].
     pub fn note_item_carried(&mut self, key: ItemKey, name: String, room_if_new: RoomId, turn: u32) {
         match self.items.get_mut(&key) {
             Some(rec) => {
                 rec.name = name;
+                if rec.last_seen != ItemLocation::Carried {
+                    rec.carried_since_turn = Some(turn);
+                }
                 rec.last_seen = ItemLocation::Carried;
                 rec.last_seen_turn = turn;
             }
@@ -1425,33 +1477,43 @@ impl MapGraph {
                         last_seen: ItemLocation::Carried,
                         last_seen_turn: turn,
                         fixed_in_place: false,
+                        carried_since_turn: Some(turn),
                     },
                 );
             }
         }
     }
 
-    /// Sweep `room` for items whose last-confirmed sighting was a DIRECT (top-level) one in this
-    /// same room, and that `touched` (every item key this turn's observations named ANYWHERE —
-    /// this room, any other room, or carried; see `app::session::apply_item_observations`) does
-    /// not contain — mark each [`ItemLocation::Vanished`] (SQ-1627, Facet 1).
+    /// Sweep for items that just went missing, from two vantage points, neither broader than what
+    /// the player standing in `room` this turn actually confirmed (SQ-1627 Facet 1; SQ-1632 Fix
+    /// 4 added the second): a DIRECT (top-level) sighting in this same room, or a last-known
+    /// `Carried` item — and that `touched` (every item key this turn's observations named
+    /// ANYWHERE — this room, any other room, or carried; see
+    /// `app::session::apply_item_observations`) does not contain — mark each
+    /// [`ItemLocation::Vanished`], stamped with `room`/`turn`: the room the player is standing in
+    /// NOW, since for a carried item that vanished, that is where it was last WITH them.
     ///
     /// Never touches a record last seen only NESTED in a container (`direct: false`) or last seen
     /// in a *different* room: neither is evidence about `room` at all, and guessing would be
     /// exactly the false positive this feature's correction (see [`ItemLocation`]'s doc) exists to
     /// avoid — closing a container the item sits in, or simply being elsewhere, leaves the record
-    /// untouched rather than marking it vanished.
+    /// untouched rather than marking it vanished. A carried item that just vanished also has its
+    /// `carried_since_turn` cleared (SQ-1632 Fix 3) — it is no longer held, whatever it was doing
+    /// a moment ago.
     ///
     /// Deliberately does NOT call [`Self::touch_layout`] — same reasoning as [`Self::note_item_seen`].
     pub fn note_items_absent(&mut self, room: RoomId, turn: u32, touched: &std::collections::BTreeSet<ItemKey>) {
-        let target = ItemLocation::Room { room, direct: true };
         for (key, rec) in self.items.iter_mut() {
             if touched.contains(key) {
                 continue;
             }
-            if rec.last_seen == target {
-                rec.last_seen = ItemLocation::Vanished;
+            let vanished_from_room =
+                matches!(rec.last_seen, ItemLocation::Room { room: r, direct: true, .. } if r == room);
+            let vanished_while_carried = rec.last_seen == ItemLocation::Carried;
+            if vanished_from_room || vanished_while_carried {
+                rec.last_seen = ItemLocation::Vanished { room, turn };
                 rec.last_seen_turn = turn;
+                rec.carried_since_turn = None;
             }
         }
     }
@@ -2299,11 +2361,11 @@ mod struct_gen_tests {
         let mut g = MapGraph::new();
         g.upsert_room(1, "Hall".into());
         let gen = g.struct_gen();
-        g.note_item_seen(10, "a lamp".into(), 1, true, 1);
+        g.note_item_seen(10, "a lamp".into(), 1, true, None, 1);
         assert_eq!(g.struct_gen(), gen, "a first sighting must not bump struct_gen");
-        g.note_item_seen(10, "a lamp".into(), 1, true, 2);
+        g.note_item_seen(10, "a lamp".into(), 1, true, None, 2);
         assert_eq!(g.struct_gen(), gen, "re-confirming the same sighting must not bump it either");
-        g.note_item_seen(10, "a lamp".into(), 2, false, 3);
+        g.note_item_seen(10, "a lamp".into(), 2, false, None, 3);
         assert_eq!(g.struct_gen(), gen, "moving to a different room, or going nested, must not bump it either");
     }
 
@@ -2322,11 +2384,11 @@ mod struct_gen_tests {
     fn note_items_absent_never_bumps_struct_gen() {
         let mut g = MapGraph::new();
         g.upsert_room(1, "Hall".into());
-        g.note_item_seen(10, "a lamp".into(), 1, true, 1);
+        g.note_item_seen(10, "a lamp".into(), 1, true, None, 1);
         let gen = g.struct_gen();
         g.note_items_absent(1, 2, &std::collections::BTreeSet::new());
         assert_eq!(g.struct_gen(), gen, "marking an item vanished must not bump struct_gen");
-        assert_eq!(g.item(10).unwrap().last_seen, ItemLocation::Vanished);
+        assert_eq!(g.item(10).unwrap().last_seen, ItemLocation::Vanished { room: 1, turn: 2 });
     }
 
     /// SQ-1627 regression, same shape as `note_item_seen_never_bumps_struct_gen`.
@@ -2334,7 +2396,7 @@ mod struct_gen_tests {
     fn note_item_fixed_in_place_never_bumps_struct_gen() {
         let mut g = MapGraph::new();
         g.upsert_room(1, "Hall".into());
-        g.note_item_seen(10, "a mailbox".into(), 1, true, 1);
+        g.note_item_seen(10, "a mailbox".into(), 1, true, None, 1);
         let gen = g.struct_gen();
         g.note_item_fixed_in_place(10);
         assert_eq!(g.struct_gen(), gen, "flagging an item fixed-in-place must not bump struct_gen");
@@ -2348,14 +2410,18 @@ mod struct_gen_tests {
         let mut g = MapGraph::new();
         g.upsert_room(1, "A".into());
         g.upsert_room(2, "B".into());
-        g.note_item_seen(10, "a lamp".into(), 1, true, 1);
+        g.note_item_seen(10, "a lamp".into(), 1, true, None, 1);
         g.note_item_carried(10, "a lamp".into(), 1, 2);
-        g.note_item_seen(10, "a lamp".into(), 2, true, 3);
+        g.note_item_seen(10, "a lamp".into(), 2, true, None, 3);
 
         let rec = g.item(10).unwrap();
         assert_eq!(rec.origin_room, 1, "origin stays the room it was FIRST seen in");
         assert_eq!(rec.origin_turn, 1);
-        assert_eq!(rec.last_seen, ItemLocation::Room { room: 2, direct: true }, "current location moved to B");
+        assert_eq!(
+            rec.last_seen,
+            ItemLocation::Room { room: 2, direct: true, container: None },
+            "current location moved to B"
+        );
     }
 
     /// SQ-1627, Facet 1 correction: an item sitting loose (direct) in a room that goes absent,
@@ -2364,11 +2430,11 @@ mod struct_gen_tests {
     fn a_direct_item_absent_and_uncarried_on_a_later_visit_vanishes() {
         let mut g = MapGraph::new();
         g.upsert_room(1, "Room".into());
-        g.note_item_seen(10, "a coin".into(), 1, true, 1);
+        g.note_item_seen(10, "a coin".into(), 1, true, None, 1);
         // Turn 2: back in room 1, the direct listing no longer shows the coin, and it is not
         // carried — `touched` (this turn's full observation set) is empty.
         g.note_items_absent(1, 2, &std::collections::BTreeSet::new());
-        assert_eq!(g.item(10).unwrap().last_seen, ItemLocation::Vanished);
+        assert_eq!(g.item(10).unwrap().last_seen, ItemLocation::Vanished { room: 1, turn: 2 });
         assert_eq!(g.item(10).unwrap().last_seen_turn, 2);
     }
 
@@ -2380,13 +2446,13 @@ mod struct_gen_tests {
         let mut g = MapGraph::new();
         g.upsert_room(1, "Room".into());
         // The leaflet was seen only by recursing into the (open) mailbox — direct: false.
-        g.note_item_seen(10, "a leaflet".into(), 1, false, 1);
+        g.note_item_seen(10, "a leaflet".into(), 1, false, None, 1);
         let before = g.item(10).unwrap().clone();
         // The mailbox is now closed; this turn's recursive query cannot reach the leaflet at
         // all, so it never appears in `touched`.
         g.note_items_absent(1, 2, &std::collections::BTreeSet::new());
         assert_eq!(g.item(10).unwrap(), &before, "a nested-only sighting is never vanish-eligible");
-        assert_ne!(g.item(10).unwrap().last_seen, ItemLocation::Vanished);
+        assert!(!matches!(g.item(10).unwrap().last_seen, ItemLocation::Vanished { .. }));
     }
 
     /// SQ-1627, Facet 1 correction: an item observed elsewhere this turn (touched) is never
@@ -2397,16 +2463,16 @@ mod struct_gen_tests {
         let mut g = MapGraph::new();
         g.upsert_room(1, "A".into());
         g.upsert_room(2, "B".into());
-        g.note_item_seen(10, "a coin".into(), 1, true, 1);
+        g.note_item_seen(10, "a coin".into(), 1, true, None, 1);
         // The coin was actually carried away and dropped in B — the record now says Room(B) —
         // sweeping A must not touch a record that no longer claims to be in A at all.
-        g.note_item_seen(10, "a coin".into(), 2, true, 2);
+        g.note_item_seen(10, "a coin".into(), 2, true, None, 2);
         let mut touched = std::collections::BTreeSet::new();
         touched.insert(10);
         g.note_items_absent(1, 3, &touched);
         assert_eq!(
             g.item(10).unwrap().last_seen,
-            ItemLocation::Room { room: 2, direct: true },
+            ItemLocation::Room { room: 2, direct: true, container: None },
             "the record already says B, not A, so sweeping A must leave it alone"
         );
     }

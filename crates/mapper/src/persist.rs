@@ -554,9 +554,9 @@ mod tests {
 
         let mut m = Mapper::default();
         m.observe(1, "West of House", None);
-        m.graph.note_item_seen(10, "a small mailbox".into(), 1, true, 1);
+        m.graph.note_item_seen(10, "a small mailbox".into(), 1, true, None, 1);
         m.graph.note_item_fixed_in_place(10);
-        m.graph.note_item_seen(11, "a leaflet".into(), 1, false, 2);
+        m.graph.note_item_seen(11, "a leaflet".into(), 1, false, Some(10), 2);
         m.graph.note_item_carried(12, "a lamp".into(), 1, 3);
 
         let m2 = from_json(&to_json(&m)).unwrap();
@@ -564,16 +564,21 @@ mod tests {
         assert_eq!(mailbox.name, "a small mailbox");
         assert_eq!(mailbox.origin_room, 1);
         assert_eq!(mailbox.origin_turn, 1);
-        assert_eq!(mailbox.last_seen, ItemLocation::Room { room: 1, direct: true });
+        assert_eq!(mailbox.last_seen, ItemLocation::Room { room: 1, direct: true, container: None });
         assert!(mailbox.fixed_in_place, "the fixed-in-place flag survives");
 
         let leaflet = m2.graph.item(11).unwrap();
-        assert_eq!(leaflet.last_seen, ItemLocation::Room { room: 1, direct: false }, "the nested flag survives");
+        assert_eq!(
+            leaflet.last_seen,
+            ItemLocation::Room { room: 1, direct: false, container: Some(10) },
+            "the nested flag AND its container (SQ-1632 Fix 1) survive"
+        );
         assert!(!leaflet.fixed_in_place);
 
         let lamp = m2.graph.item(12).unwrap();
         assert_eq!(lamp.last_seen, ItemLocation::Carried);
         assert_eq!(lamp.origin_room, 1, "carried-from-first-sighting still names an origin room");
+        assert_eq!(lamp.carried_since_turn, Some(3), "SQ-1632 Fix 3: the pick-up turn survives too");
     }
 
     /// A map file saved before SQ-1627 has no `items` field at all; it must load with an empty
@@ -585,5 +590,38 @@ mod tests {
         let m = from_json(old).unwrap();
         assert!(m.graph.items().next().is_none());
         assert!(m.graph.item(1).is_none());
+    }
+
+    /// SQ-1632: a map file saved before Fix 1/Fix 3 has an item's `Room` variant with no
+    /// `container` field, and no `carried_since_turn` field on the record at all — both must load
+    /// as `None` rather than fail to parse, the same `#[serde(default)]` back-compat shape every
+    /// addition to `ItemRecord`/`ItemLocation` has needed when it was new (see the test just
+    /// above, for `description`/the whole `items` field). Built by round-tripping a REAL record
+    /// through `to_json`, then removing the two new fields as JSON KEYS (not merely nulling their
+    /// values) via `serde_json::Value`, so this test cannot drift from whatever the wire format
+    /// actually is and does not depend on `to_json`'s exact whitespace/indentation.
+    #[test]
+    fn a_pre_sq1632_item_record_has_no_container_or_carried_since_turn_and_loads_fine() {
+        use crate::graph::ItemLocation;
+
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        m.graph.note_item_seen(11, "a leaflet".into(), 1, false, Some(10), 2);
+        let mut value: serde_json::Value = serde_json::from_str(&to_json(&m)).unwrap();
+        let rec = value.get_mut("items").unwrap().get_mut("11").unwrap().as_object_mut().unwrap();
+        assert!(rec.contains_key("carried_since_turn"), "premise: the fresh save DOES carry the field");
+        rec.remove("carried_since_turn");
+        let room = rec.get_mut("last_seen").unwrap().get_mut("Room").unwrap().as_object_mut().unwrap();
+        assert!(room.contains_key("container"), "premise: and the nested field too");
+        room.remove("container");
+
+        let m2 = from_json(&value.to_string()).unwrap();
+        let leaflet = m2.graph.item(11).unwrap();
+        assert_eq!(
+            leaflet.last_seen,
+            ItemLocation::Room { room: 1, direct: false, container: None },
+            "a missing container field must default to None, not fail to parse"
+        );
+        assert_eq!(leaflet.carried_since_turn, None, "a missing carried_since_turn field defaults to None too");
     }
 }

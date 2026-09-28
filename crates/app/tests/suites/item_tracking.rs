@@ -88,6 +88,12 @@ fn a_leaflet_seen_only_inside_the_mailbox_is_nested_and_survives_the_mailbox_clo
         return;
     };
     let opened = s.submit("open mailbox");
+    let mailbox_key = opened
+        .items
+        .iter()
+        .find(|o| o.name.contains("mailbox"))
+        .expect("the mailbox itself is still a direct sighting")
+        .key;
     let leaflet = opened
         .items
         .iter()
@@ -95,8 +101,8 @@ fn a_leaflet_seen_only_inside_the_mailbox_is_nested_and_survives_the_mailbox_clo
         .expect("opening the mailbox reveals the leaflet");
     assert_eq!(
         leaflet.location,
-        app::session::ObservedItemLocation::RoomNested,
-        "the leaflet is reached only by recursing into the open mailbox, never the room's own top level"
+        app::session::ObservedItemLocation::RoomNested { container: Some(mailbox_key) },
+        "SQ-1632 Fix 1: the leaflet is nested inside the mailbox specifically, not just \"nested somewhere\""
     );
     let leaflet_key = leaflet.key;
 
@@ -105,7 +111,11 @@ fn a_leaflet_seen_only_inside_the_mailbox_is_nested_and_survives_the_mailbox_clo
     app::session::apply_item_observations(&mut mapper, 1, &opened);
     assert_eq!(
         mapper.graph.item(leaflet_key).unwrap().last_seen,
-        mapper::graph::ItemLocation::Room { room: opened.location.as_ref().unwrap().number, direct: false }
+        mapper::graph::ItemLocation::Room {
+            room: opened.location.as_ref().unwrap().number,
+            direct: false,
+            container: Some(mailbox_key),
+        }
     );
 
     // Close the mailbox — the leaflet drops out of every observation entirely (unreachable, not
@@ -120,10 +130,17 @@ fn a_leaflet_seen_only_inside_the_mailbox_is_nested_and_survives_the_mailbox_clo
     app::session::apply_item_observations(&mut mapper, 3, &looked);
 
     let rec = mapper.graph.item(leaflet_key).unwrap();
-    assert_ne!(rec.last_seen, mapper::graph::ItemLocation::Vanished, "a nested-only item must never read as vanished when its container closes");
+    assert!(
+        !matches!(rec.last_seen, mapper::graph::ItemLocation::Vanished { .. }),
+        "a nested-only item must never read as vanished when its container closes"
+    );
     assert_eq!(
         rec.last_seen,
-        mapper::graph::ItemLocation::Room { room: opened.location.as_ref().unwrap().number, direct: false },
+        mapper::graph::ItemLocation::Room {
+            room: opened.location.as_ref().unwrap().number,
+            direct: false,
+            container: Some(mailbox_key),
+        },
         "the record is left exactly as it was — the correction's whole point"
     );
 }
@@ -150,15 +167,32 @@ fn taking_and_dropping_the_leaflet_moves_its_tracked_location() {
     let taken = drive(&mut s, &mut mapper, "take leaflet");
     let leaflet_key = taken.items.iter().find(|o| o.name.contains("leaflet")).expect("still observed, now carried").key;
     assert_eq!(mapper.graph.item(leaflet_key).unwrap().last_seen, mapper::graph::ItemLocation::Carried);
+    assert_eq!(
+        mapper.graph.item(leaflet_key).unwrap().carried_since_turn,
+        Some(2),
+        "SQ-1632 Fix 3: picked up on turn 2 (open mailbox=1, take leaflet=2)"
+    );
     let origin_room = mapper.graph.item(leaflet_key).unwrap().origin_room;
+
+    // Re-confirming it's STILL carried (an ordinary look) must not disturb the pick-up turn.
+    drive(&mut s, &mut mapper, "look");
+    assert_eq!(
+        mapper.graph.item(leaflet_key).unwrap().carried_since_turn,
+        Some(2),
+        "still held — the pick-up turn does not slide forward on a re-confirmation"
+    );
 
     drive(&mut s, &mut mapper, "drop leaflet");
     let rec = mapper.graph.item(leaflet_key).unwrap();
     assert_eq!(rec.origin_room, origin_room, "origin never moves");
     assert_eq!(
         rec.last_seen,
-        mapper::graph::ItemLocation::Room { room: origin_room, direct: true },
+        mapper::graph::ItemLocation::Room { room: origin_room, direct: true, container: None },
         "dropped back in the same room — a direct sighting again"
+    );
+    assert_eq!(
+        rec.carried_since_turn, None,
+        "SQ-1632 Fix 3: dropping it clears the pick-up turn — it is not carried any more"
     );
 }
 
@@ -230,6 +264,52 @@ fn an_item_in_a_never_visited_room_never_appears_in_the_registry() {
     // Every item actually tracked must have an origin room the player did, in fact, walk
     // through this session (a resolved, non-synthetic location every `submit` above returned).
     assert!(!tracked_names.is_empty(), "West of House's own mailbox should still be tracked");
+}
+
+/// SQ-1632 Fix 5: the quest's own real repro against Zork I r88 — "white house", "board",
+/// "stairs", "chimney", "kitchen window", "boarded window" are Inform/ZIL local-global/shared
+/// scenery (`zvm::world::WorldModel::local_globals`), visible from several rooms but a genuine
+/// child of NONE of them (`real_container_in_room` returns `None` for every one). Before the
+/// fix, each such object was recorded as `RoomNested` in EVERY room it happened to be visible
+/// from, reading in the item registry as though one portable object silently relocated itself as
+/// the player walked ("white house" moving West of House -> North of House -> Behind House).
+/// Falsify by temporarily dropping the `real_container_in_room` filter in
+/// `GameSession::zvm_item_observations` and re-running: this test fails with exactly that shape
+/// (confirmed before writing the fix).
+#[test]
+fn shared_scenery_never_reads_as_a_portable_item_following_the_player() {
+    let Some(mut s) = boot_zork1() else {
+        eprintln!("SKIP: gitignored stories/zork1-r88-s840726.z3 missing");
+        return;
+    };
+    let mut mapper = mapper::mapper::Mapper::default();
+    let mut turn = 0u32;
+    let mut drive = |s: &mut GameSession, mapper: &mut mapper::mapper::Mapper, cmd: &str| {
+        let r = s.submit(cmd);
+        turn += 1;
+        app::session::apply_turn(mapper, cmd, &r, &mut Default::default());
+        app::session::apply_item_observations(mapper, turn, &r);
+        r
+    };
+
+    // The quest's own repro, verbatim.
+    for cmd in [
+        "open mailbox", "take leaflet", "take mailbox", "north", "east", "open window",
+        "enter window", "open sack", "take bottle", "west", "take lamp", "take sword", "east",
+        "turn on lamp", "up", "take rope", "down", "drop bottle", "look",
+    ] {
+        drive(&mut s, &mut mapper, cmd);
+    }
+
+    // None of the scenery the report named is in the item registry at all — the fix EXCLUDES
+    // local-global scenery from item tracking outright, rather than merely pinning it to one room.
+    let names: Vec<String> = mapper.graph.items().map(|(_, rec)| rec.name.to_lowercase()).collect();
+    for scenery in ["white house", "board", "stairs", "chimney", "window"] {
+        assert!(
+            !names.iter().any(|n| n.contains(scenery)),
+            "local-global scenery {scenery:?} must never enter the item registry at all: {names:?}"
+        );
+    }
 }
 
 // ── Fix 1 / Fix 3 (SQ-1631) — a real Inform 7 game with an unidentifiable avatar ─────────────

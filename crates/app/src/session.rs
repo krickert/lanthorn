@@ -750,7 +750,16 @@ pub enum ObservedItemLocation {
     /// eligible for `Vanished` on a later absence (see `mapper::graph::ItemLocation`'s own doc).
     RoomDirect,
     /// The current room, reached only by recursing into an open container. Never vanish-eligible.
-    RoomNested,
+    ///
+    /// `container` (SQ-1632 Fix 1) names the immediate container — the brown sack, the table —
+    /// when the engine can state one. The Z-machine can (`GameSession::zvm_item_observations`,
+    /// via `zvm::world::WorldModel::real_container_in_room`) and also uses it as the SQ-1632
+    /// Fix 5 filter: an object that walk finds NO real containment relationship for at all
+    /// (local-global/shared scenery — a window, a house, visible from many rooms but a genuine
+    /// child of none of them) is dropped before it ever becomes an `ItemObservation`, rather than
+    /// surfacing here as nested-with-no-container. Glulx and Scott have no containment model to
+    /// ask at all (see each session's own item-observation doc) and always report `None`.
+    RoomNested { container: Option<mapper::graph::ItemKey> },
     /// The player's own inventory.
     Carried,
 }
@@ -4636,12 +4645,12 @@ pub fn apply_item_observations(mapper: &mut Mapper, turn: u32, result: &TurnResu
             }
             ObservedItemLocation::RoomDirect => {
                 if let Some(loc) = &result.location {
-                    mapper.graph.note_item_seen(obs.key, obs.name.clone(), loc.number, true, turn);
+                    mapper.graph.note_item_seen(obs.key, obs.name.clone(), loc.number, true, None, turn);
                 }
             }
-            ObservedItemLocation::RoomNested => {
+            ObservedItemLocation::RoomNested { container } => {
                 if let Some(loc) = &result.location {
-                    mapper.graph.note_item_seen(obs.key, obs.name.clone(), loc.number, false, turn);
+                    mapper.graph.note_item_seen(obs.key, obs.name.clone(), loc.number, false, container, turn);
                 }
             }
         }
@@ -6455,7 +6464,21 @@ impl GameSession {
                     let Some(name) = o.display_name() else {
                         continue;
                     };
-                    out.push(ItemObservation { key: o.id, name, location: ObservedItemLocation::RoomNested, words: o });
+                    // SQ-1632 Fix 5: a "nested" sighting the visibility walk reached is not
+                    // necessarily a genuinely CONTAINED one — local-global/shared scenery (a
+                    // window, a house, visible from many rooms) is never a real child of any of
+                    // them (`WorldModel::real_container_in_room`'s own doc). Skip it outright
+                    // rather than recording it as nested-with-no-container, which would read as a
+                    // portable item that mysteriously follows the player from room to room.
+                    let Some(container) = self.world_model().real_container_in_room(&self.machine.mem, room_num, o.id as u16) else {
+                        continue;
+                    };
+                    out.push(ItemObservation {
+                        key: o.id,
+                        name,
+                        location: ObservedItemLocation::RoomNested { container: Some(container as u32) },
+                        words: o,
+                    });
                 }
             }
         }
@@ -11282,7 +11305,7 @@ mod item_observation_tests {
         let rec = m.graph.item(10).unwrap();
         assert_eq!(rec.origin_room, 1);
         assert_eq!(rec.origin_turn, 1);
-        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true });
+        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true, container: None });
     }
 
     #[test]
@@ -11299,14 +11322,18 @@ mod item_observation_tests {
         apply_item_observations(&mut m, 3, &result_with_items(2, "B", vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect)]));
         let rec = m.graph.item(10).unwrap();
         assert_eq!(rec.origin_room, 1, "origin never moves");
-        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 2, direct: true }, "current location is B");
+        assert_eq!(
+            rec.last_seen,
+            mapper::graph::ItemLocation::Room { room: 2, direct: true, container: None },
+            "current location is B"
+        );
         // Turn 4: re-entering A observes nothing of the coin there (it is in B) — this must NOT
         // read as Vanished-in-A, and must NOT resurrect a stale Room(A). It is simply not evidence
         // about A at all, because the record already says B.
         apply_item_observations(&mut m, 4, &result_with_items(1, "A", vec![]));
         assert_eq!(
             m.graph.item(10).unwrap().last_seen,
-            mapper::graph::ItemLocation::Room { room: 2, direct: true },
+            mapper::graph::ItemLocation::Room { room: 2, direct: true, container: None },
             "re-entering A must not disturb a record that already correctly says B"
         );
     }
@@ -11318,22 +11345,55 @@ mod item_observation_tests {
         apply_item_observations(&mut m, 1, &result_with_items(1, "Room", vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect)]));
         // Later turn, same room, the coin is simply gone and not carried.
         apply_item_observations(&mut m, 2, &result_with_items(1, "Room", vec![]));
-        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Vanished);
+        assert_eq!(
+            m.graph.item(10).unwrap().last_seen,
+            mapper::graph::ItemLocation::Vanished { room: 1, turn: 2 },
+            "SQ-1632 Fix 2: Vanished now carries the room it was last seen in"
+        );
+    }
+
+    /// SQ-1632 Fix 4: an item last known `Carried` that this turn is observed neither carried nor
+    /// anywhere in the room must be swept as `Vanished` too, stamped with the room the player is
+    /// STANDING IN now — the room-only sweep the direct-item test above exercises never even
+    /// looked at a `Carried` record, so something eaten/burned/destroyed while held stayed
+    /// `Carried` forever before this fix. Falsify by reverting `note_items_absent`'s
+    /// `vanished_while_carried` branch: this test fails with `last_seen` still `Carried`.
+    #[test]
+    fn apply_item_observations_vanishes_a_carried_item_that_disappears_entirely() {
+        let mut m = Mapper::default();
+        m.observe(1, "Room", None);
+        // Turn 1: the garlic is picked up.
+        apply_item_observations(&mut m, 1, &result_with_items(1, "Room", vec![item_obs(10, "a clove of garlic", ObservedItemLocation::Carried)]));
+        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Carried);
+        // Turn 2: eaten (or burned, or otherwise destroyed) — this turn's observations name it
+        // neither carried nor anywhere in the room at all.
+        apply_item_observations(&mut m, 2, &result_with_items(1, "Room", vec![]));
+        let rec = m.graph.item(10).unwrap();
+        assert_eq!(
+            rec.last_seen,
+            mapper::graph::ItemLocation::Vanished { room: 1, turn: 2 },
+            "vanished from the room the player was standing in when it was last WITH them"
+        );
+        assert_eq!(rec.carried_since_turn, None, "SQ-1632 Fix 3: no longer held, once vanished");
     }
 
     #[test]
     fn apply_item_observations_never_vanishes_a_nested_only_sighting_when_its_container_closes() {
         let mut m = Mapper::default();
         m.observe(1, "West of House", None);
-        // The leaflet is seen only by recursing into the open mailbox.
-        apply_item_observations(&mut m, 1, &result_with_items(1, "West of House", vec![item_obs(11, "a leaflet", ObservedItemLocation::RoomNested)]));
+        // The leaflet is seen only by recursing into the open mailbox (container = the mailbox's
+        // own key, SQ-1632 Fix 1).
+        apply_item_observations(
+            &mut m, 1,
+            &result_with_items(1, "West of House", vec![item_obs(11, "a leaflet", ObservedItemLocation::RoomNested { container: Some(23) })]),
+        );
         // The mailbox is now closed — the leaflet is unreachable and absent from this turn's
         // observations entirely, exactly like a real "close mailbox" + "look" turn.
         apply_item_observations(&mut m, 2, &result_with_items(1, "West of House", vec![]));
         assert_eq!(
             m.graph.item(11).unwrap().last_seen,
-            mapper::graph::ItemLocation::Room { room: 1, direct: false },
-            "a nested-only sighting is never vanish-eligible — the record is untouched"
+            mapper::graph::ItemLocation::Room { room: 1, direct: false, container: Some(23) },
+            "a nested-only sighting is never vanish-eligible — the record (container included) is untouched"
         );
     }
 
@@ -11347,7 +11407,7 @@ mod item_observation_tests {
             vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect), item_obs(20, "a lamp", ObservedItemLocation::Carried)],
         );
         apply_item_observations(&mut m, 1, &result);
-        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true });
+        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true, container: None });
         assert_eq!(m.graph.item(20).unwrap().last_seen, mapper::graph::ItemLocation::Carried);
         assert_eq!(m.graph.item(20).unwrap().origin_room, 1, "carried-from-first-sighting still names an origin");
     }
