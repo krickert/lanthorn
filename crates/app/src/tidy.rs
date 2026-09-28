@@ -80,7 +80,13 @@ fn replay_build_and_placement(
         rebuild.set_room_layer(id, layer);
     }
     for c in conns {
-        rebuild.add_edge(c.origin, c.dir, c.dest);
+        // Preserve the real gated/Hard weighting (SQ-1637): `add_edge` always mints a Hard
+        // edge, which would make every replayed connection's own claim on geometry look
+        // stronger than it really is — a gated passage is the first thing `creates_cycle`
+        // drops in the real (production) tidy, and reconstructing it as Hard can make a
+        // DIFFERENT edge give way instead, diverging from what `tidy_layer_silent` actually
+        // computes on the same graph.
+        rebuild.add_edge_weighted(c.origin, c.dir, c.dest, c.weight);
     }
     let manifest: Vec<String> = conns.iter()
         .map(|c| format!("{} \u{2192}{:?}\u{2192} {}", name_of(sub, c.origin), c.dir, name_of(sub, c.dest)))
@@ -306,6 +312,15 @@ pub(crate) fn run_tidy_pipeline(
     }
 
     // Frame cap: if the layout is extremely large, frames are silently truncated at MAX_TIDY_FRAMES.
+
+    // Re-derive every `distorted` flag from the FINAL positions, exactly as `run_layer_ops_silent`
+    // does for the production (silent) path (SQ-1637). Without this, the flags written back below
+    // are whatever `relayout_auto_observed`'s own internal `mark_distorted` left them at — BEFORE
+    // the four stages above (cleanup_overlaps, repair_directional_hints, cleanup_overlaps again,
+    // compact_empty_lines) had a chance to move a room and either honour a dropped bearing or
+    // break a satisfied one. See `remark_distorted`'s doc comment (SQ-1377) for why this must run
+    // last, after every stage that can move a room.
+    mapper::layout::remark_distorted(&mut sub);
 
     // Write the tidied positions back into the live graph for this layer's rooms.
     for id in graph.rooms_in_layer(layer) {
@@ -729,6 +744,62 @@ mod tests {
                 animated.graph.room(id).unwrap().pos,
                 silent.graph.room(id).unwrap().pos,
                 "room {id} final position must match the silent (today's) pipeline"
+            );
+        }
+    }
+
+    /// SQ-1637 Part 1: the animated replay (`run_tidy_pipeline`) must produce IDENTICAL final
+    /// positions and distortion flags to the real background tidy (`tidy_layer_silent`) on a
+    /// graph with a GATED passage. Before the fix, `replay_build_and_placement` reconstructed
+    /// every edge as `PassageWeight::Hard` via `add_edge` regardless of the real graph's
+    /// weighting, so the replay's constraint solver could give up on a DIFFERENT edge than the
+    /// production path does when a cycle has to give.
+    ///
+    /// Three rooms in a same-direction cycle (1--N-->2--N-->3--N-->1) always forces one of the
+    /// three N constraints to be dropped (`creates_cycle`). The 3--N-->1 edge is marked
+    /// `Conditional` (gated) and inserted FIRST, so the correct (weight-aware) solver drops it
+    /// regardless of insertion order — but the buggy all-Hard reconstruction falls back to
+    /// insertion-order tie-breaking and drops the 2--N-->3 edge instead, a real divergence (not
+    /// just a coincidental match), which is what this test would catch.
+    #[test]
+    fn animated_replay_matches_silent_tidy_with_a_gated_passage() {
+        use mapper::direction::Direction;
+        use mapper::graph::{MapGraph, PassageWeight};
+
+        let build = || {
+            let mut g = MapGraph::new();
+            g.upsert_room(1, "A".into());
+            g.upsert_room(2, "B".into());
+            g.upsert_room(3, "C".into());
+            // Insertion order deliberately does NOT match the weight-based drop order: the
+            // gated edge is added first, so a bug that discards weight and falls back to
+            // insertion-order tie-breaking drops a DIFFERENT (real) edge than the correct
+            // weight-aware solver does.
+            g.add_edge_weighted(3, Direction::N, 1, PassageWeight::Conditional);
+            g.add_edge(1, Direction::N, 2);
+            g.add_edge(2, Direction::N, 3);
+            g
+        };
+
+        let mut animated = build();
+        let mut silent = build();
+        let layer = animated.layer_of(1);
+
+        let _ = run_tidy_pipeline(&mut animated, layer, None);
+        tidy_layer_silent(&mut silent, layer);
+
+        for id in [1u32, 2, 3] {
+            assert_eq!(
+                animated.room(id).unwrap().pos,
+                silent.room(id).unwrap().pos,
+                "room {id} final position must match between the animated replay and the real background tidy"
+            );
+        }
+        for (a, s) in animated.connections().iter().zip(silent.connections().iter()) {
+            assert_eq!(
+                a.distorted, s.distorted,
+                "connection {:?}/{:?}/{:?} distortion flag must match between the animated replay and the real background tidy",
+                a.origin, a.dir, a.dest
             );
         }
     }
