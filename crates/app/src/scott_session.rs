@@ -802,6 +802,19 @@ impl Engine for ScottSession {
         std::mem::take(&mut self.intro)
     }
 
+    /// SQ-1629 Fix 2: the default [`Engine::seed_turn`] drains the boot transcript for the host's
+    /// opening banner and stops there, so without this override the starting room's own
+    /// `description`/`items` were never captured — no command runs `submit`'s own `self.turn(...)`
+    /// for it, and the player has not typed `look` yet either. `Self::turn` already answers both
+    /// as a DIRECT query of live VM state (`self.vm.room_description_text()`,
+    /// `Self::item_observations`) — see its own doc — so, unlike the Z-machine, this needs no
+    /// transcript heuristic at all and is correct whichever order the boot drains it in.
+    fn seed_turn(&mut self) -> TurnResult {
+        let transcript = self.take_transcript();
+        let quit = self.has_quit();
+        self.turn(transcript, quit)
+    }
+
     fn drain_screen_clear(&mut self) -> bool {
         // Scott Adams games have no screen-clear channel at all: the VM prints and
         // the host scrolls. Nothing to drain, at boot or in a turn — which is why

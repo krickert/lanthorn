@@ -1715,9 +1715,18 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     // ordered elements (text + any startup/cover images); the Z-machine returns
     // empty here and falls back to the flat string path. Either way `banner` is the
     // banner text for title extraction (the elems' concatenated Text equals it).
-    let banner_elems = session.take_transcript_elems();
+    //
+    // SQ-1629 Fix 2: `Engine::seed_turn` is now the ONE boot drain (see its own doc) — it
+    // drains the exact same transcript/elems this banner is built from, and (for engines that
+    // override it, e.g. `GameSession`) also captures the STARTING room's own `description`/
+    // `items` off that same still-warm text, applied further down once `mapper`/`state.turns`
+    // are in scope. `std::mem::take` lifts just those two fields out of `seed_result` so the
+    // rest of it (`location`, `description`, `items`, …) survives for that later use — a second
+    // drain call there would find an already-empty transcript.
+    let mut seed_result = session.seed_turn();
+    let banner_elems = std::mem::take(&mut seed_result.transcript_elems);
     let banner: String = if banner_elems.is_empty() {
-        session.take_transcript()
+        std::mem::take(&mut seed_result.transcript)
     } else {
         banner_elems
             .iter()
@@ -1825,16 +1834,23 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
 
     // Observe the starting room so it appears on the map immediately.
     //
-    // Built by [`Engine::seed_turn`] and NOT by a `TurnResult { … }` literal: the
-    // literal that used to stand here spelled `erase_lower: false` into itself, so
-    // an `erase_window` the game issued during its own boot was never drained and
-    // the first real turn took it instead — wiping the banner and the opening room
-    // description one command late (SQ-1106). Taken UNCONDITIONALLY, before the
-    // location test below, because a story whose starting room is undetectable still
-    // has a boot to drain.
-    let seed_result = session.seed_turn();
+    // `seed_result` — built by [`Engine::seed_turn`], not a `TurnResult { … }` literal (a
+    // literal that spelled `erase_lower: false` into itself once left an `erase_window` issued
+    // during boot undrained until the first real turn took it instead, wiping the banner and
+    // the opening room description one command late, SQ-1106) — was already taken above,
+    // alongside the banner (SQ-1629 Fix 2: one boot drain, not two — see that call site's own
+    // comment). Applied UNCONDITIONALLY, before the location test below, because a story whose
+    // starting room is undetectable still has a boot to drain.
     if let Some(snap_number) = seed_result.location.as_ref().map(|snap| snap.number) {
         apply_turn(&mut mapper, "", &seed_result, &mut state.death_watch);
+        // SQ-1629 Fix 2: the starting room's own description/items, off the SAME boot drain —
+        // `apply_room_description`/`apply_item_observations` are the identical engine-neutral
+        // calls `finish_command_turn`/`finish_resumed_turn` already make for every later turn
+        // (SQ-1625/SQ-1627); this closes the one gap those lanes left — the room the story
+        // STARTS in, which no command ever arrives for and which the player has not yet typed
+        // `look` at either.
+        crate::session::apply_room_description(&mut mapper, state.turns, &seed_result);
+        crate::session::apply_item_observations(&mut mapper, state.turns, &seed_result);
         flush_screen_trace(&state.config.user_dir, &mut *session, state.config.trace.screen);
         flush_v6_trace(&state.config.user_dir, &mut *session, state.config.trace.v6);
         if state.config.trace.any() {

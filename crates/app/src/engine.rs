@@ -1299,8 +1299,19 @@ pub trait Engine {
     /// and neither plays its sounds nor prints its diagnostics. Surfacing a boot
     /// sound and a boot warning at the boot is the real change, and it waits for a
     /// story that needs one.
+    ///
+    /// SQ-1629: also drains `transcript`/`transcript_elems` (the same pair
+    /// `host::boot` used to drain a second time, separately, for the opening
+    /// banner) so this is now the ONE boot drain — an engine that fills
+    /// `description`/`items` from that same drain (overriding this default, as
+    /// `GameSession` does) needs the text still warm, not re-drained empty by a
+    /// caller who read it first.
     fn seed_turn(&mut self) -> TurnResult {
+        let transcript_elems = self.take_transcript_elems();
+        let transcript = if transcript_elems.is_empty() { self.take_transcript() } else { String::new() };
         TurnResult {
+            transcript,
+            transcript_elems,
             location: self.current_location(),
             quit: self.has_quit(),
             erase_lower: self.drain_screen_clear(),

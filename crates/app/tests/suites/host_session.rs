@@ -844,3 +844,92 @@ fn recording_switched_on_mid_game_still_has_a_baseline_snapshot() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── SQ-1629 ──────────────────────────────────────────────────────────────────
+
+/// SQ-1629 Fix 2: the room a story STARTS in never got a `description` at all — no command
+/// triggers `finish_command_turn`/`finish_resumed_turn`'s `apply_room_description` for it, and
+/// the player has not typed `look` yet either. `Engine::seed_turn`'s boot drain (Z-machine
+/// override in `session.rs`) now captures it the same way an ordinary arrival does, wired into
+/// `host::boot::boot_story` right beside the pre-existing `apply_turn` seed call.
+#[test]
+fn boot_captures_the_starting_rooms_own_description() {
+    let story = fixture_path("minizork-r34-s871124.z3");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-starting-room-description");
+    let b = boot(story, &home);
+    assert_eq!(here(&b).as_deref(), Some("West of House"), "premise: minizork starts here");
+    let start = b.mapper.graph.current().expect("the starting room is observed at boot");
+    let desc = b.mapper.graph.room(start).and_then(|r| r.description.clone());
+    assert!(
+        desc.as_deref().is_some_and(|d| !d.trim().is_empty()),
+        "West of House must carry a description straight off boot, before any command: {desc:?}"
+    );
+}
+
+/// SQ-1629 Fix 1: minizork (a v1-3 game) prints its own inline `>` read prompt as part of the
+/// SAME turn's transcript as its room description — the mapper's captured description must stop
+/// before it (reusing [`strip_read_prompt`], the same prompt-recognition the Glk tier's own
+/// `take_room_description` already runs), not carry a trailing "\n\n>". Covers both the boot
+/// capture (Fix 2, West of House) and an ordinary arrival (Forest Path, reached via `n`, `n`
+/// per the quest's own repro).
+#[test]
+fn a_room_description_never_carries_the_games_own_trailing_prompt() {
+    let story = fixture_path("minizork-r34-s871124.z3");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-room-description-prompt-strip");
+    let mut b = boot(story, &home);
+
+    let start = b.mapper.graph.current().expect("the starting room is observed at boot");
+    let start_desc = b.mapper.graph.room(start).and_then(|r| r.description.clone());
+    assert!(start_desc.is_some(), "premise: West of House has a captured description (Fix 2)");
+    let start_desc = start_desc.unwrap();
+    assert!(!start_desc.contains('>'), "the boot's own inline read prompt must not leak in: {start_desc:?}");
+
+    let _ = command(&mut b, "n");
+    let _ = command(&mut b, "n");
+    assert_eq!(here(&b).as_deref(), Some("Forest Path"), "premise: n, n reaches Forest Path");
+    let id = b.mapper.graph.current().expect("Forest Path is on the map");
+    let desc = b.mapper.graph.room(id).and_then(|r| r.description.clone());
+    assert!(desc.is_some(), "Forest Path must have a captured description");
+    let desc = desc.unwrap();
+    assert!(!desc.contains('>'), "the trailing inline read prompt must not leak into the description: {desc:?}");
+    assert!(!desc.trim_end().ends_with('>'), "and no residual blank-line-then-prompt tail: {desc:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1629: the Glk tier already strips its own trailing prompt (`AppGlk::take_room_description`
+/// via `strip_read_prompt`, unchanged by Fix 1) — this confirms an ordinary Glulx boot-and-look
+/// sequence is unaffected by Fix 1's Z-machine-side change, and that Fix 2's boot-time wiring
+/// (`apply_room_description`/`apply_item_observations` in `host::boot::boot_story`, engine-
+/// neutral) DOES reach Glulx too: `GlulxSession::new_with_store` already resolves the opening
+/// room's HEADING at construction (to seed `last_room`/the room-lock), and a small companion
+/// change stashes the paired DESCRIPTION `take_room_heading` leaves ready right beside it
+/// (`GlulxSession::boot_description`), which `GlulxSession`'s own `seed_turn` override now hands
+/// to the mapper — the same shape as the Z-machine fix, just reading a different capture.
+#[test]
+fn glulx_boot_captures_the_starting_rooms_own_description_too() {
+    let story = fixture_path("chlorophyll.gblorb");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-glulx-boot-and-look");
+    let b = boot(story, &home);
+    let start = b.mapper.graph.current().expect("Chlorophyll's opening room is seeded at boot");
+    let desc = b.mapper.graph.room(start).and_then(|r| r.description.clone());
+    assert!(
+        desc.as_deref().is_some_and(|d| !d.trim().is_empty()),
+        "the starting room must carry a description straight off boot: {desc:?}"
+    );
+    assert!(!desc.unwrap().contains('>'), "Glk's own prompt-stripping still holds");
+
+    let _ = std::fs::remove_dir_all(&home);
+}

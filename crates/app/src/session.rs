@@ -5027,6 +5027,13 @@ fn zvm_room_description(machine: &Machine, transcript: &str, location: Option<&L
 /// BEFORE it and falls away on its own. A trailing parser aside chained onto the SAME turn as a
 /// real arrival is a known, accepted gap — rare enough in practice that a dedicated detector for
 /// it is not worth carrying.
+///
+/// SQ-1629: a v1–3 game that prints its own inline read prompt as part of the SAME turn's
+/// transcript (e.g. minizork's `\n>` after every room description) would otherwise leave that
+/// prompt hanging off the end of the captured description. [`strip_read_prompt`] is the SAME
+/// prompt-recognition the Glk tier's own `take_room_description` already runs for this exact
+/// purpose (`glk_backend.rs`) — reused here rather than duplicated, so the two engines can never
+/// grow different ideas of what a trailing prompt looks like.
 fn transcript_room_description(transcript: &str, name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -5035,7 +5042,7 @@ fn transcript_room_description(transcript: &str, name: &str) -> Option<String> {
     let lines: Vec<&str> = transcript.lines().collect();
     let idx = lines.iter().rposition(|l| line_is_room_heading(l, name))?;
     let rest = lines[idx + 1..].join("\n");
-    let trimmed = rest.trim();
+    let trimmed = strip_read_prompt(&rest).trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
@@ -5843,6 +5850,31 @@ impl Engine for GameSession {
             .map(|(at, img)| (at, TranscriptElem::Image(img)))
             .collect();
         interleave_story_elems(&transcript, &runs, marks, base, None)
+    }
+
+    /// SQ-1629 Fix 2: the default [`Engine::seed_turn`] drains the boot transcript for the host's
+    /// opening banner but stops there — no command triggers a `drain_turn` for the starting room
+    /// (and the player has not typed `look` yet either), so without this override the room the
+    /// story opens in never got a `description`/`items` at all. Same heading-match rule as an
+    /// ordinary arrival ([`zvm_room_description`]) and the same direct object-tree query
+    /// ([`Self::zvm_item_observations`]) `drain_turn` uses, just run against the BOOT drain instead
+    /// of a command's.
+    fn seed_turn(&mut self) -> TurnResult {
+        let transcript_elems = self.take_transcript_elems();
+        let transcript = if transcript_elems.is_empty() { self.take_transcript() } else { String::new() };
+        let location = self.current_location();
+        let description = zvm_room_description(&self.machine, &transcript, location.as_ref());
+        let items = self.zvm_item_observations(location.as_ref());
+        TurnResult {
+            transcript,
+            transcript_elems,
+            location,
+            quit: self.has_quit(),
+            erase_lower: self.drain_screen_clear(),
+            description,
+            items,
+            ..TurnResult::default()
+        }
     }
 
     fn set_strip_prompt(&mut self, on: bool) {
@@ -7025,6 +7057,16 @@ mod tests {
         let transcript = "West of House\nSomething unrelated happens here.\nWest of House\nYou are standing in an open field.\n";
         let desc = transcript_room_description(transcript, "West of House").unwrap();
         assert_eq!(desc, "You are standing in an open field.");
+    }
+
+    /// SQ-1629 Fix 1: a v1–3 game whose read prompt rides the SAME turn's transcript (minizork's
+    /// `\n>` after every room description) must not leak into the captured description — falsifies
+    /// the pre-fix behaviour, which returned the description with a trailing "\n\n>".
+    #[test]
+    fn transcript_room_description_strips_a_trailing_inline_read_prompt() {
+        let transcript = "Forest Path\nThis is a path through a dimly lit forest.\nOn the ground is a pile of leaves.\n\n>";
+        let desc = transcript_room_description(transcript, "Forest Path").unwrap();
+        assert_eq!(desc, "This is a path through a dimly lit forest.\nOn the ground is a pile of leaves.");
     }
 
     /// A minimal valid Machine (same recipe as `headless.rs`'s `minimal_machine`), for the one

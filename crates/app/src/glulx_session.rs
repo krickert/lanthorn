@@ -220,6 +220,13 @@ pub struct GlulxSession {
     /// The current room, derived from the last Inform `Subheader` heading and
     /// held sticky across heading-less turns (examine/talk/failed-move).
     last_room: Option<LocationInfo>,
+    /// SQ-1629 Fix 2: the starting room's own description, captured once at construction
+    /// (`new_with_store`, immediately after the SAME `take_room_heading` drain that resolves
+    /// `last_room` there — see `AppGlk::take_room_description`'s own doc for why it must follow
+    /// that call on the same drain) and consumed exactly once by `Engine::seed_turn`'s override
+    /// below. No command runs `finish_turn`'s own heading/description pair for the boot, and the
+    /// player has not typed `look` yet either — this is the only chance to capture it.
+    boot_description: Option<String>,
     /// Learns which RAM word holds the game's `location` global, so same-named
     /// rooms get distinct ids (SQ-0526). See [`crate::glulx_roomlock`].
     room_lock: crate::glulx_roomlock::RoomLock,
@@ -697,6 +704,7 @@ impl GlulxSession {
             aux: BTreeMap::new(),
             aux_dirty: false,
             last_room: None,
+            boot_description: None,
             room_lock: crate::glulx_roomlock::RoomLock::new(0, 0),
             naming_look_refusals: 0,
             saw_buffer_heading: false,
@@ -736,6 +744,11 @@ impl GlulxSession {
         let ram = session.scan_ram();
         let awaiting_line_input = session.pending == InputKind::Line;
         let heading = session.appglk().take_room_heading(awaiting_line_input);
+        // SQ-1629 Fix 2: must follow `take_room_heading` on the SAME drain, exactly like
+        // `finish_turn`'s own pairing (see `AppGlk::take_room_description`'s doc) — stashed
+        // rather than used immediately, since `TurnResult` doesn't exist yet this early; `Engine::
+        // seed_turn`'s override below is what hands it to the mapper.
+        session.boot_description = session.appglk().take_room_description();
         let heading = session.name_this_room(heading, awaiting_line_input);
         session.last_room = heading.map(|n| session.room_for(&n, &ram));
         Ok(session)
@@ -2569,6 +2582,32 @@ impl Engine for GlulxSession {
 
     fn set_strip_prompt(&mut self, on: bool) {
         self.strip_prompt = on;
+    }
+
+    /// SQ-1629 Fix 2: the default [`Engine::seed_turn`] drains the boot transcript for the
+    /// host's opening banner and stops there, so without this override the starting room's own
+    /// `description`/`items` were never captured. Unlike the Z-machine, the `description` half
+    /// is not re-derivable here at all — it is a transcript heuristic that must run on the SAME
+    /// drain `take_room_heading` did, which construction (`new_with_store`) already consumed to
+    /// resolve `last_room`, stashing its paired description in `Self::boot_description` for
+    /// exactly this moment. `items` needs no such stash: it is a live `Introspect` query, same as
+    /// every other turn's.
+    fn seed_turn(&mut self) -> TurnResult {
+        let transcript_elems = self.take_transcript_elems();
+        let transcript = if transcript_elems.is_empty() { self.take_transcript() } else { String::new() };
+        let location = self.current_location();
+        let description = self.boot_description.take();
+        let items = self.glulx_item_observations(location.as_ref());
+        TurnResult {
+            transcript,
+            transcript_elems,
+            location,
+            quit: self.has_quit(),
+            erase_lower: self.drain_screen_clear(),
+            description,
+            items,
+            ..TurnResult::default()
+        }
     }
 
     fn pending_input(&self) -> InputKind {
