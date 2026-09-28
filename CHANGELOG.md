@@ -6,7 +6,7 @@ All notable changes to lanthorn are recorded here.
 [`.github/workflows/release.yml`](.github/workflows/release.yml)). A tag whose
 name contains a hyphen — `v0.1.0-beta.1`, `v0.2.0-rc.1` — is published as a
 **pre-release**; a bare `vMAJOR.MINOR.PATCH` is a full release. The workspace
-version in `Cargo.toml` (currently `0.7.2`) versions every crate and every
+version in `Cargo.toml` (currently `0.8.0`) versions every crate and every
 binary's `--version` at once, and carries any pre-release suffix so a build
 identifies itself without reading its git hash.
 
@@ -19,13 +19,13 @@ Absolute URLs or no link.
 
 ---
 
-## Unreleased
+## v0.8.0 — 2026-09-28
 
-*This section is drained when a version is cut. README.md describes the
-RELEASED build; prose for a feature that is in `main` but not yet released
-goes into the README in place, at its normal destination, marked with the
-visible tag `*Next release:*`. `release.yml` refuses to cut a release
-while any such tag, or this Unreleased section, still exists.*
+### Added
+
+- **Auto-save is on by default now, and has its own save slot separate from
+  your manual quick-save (Ctrl+S).** A deliberate quick-save is never
+  immediately overwritten by the next auto-save the way it used to be.
 
 ### Changed
 
@@ -33,6 +33,16 @@ while any such tag, or this Unreleased section, still exists.*
   folder whether you're playing the raw story file or a disk image of the
   same release.** If you already had separate saves for each, they stay
   exactly as they were — this only applies to saves made from now on.
+- Laid groundwork for upcoming map features (room descriptions, item
+  tracking) — not yet visible in the map view.
+
+### Fixed
+
+- **The automatic map layout no longer mis-scores certain one-way
+  passages**, which could leave a room positioned in the wrong spot relative
+  to its neighbors.
+- **Resuming a game now correctly picks up your most recent save** between
+  auto-save and quick-save, even right after a normal quit.
 
 ---
 
