@@ -3835,6 +3835,12 @@ pub(crate) fn cleanup_overlaps_observed(
 
     let mut stats = mapper::layout::TidyStats::default();
     let locks = reciprocal_axis_locks(graph);
+    // SQ-1637 Part 4: every candidate (room, offset) actually evaluated (i.e. that reached
+    // `graph.set_pos` below, past the lock/occupied/up-down-side skips) counts as one "trial",
+    // whether or not it ends up the pass's winner. `stats.overlaps_resolved` already counts the
+    // committed ones, so the difference is what silently got rejected — a move that was tried,
+    // scored, and discarded left NO trace at all before this (SQ-1636's root cause).
+    let mut trials_tried: u32 = 0;
 
     for _ in 0..max_passes {
         let base = render_overlap_stats(graph);
@@ -3869,6 +3875,7 @@ pub(crate) fn cleanup_overlaps_observed(
                 if !move_keeps_updown_sides(graph, id, trial) {
                     continue;
                 }
+                trials_tried += 1;
                 graph.set_pos(id, trial);
                 let s = render_overlap_stats(graph);
                 let score_trial = mapper::layout::room_side_score(graph, id);
@@ -3903,6 +3910,22 @@ pub(crate) fn cleanup_overlaps_observed(
                 }
             }
             None => break,
+        }
+    }
+
+    // SQ-1637 Part 4: a trailing summary frame naming how many candidate moves this call
+    // evaluated versus how many it actually committed — the only trace a REJECTED trial leaves
+    // at all. Fires even when nothing committed (every trial rejected), which is exactly the
+    // case SQ-1636 investigated: a genuinely improving move scored as a net loss under the old
+    // (buggy) scoring and was silently discarded with zero visibility.
+    if trials_tried > 0 {
+        if let Some(ref mut cb) = obs {
+            let rejected = trials_tried - stats.overlaps_resolved;
+            let desc = format!(
+                "Overlap cleanup summary: {trials_tried} trials tried, {} committed, {rejected} rejected.",
+                stats.overlaps_resolved,
+            );
+            cb(graph, "cleanup_overlaps", &desc, &stats);
         }
     }
 }
@@ -3941,6 +3964,9 @@ pub(crate) fn repair_directional_hints_observed(
 
     let mut stats = mapper::layout::TidyStats::default();
     let locks = reciprocal_axis_locks(graph);
+    // SQ-1637 Part 4: same accounting as `cleanup_overlaps_observed` — every candidate actually
+    // evaluated counts as a trial, whether or not it wins its pass.
+    let mut trials_tried: u32 = 0;
 
     for _ in 0..max_passes {
         let base = render_overlap_stats(graph);
@@ -3966,6 +3992,7 @@ pub(crate) fn repair_directional_hints_observed(
                 if graph.rooms().any(|r| r.id != id && r.pos == Some(trial)) {
                     continue;
                 }
+                trials_tried += 1;
                 graph.set_pos(id, trial);
                 let s = render_overlap_stats(graph);
                 let score = mapper::layout::directional_hint_score(graph);
@@ -3998,6 +4025,18 @@ pub(crate) fn repair_directional_hints_observed(
             None => break,
         }
     }
+
+    // SQ-1637 Part 4: trailing summary frame — see `cleanup_overlaps_observed`'s twin.
+    if trials_tried > 0 {
+        if let Some(ref mut cb) = obs {
+            let rejected = trials_tried - stats.hints_repaired;
+            let desc = format!(
+                "Repair hints summary: {trials_tried} trials tried, {} committed, {rejected} rejected.",
+                stats.hints_repaired,
+            );
+            cb(graph, "repair_hints", &desc, &stats);
+        }
+    }
 }
 
 /// Collapse the fully-empty interior rows and columns the tidy passes leave behind (e.g. a gap
@@ -4018,6 +4057,11 @@ pub(crate) fn compact_empty_lines_observed(
     mut obs: Option<TidyObserver>,
 ) {
     let stats = mapper::layout::TidyStats::default();
+    // SQ-1637 Part 4: a candidate empty-line collapse is a trial exactly like cleanup/repair's
+    // room moves — tried, then either committed (a frame already fires for that) or rejected
+    // and silently reverted (the `floor = empty;` branch below), with no trace before this.
+    let mut lines_tried: u32 = 0;
+    let mut lines_committed: u32 = 0;
 
     for is_x in [true, false] {
         let mut floor = i32::MIN;
@@ -4035,6 +4079,7 @@ pub(crate) fn compact_empty_lines_observed(
             let rooms: Vec<(mapper::graph::RoomId, (i32, i32))> =
                 graph.rooms().filter_map(|r| r.pos.map(|p| (r.id, p))).collect();
             let before = render_overlap_stats(graph).0;
+            lines_tried += 1;
             for &(id, p) in &rooms {
                 let c = if is_x { p.0 } else { p.1 };
                 if c > empty {
@@ -4047,6 +4092,7 @@ pub(crate) fn compact_empty_lines_observed(
                 }
                 floor = empty;
             } else {
+                lines_committed += 1;
                 if let Some(ref mut cb) = obs {
                     let axis = if is_x { "column" } else { "row" };
                     let desc = format!(
@@ -4056,6 +4102,19 @@ pub(crate) fn compact_empty_lines_observed(
                     cb(graph, "compact", &desc, &stats);
                 }
             }
+        }
+    }
+
+    // SQ-1637 Part 4: trailing summary frame — see `cleanup_overlaps_observed`'s twin. Fires
+    // even when every candidate collapse was rejected (would have raised an overlap), which
+    // otherwise left no trace at all.
+    if lines_tried > 0 {
+        if let Some(ref mut cb) = obs {
+            let rejected = lines_tried - lines_committed;
+            let desc = format!(
+                "Compact summary: {lines_tried} candidates tried, {lines_committed} committed, {rejected} rejected.",
+            );
+            cb(graph, "compact", &desc, &stats);
         }
     }
 }
@@ -6936,6 +6995,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// SQ-1637 Part 4: a trial that was TRIED and REJECTED must leave a trace — before this, a
+    /// rejected trial vanished without a frame (the exact shape at the heart of SQ-1636: a move
+    /// scored as a net loss and silently discarded).
+    ///
+    /// `render_overlap_stats`/`overlap_stats` measures CONNECTOR-path overlaps (two routed
+    /// passages sharing an illegal cell), not simply two room boxes sharing a coordinate — so
+    /// this reuses the same A129 subset `cleanup_clears_a129_illegal_overlaps` uses, the
+    /// smallest graph in this file already proven to leave a real illegal overlap after
+    /// `relayout_auto`. `cleanup_overlaps_observed` needs several candidate moves per pass to
+    /// find the one that actually helps, so committed < tried is guaranteed here.
+    #[test]
+    fn cleanup_overlaps_summary_frame_surfaces_rejected_trials() {
+        use mapper::graph::MapGraph;
+        use mapper::layout::relayout_auto;
+        let mut g = MapGraph::new();
+        for (id, name) in [
+            (74, "Clearing"), (75, "Forest Path"), (77, "Forest"), (78, "Forest"),
+            (79, "Behind House"), (80, "South of House"), (81, "North of House"),
+            (143, "Clearing"), (180, "West of House"), (239, "Forest"),
+        ] { g.upsert_room(id, name.into()); }
+        for (o, d, dst) in [
+            (180, Direction::N, 81), (81, Direction::W, 180), (180, Direction::S, 80),
+            (80, Direction::E, 79), (79, Direction::N, 81), (81, Direction::E, 79),
+            (79, Direction::S, 80), (80, Direction::W, 180), (180, Direction::W, 78),
+            (78, Direction::N, 143), (143, Direction::S, 75), (75, Direction::N, 143),
+            (143, Direction::W, 78), (143, Direction::E, 77), (77, Direction::S, 74),
+            (74, Direction::N, 77), (77, Direction::E, 239), (239, Direction::N, 77),
+            (239, Direction::S, 77),
+        ] { g.add_edge(o, d, dst); }
+        relayout_auto(&mut g);
+        // Force a real illegal connector overlap: smash room 74 onto room 180's cell so its
+        // S/N connector to 77 crosses several of 180's own connectors.
+        let p180 = g.room(180).unwrap().pos.unwrap();
+        g.set_pos(74, p180);
+        let (base_illegal, _) = render_overlap_stats(&g);
+        assert!(base_illegal > 0, "sanity: this fixture must start with a real illegal overlap");
+
+        let mut frames: Vec<(String, String)> = Vec::new();
+        cleanup_overlaps_observed(&mut g, 3, 40, Some(&mut |_g, label, desc, _s| {
+            frames.push((label.to_owned(), desc.to_owned()));
+        }));
+        let (final_illegal, _) = render_overlap_stats(&g);
+        assert_eq!(final_illegal, 0, "sanity: cleanup must still clear the overlap, as it did before this change");
+
+        let summary = frames
+            .iter()
+            .find(|(_, d)| d.starts_with("Overlap cleanup summary:"))
+            .unwrap_or_else(|| panic!("no summary frame emitted: {frames:?}"));
+        // Parse "N trials tried, M committed, K rejected" back out to assert on the numbers,
+        // not just that the word "rejected" appears somewhere.
+        let nums: Vec<u32> = summary.1
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let [tried, committed, rejected] = nums[..] else {
+            panic!("expected exactly 3 numbers in the summary: {}", summary.1)
+        };
+        assert!(tried > 0, "at least one trial must have been tried: {}", summary.1);
+        assert!(rejected > 0, "at least one trial must have been rejected: {}", summary.1);
+        assert_eq!(tried, committed + rejected, "tried must equal committed + rejected: {}", summary.1);
+        assert!(committed >= 1, "at least one move must have resolved the overlap: {}", summary.1);
     }
 
     #[test]
