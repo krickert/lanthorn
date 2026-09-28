@@ -807,3 +807,65 @@ fn a_resumed_boots_own_drain_stamps_the_restored_turn_not_zero() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── SQ-1635: a loose known release shares a disk-mounted copy's game_dir ────
+
+/// The end-to-end proof that `save_key_media.rs`'s unit-level pins do not by
+/// themselves give: `boot_story` — the real chain `startup.rs` drives, not
+/// `story_key_for` called in isolation — resolves a loose `zork1-r88-s840726.z3`
+/// to the SAME `game_dir` as an Amiga floppy pressing the identical release
+/// (`Zork I - The Great Underground Empire.adf`), when both are booted against
+/// the same `data_base`. `stories/`-only, so this skips vacuously without it.
+#[test]
+fn a_loose_known_release_boots_into_the_same_game_dir_as_a_disk_mounted_copy() {
+    let loose = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stories/zork1-r88-s840726.z3");
+    let disk =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stories/Zork I - The Great Underground Empire.adf");
+    if !loose.is_file() || !disk.is_file() {
+        eprintln!("SKIP: stories/ not populated with both Zork I fixtures in this checkout");
+        return;
+    }
+    let home = app::scratch_dir("host-boot-sq1635-unify");
+    let data_base = home.join("saves");
+
+    let b_loose = boot(loose, headless_config(&home), &data_base);
+    assert_ready(&b_loose, "Zork I (loose)");
+    let b_disk = boot(disk, headless_config(&home), &data_base);
+    assert_ready(&b_disk, "Zork I (Amiga floppy)");
+
+    assert_eq!(
+        b_loose.game_dir, b_disk.game_dir,
+        "a loose copy and a disk-mounted copy of the identical release must share one game_dir"
+    );
+    // And it is the DISK-STYLE key, not either fixture's own basename — proof
+    // this really is the unification and not an accidental basename collision.
+    let dir_name = b_loose.game_dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    assert!(dir_name.starts_with("zork-i-r88-s840726"), "got {dir_name:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The v6 half of the same proof, in the other direction: a loose, KNOWN
+/// Version 6 release (`arthur-r74-s890714.z6`) still boots into its OWN
+/// basename-keyed `game_dir`, exactly as before SQ-1635 — never unified with
+/// the Amiga floppy's build-keyed directory, per this feature's documented v6
+/// exclusion (`cli_host::storage`'s module docs).
+#[test]
+fn a_loose_known_version_six_release_keeps_its_own_basename_game_dir() {
+    let loose = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stories/arthur-r74-s890714.z6");
+    if !loose.is_file() {
+        eprintln!("SKIP: stories/arthur-r74-s890714.z6 absent in this checkout");
+        return;
+    }
+    let home = app::scratch_dir("host-boot-sq1635-v6-excluded");
+    let b = boot(loose, headless_config(&home), &home.join("saves"));
+    assert!(!b.session.has_quit(), "the story is running");
+
+    let dir_name = b.game_dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    assert_eq!(
+        dir_name, "arthur-r74-s890714.z6.save",
+        "a loose Version 6 file keeps its basename game_dir, unaffected by SQ-1635"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

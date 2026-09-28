@@ -274,20 +274,28 @@ impl StoryMeta {
         }
     }
 
-    /// The build that names this story's save directory when it was mounted out
-    /// of a disk image, and `None` for a loose story file — the scan already
-    /// read the header, so a row can be keyed without touching the disk again
-    /// (SQ-0850). Feed to [`crate::storage::story_key_for`].
+    /// The build that names this story's save directory: its disk build when
+    /// it was mounted out of an image, or — for a loose story file whose own
+    /// header names a KNOWN, CATALOGUED commercial release (SQ-1635) — the
+    /// same build a disk-mounted copy of it would carry, so the two share one
+    /// save folder. `None` for every other loose file, unaffected by this at
+    /// all. The scan already read the header, so a row can be keyed without
+    /// touching the disk again (SQ-0850). Feed to [`crate::storage::story_key_for`].
     pub fn disk_build(&self) -> Option<crate::storage::DiskBuild> {
-        Some(crate::storage::DiskBuild {
+        let version = self.version.as_deref().and_then(|v| v.parse().ok())?;
+        let release = self.release?;
+        let serial = self.serial.as_ref()?;
+        match self.disk_image {
             // The MEDIUM and the VERSION are half of what names a Version 6
             // game's directory (SQ-1068) — one build pressed onto two disks is
             // one game for v1-v5 and two machines for v6.
-            medium: self.disk_image?,
-            version: self.version.as_deref().and_then(|v| v.parse().ok())?,
-            release: self.release?,
-            serial: self.serial.as_ref()?.clone(),
-        })
+            Some(medium) => {
+                Some(crate::storage::DiskBuild { medium, version, release, serial: serial.clone() })
+            }
+            // See `cli_host::storage::known_loose_build`'s docs for exactly
+            // when this answers `Some` (a known release, never Version 6).
+            None => cli_host::storage::known_loose_build(version, release, serial),
+        }
     }
 }
 
@@ -2102,7 +2110,13 @@ fn entry_from_loaded(
     // Fetched IFDB sidecar: absent (never fetched, unreadable, malformed,
     // wrong IFID) is simply no metadata, never a scan error. The mount is
     // already done, so the disk-image save key (SQ-0850) costs nothing here.
-    let disk_build = disk_image.and_then(|kind| crate::storage::DiskBuild::of(&bytes, kind));
+    // `build_for_key` also unifies a LOOSE known release's key with a disk-
+    // mounted copy's (SQ-1635) — this must stay in step with
+    // `StoryMeta::disk_build`, which computes the same row's key again once
+    // the `StoryEntry` exists, or the scan-time `game_dir` below (used to load
+    // the fetched sidecar) and the row's own later `game_dir()` would name two
+    // different directories for one game.
+    let disk_build = crate::storage::build_for_key(&bytes, disk_image);
     let game_dir = crate::storage::game_dir(
         data_base,
         &crate::storage::story_key_for(crate::storage::StoryOrigin {

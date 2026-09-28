@@ -19,6 +19,23 @@ Absolute URLs or no link.
 
 ---
 
+## Unreleased
+
+*This section is drained when a version is cut. README.md describes the
+RELEASED build; prose for a feature that is in `main` but not yet released
+goes into the README in place, at its normal destination, marked with the
+visible tag `*Next release:*`. `release.yml` refuses to cut a release
+while any such tag, or this Unreleased section, still exists.*
+
+### Changed
+
+- **Verified commercial Z-machine games (Infocom titles) now share one save
+  folder whether you're playing the raw story file or a disk image of the
+  same release.** If you already had separate saves for each, they stay
+  exactly as they were — this only applies to saves made from now on.
+
+---
+
 ## v0.7.2 — 2026-09-18
 
 ### Added

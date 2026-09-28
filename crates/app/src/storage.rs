@@ -20,7 +20,7 @@
 //! plausible answer.
 
 pub use cli_host::storage::{
-    DiskBuild, StoryOrigin, story_key_at, story_key_at_from, story_key_for,
+    DiskBuild, StoryOrigin, build_for_key, story_key_at, story_key_at_from, story_key_for,
 };
 
 use std::io::{self, Write};

@@ -34,7 +34,7 @@ use crate::hints;
 use crate::ifid::compute_ifid;
 use crate::session::{apply_turn, GameSession};
 use crate::state::AppState;
-use crate::storage::{default_state_path, game_dir as story_game_dir, quick_save_state_path, story_key_for, DiskBuild};
+use crate::storage::{default_state_path, game_dir as story_game_dir, quick_save_state_path, story_key_for};
 
 use super::{flush_screen_trace, flush_v6_trace};
 
@@ -585,7 +585,11 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     // carries the `pictures` key, and that key decides the machine below; the
     // directory itself is created (and read from) further down, where it always
     // was.
-    let disk_build = disk_image.and_then(|kind| DiskBuild::of(&story_bytes, kind));
+    // `build_for_key` is `DiskBuild::of` for a real mount, unchanged — and for a
+    // LOOSE file (`disk_image: None`), also checks whether the story's own
+    // header names a KNOWN, CATALOGUED commercial release, in which case its
+    // saves are unified with a disk-mounted copy of the same build (SQ-1635).
+    let disk_build = crate::storage::build_for_key(&story_bytes, disk_image);
     let game_dir = story_game_dir(
         &data_base,
         &story_key_for(crate::storage::StoryOrigin {
