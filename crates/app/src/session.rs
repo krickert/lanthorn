@@ -720,12 +720,26 @@ pub struct TurnResult {
 
 /// One item [`TurnResult::items`] observed this turn (SQ-1627): its engine-defined identity (the
 /// same space [`grammar_model::ObjectWords::id`] and [`mapper::graph::ItemKey`] already share —
-/// object number/address/item index), its printed name as of this turn, and where it was seen.
+/// object number/address/item index), its display name as of this turn, where it was seen, and
+/// the parser's own accepted words for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemObservation {
     pub key: mapper::graph::ItemKey,
+    /// What to SHOW the player for this item — [`grammar_model::ObjectWords::display_name`],
+    /// never the possibly-empty raw printed name alone (SQ-1631 Fix 1): an Inform 7 object
+    /// routinely has no hardware short name at all, only the parse words a `display_name` falls
+    /// back to, and a filter on the bare printed name drops every one of them (SQ-1042, the exact
+    /// bug this mirrors — see [`crate::render::room_info::list_room_objects_excluding`]'s own doc).
     pub name: String,
     pub location: ObservedItemLocation,
+    /// The SAME [`grammar_model::ObjectWords`] this observation's `name`/`key` were read off of
+    /// (SQ-1631 Fix 2) — carried forward so a later structural match
+    /// ([`take_noun_matches`]) can resolve a typed noun through
+    /// [`grammar_model::ObjectWords::refers_to`], the parser's own matching rule, instead of a
+    /// fresh hand-rolled overlap against `name` alone (which can both miss a real referent whose
+    /// printed name doesn't literally contain the typed word, and wrongly match an unrelated
+    /// object whose printed name happens to share a word).
+    pub words: grammar_model::ObjectWords,
 }
 
 /// Where [`ItemObservation`] saw an item this turn.
@@ -877,6 +891,14 @@ pub struct GameSession {
     /// [`zvm::location::PlayerCandidates`]'s doc comment for the measured
     /// cost this cache removes.
     player_candidates: std::cell::OnceCell<PlayerCandidates>,
+    /// The host's own locked player-object id (SQ-1631 Fix 3), pushed in via
+    /// [`Engine::set_player_hint`] — [`crate::state::AppState::player_obj`] mirrored back into the
+    /// session so [`Self::zvm_item_observations`] can prefer it over the raw
+    /// [`zvm::location::find_player_object_with`] heuristic, the same fallback order
+    /// [`crate::vocab::scope_split`]'s own `player_hint` parameter already uses. `None` until the
+    /// host has locked one (every story before its first movement-tracked turn, and any story whose
+    /// player object is named and so never needs the heuristic's help at all).
+    player_hint: Option<u16>,
     /// The [`parse_names`](Self::parse_names) walk folded into the one set the
     /// bulk callers query — "does ANY object answer to this word" (SQ-1176).
     ///
@@ -1284,6 +1306,7 @@ impl GameSession {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -4628,27 +4651,33 @@ pub fn apply_item_observations(mapper: &mut Mapper, turn: u32, result: &TurnResu
     }
 }
 
-/// The verb family [`classify_take_attempt`] recognises (SQ-1627, Facet 3) — `verb_synonyms`'s
-/// own "take" synonym group (`crates/verb-synonyms/src/synonym_groups.tsv`: `take  hold  carry
-/// get  grab  remove`), reused rather than invented fresh, exactly the discipline
-/// `mapper::direction::is_travel_to_command` sets for its own travel-verb list.
-const TAKE_VERBS: &[&str] = &["take", "get", "grab", "carry", "hold", "remove"];
-
-/// The noun phrase after a take-family verb, or `None` when `cmd` isn't shaped like a take-style
-/// command at all (SQ-1627, Facet 3) — structural parsing of the command's own words, the same
-/// shape [`mapper::direction::is_travel_to_command`] uses for a travel command, never a guess at
-/// what the STORY's reply means.
+/// The noun phrase after a take-style verb, or `None` when `cmd` isn't shaped like a take attempt
+/// at all (SQ-1627, Facet 3; SQ-1631 Fix 4) — structural parsing of the command's own words, the
+/// same shape [`mapper::direction::is_travel_to_command`] uses for a travel command, never a
+/// guess at what the STORY's reply means.
 ///
-/// Recognises the bare `<verb> <noun>` form (verb from [`TAKE_VERBS`]) plus the two common
-/// separable-particle spellings, "pick up <noun>" and "pick <noun> up" — "pick" alone is not in
-/// `TAKE_VERBS` because a bare "pick lock" names a different verb entirely.
-fn take_command_target(cmd: &str) -> Option<String> {
-    let lower = cmd.trim().to_lowercase();
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    let (&first, rest) = tokens.split_first()?;
+/// Recognises the bare `<verb> <noun>` form plus the two common separable-particle spellings,
+/// "pick up <noun>" and "pick <noun> up" — "pick" alone names a different verb entirely ("pick
+/// lock"), so it is handled here structurally rather than resolved through `vocab` below.
+///
+/// The bare form's VERB is resolved through the story's own grammar, not a hand-copied word list:
+/// `vocab` is [`crate::vocab::StoryVocabulary::verb_named`]'s reader, and `first` must resolve to
+/// the SAME [`grammar_model::Verb`] the story's own "take" spelling reaches — exactly how
+/// [`crate::render::command_band::story_verbs`] resolves each core verb's own row, so Zork I's
+/// take-verb (dictionary-first spelling `carry`) is recognised because "take" and "carry" resolve
+/// to one `Verb`, not because "carry" happens to appear in a literal list. `None` for `vocab` (no
+/// readable dictionary at all, e.g. a menu-driven v6 game) or a story whose dictionary does not
+/// even recognise "take" disables the bare form entirely — a known, accepted gap rather than a
+/// guess, matching this feature's own "record nothing rather than guess" discipline.
+///
+/// Tokenises with [`crate::vocab::words_of`], not a bare `split_whitespace`, so trailing
+/// punctuation a player actually types ("take lamp.") does not stay glued to the noun.
+fn take_command_target(cmd: &str, vocab: Option<&crate::vocab::StoryVocabulary>) -> Option<String> {
+    let tokens = crate::vocab::words_of(cmd);
+    let (first, rest) = tokens.split_first()?;
     if first == "pick" {
-        let (&last, body) = rest.split_last()?;
-        if rest.first() == Some(&"up") && rest.len() > 1 {
+        let (last, body) = rest.split_last()?;
+        if rest.first().map(String::as_str) == Some("up") && rest.len() > 1 {
             return Some(rest[1..].join(" "));
         }
         if last == "up" && !body.is_empty() {
@@ -4656,27 +4685,26 @@ fn take_command_target(cmd: &str) -> Option<String> {
         }
         return None;
     }
-    if TAKE_VERBS.contains(&first) && !rest.is_empty() {
+    let vocab = vocab?;
+    let take_verb = vocab.verb_named("take")?;
+    if !rest.is_empty() && std::ptr::eq(vocab.verb_named(first)?, take_verb) {
         return Some(rest.join(" "));
     }
     None
 }
 
-/// Whether `noun` (already lower-cased by [`take_command_target`]) names `printed_name` — every
-/// word of `noun`, minus a leading article, must appear somewhere among `printed_name`'s own
-/// words (case-insensitively). A DELIBERATELY weaker match than the parser's own: this app has no
-/// engine-neutral access to an item's parser-accepted words at this call site (only its printed
-/// name — see [`ItemObservation`]), so "take lamp" will not match a Zork I object whose printed
-/// name is "brass lantern" even though the parser accepts "lamp" for it. A known, documented gap
-/// (Facet 3 is allowed to be the least-complete facet of this quest) rather than a reason to guess.
-fn take_noun_matches(noun: &str, printed_name: &str) -> bool {
-    const ARTICLES: &[&str] = &["a", "an", "the"];
-    let name_lower = printed_name.to_lowercase();
-    let name_words: std::collections::HashSet<&str> = name_lower.split_whitespace().collect();
+/// Whether `noun` (already lower-cased by [`take_command_target`]) names `words` (SQ-1631 Fix 2):
+/// every word of `noun`, minus an article, must be one [`grammar_model::ObjectWords::refers_to`]
+/// — the parser's own matching rule for this exact object — answers `true` for. Replaces a
+/// former hand-rolled overlap against the printed name alone, which could both MISS a real
+/// referent (a Zork I object whose printed name is "brass lantern" never contains "lamp", though
+/// the parser accepts it) and wrongly MATCH an unrelated one (two objects whose printed names
+/// happen to share a word) — see [`ItemObservation::words`]'s own doc.
+fn take_noun_matches(noun: &str, words: &grammar_model::ObjectWords) -> bool {
     let mut any = false;
-    for word in noun.split_whitespace().filter(|w| !ARTICLES.contains(w)) {
+    for word in noun.split_whitespace().filter(|w| !grammar_model::ARTICLES.contains(w)) {
         any = true;
-        if !name_words.contains(word) {
+        if !words.refers_to(word) {
             return false;
         }
     }
@@ -4685,11 +4713,11 @@ fn take_noun_matches(noun: &str, printed_name: &str) -> bool {
 
 /// Confirm an item fixed-in-place (SQ-1627, Facet 3): `cmd` is a take-style command
 /// ([`take_command_target`]), its noun matches EXACTLY ONE of `items` ([`take_noun_matches`]
-/// against each observation's printed name), and that one item's location this turn is anything
-/// OTHER than [`ObservedItemLocation::Carried`] — i.e. the take visibly did not put it in the
-/// player's hands. Returns that item's key, or `None` when the command isn't a take attempt at
-/// all, the noun matches zero or more-than-one candidate (ambiguous — never guess which), or the
-/// take actually worked.
+/// against each observation's own parser words, [`ItemObservation::words`]), and that one item's
+/// location this turn is anything OTHER than [`ObservedItemLocation::Carried`] — i.e. the take
+/// visibly did not put it in the player's hands. Returns that item's key, or `None` when the
+/// command isn't a take attempt at all, the noun matches zero or more-than-one candidate
+/// (ambiguous — never guess which), or the take actually worked.
 ///
 /// Deliberately narrow, structural-only, and allowed to under-report (see this function's own
 /// callers for the "no death/quit this turn" guard, which lives at the call site because only it
@@ -4697,9 +4725,23 @@ fn take_noun_matches(noun: &str, printed_name: &str) -> bool {
 /// phrase match against the game's own refusal text, mirroring the discipline
 /// [`crate::probe::Refusals`] documents for the same reason (every family of game phrases a
 /// refusal differently, so a fixed list would misclassify as often as it helps).
-pub fn classify_take_attempt(cmd: &str, items: &[ItemObservation]) -> Option<mapper::graph::ItemKey> {
-    let noun = take_command_target(cmd)?;
-    let mut candidates = items.iter().filter(|o| take_noun_matches(&noun, &o.name));
+///
+/// **A caveat this narrowness does not close** (SQ-1631 audit): ANY refusal to a well-formed,
+/// unambiguous take is read as "fixed in place", including one that has nothing to do with the
+/// object being immovable — "you're not strong enough", "your hands are full", "it's too dark to
+/// see", an NPC holding it and refusing to hand it over. No existing structural signal separates a
+/// REFUSAL REASON from a plain "the take did not put it in inventory" fact, and per this feature's
+/// own discipline a phrase-list guess at the reason is exactly what [`crate::probe::Refusals`]'s
+/// doc already argues against — so this stays a known, undistinguished false-positive risk rather
+/// than a guessed fix. `mapper::graph::ItemRecord::fixed_in_place`'s own doc carries the same
+/// caveat for a reader who never looks at this function.
+pub fn classify_take_attempt(
+    cmd: &str,
+    items: &[ItemObservation],
+    vocab: Option<&crate::vocab::StoryVocabulary>,
+) -> Option<mapper::graph::ItemKey> {
+    let noun = take_command_target(cmd, vocab)?;
+    let mut candidates = items.iter().filter(|o| take_noun_matches(&noun, &o.words));
     let first = candidates.next()?;
     if candidates.next().is_some() {
         return None; // ambiguous — more than one thing here answers to this noun
@@ -4920,6 +4962,15 @@ pub fn rollback_tried_on_death(
     }
 }
 
+/// Whether `line`, trimmed, names the room `name` (already trimmed by the caller) — trimmed,
+/// case-insensitive equality (SQ-1631 Fix 6). The one recognition rule
+/// [`reprinted_room_heading`] and [`transcript_room_description`] both run against every
+/// transcript line to find a reprinted heading, factored out so the two structural facts they
+/// build on it — a direction is "tried", a description exists — can never drift apart.
+fn line_is_room_heading(line: &str, name: &str) -> bool {
+    line.trim().eq_ignore_ascii_case(name)
+}
+
 /// True when this turn's output REPRINTED `name` as a room heading: a line of its own holding
 /// exactly the room's name (SQ-0666).
 ///
@@ -4933,7 +4984,7 @@ pub fn rollback_tried_on_death(
 /// existed. A `look` reprints the heading too, but names no direction, so it mints nothing.
 fn reprinted_room_heading(transcript: &str, name: &str) -> bool {
     let name = name.trim();
-    !name.is_empty() && transcript.lines().any(|l| l.trim().eq_ignore_ascii_case(name))
+    !name.is_empty() && transcript.lines().any(|l| line_is_room_heading(l, name))
 }
 
 /// SQ-1625 Tier 3: this turn's room description, for a Z-machine story that keeps to the common
@@ -4982,7 +5033,7 @@ fn transcript_room_description(transcript: &str, name: &str) -> Option<String> {
         return None;
     }
     let lines: Vec<&str> = transcript.lines().collect();
-    let idx = lines.iter().rposition(|l| l.trim().eq_ignore_ascii_case(name))?;
+    let idx = lines.iter().rposition(|l| line_is_room_heading(l, name))?;
     let rest = lines[idx + 1..].join("\n");
     let trimmed = rest.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -5737,6 +5788,10 @@ impl Engine for GameSession {
         self.machine.set_mouse(y_px, x_px, 0b1);
     }
 
+    fn set_player_hint(&mut self, hint: Option<u16>) {
+        self.player_hint = hint;
+    }
+
     fn set_screen_dims(&mut self, rows: u16, cols: u16) {
         // ZMSD §8.4 — publish the host's REAL pane size in bytes $20/$21 (and the
         // v5+ unit words). A story pane wider or narrower than the old fixed 80×24
@@ -6314,10 +6369,21 @@ impl GameSession {
     /// INCLUDING what's on a supporter or inside an open container. Anything in the second set but
     /// not the first is nested; the caller ([`apply_item_observations`]) needs that distinction to
     /// decide vanish-eligibility later.
+    ///
+    /// The player id prefers [`Self::player_hint`] — the host's own locked
+    /// [`crate::state::AppState::player_obj`], pushed in via [`Engine::set_player_hint`] — over the raw
+    /// [`zvm::location::find_player_object_with`] heuristic, falling back to the heuristic only when no
+    /// hint has been set yet (SQ-1631 Fix 3): a story whose player object carries no short name can
+    /// never re-derive it from this call alone, but the host may already have locked one by watching
+    /// what moved between rooms, and bypassing that hint both under-populates carried items for such a
+    /// story and risks leaving the player's own object unexcluded from "what's directly in this room"
+    /// (the SQ-0667 hazard, reintroduced).
     fn zvm_item_observations(&self, location: Option<&LocationInfo>) -> Vec<ItemObservation> {
         let mut out = Vec::new();
         let names = self.parse_names();
-        let player_obj = zvm::location::find_player_object_with(&self.machine, self.player_candidates());
+        let player_obj = self
+            .player_hint
+            .or_else(|| zvm::location::find_player_object_with(&self.machine, self.player_candidates()));
         if let Some(loc) = location {
             if let Ok(room_num) = u16::try_from(loc.number) {
                 // The room's own top level. The player object is structurally a child of
@@ -6328,13 +6394,17 @@ impl GameSession {
                     .collect::<Vec<_>>();
                 let direct_ids: std::collections::BTreeSet<u32> = direct.iter().map(|o| o.id).collect();
                 for o in &direct {
-                    if o.printed_name.is_empty() {
+                    // SQ-1631 Fix 1: `display_name`, not the raw printed name alone — see
+                    // `list_room_objects_excluding`'s own doc for why filtering on the bare printed
+                    // name drops every Inform 7 object.
+                    let Some(name) = o.display_name() else {
                         continue; // nothing a panel could show, nothing a player could type
-                    }
+                    };
                     out.push(ItemObservation {
                         key: o.id,
-                        name: o.printed_name.clone(),
+                        name,
                         location: ObservedItemLocation::RoomDirect,
+                        words: o.clone(),
                     });
                 }
                 // Everything else the room reveals is nested by construction: it was excluded
@@ -6347,23 +6417,22 @@ impl GameSession {
                     loc.number,
                     player_obj.unwrap_or(0),
                 ) {
-                    if direct_ids.contains(&o.id) || o.printed_name.is_empty() {
+                    if direct_ids.contains(&o.id) {
                         continue;
                     }
-                    out.push(ItemObservation {
-                        key: o.id,
-                        name: o.printed_name,
-                        location: ObservedItemLocation::RoomNested,
-                    });
+                    let Some(name) = o.display_name() else {
+                        continue;
+                    };
+                    out.push(ItemObservation { key: o.id, name, location: ObservedItemLocation::RoomNested, words: o });
                 }
             }
         }
         if let Some(p) = player_obj {
             for o in crate::inventory::list_inventory(&self.machine.mem, names, p) {
-                if o.printed_name.is_empty() {
+                let Some(name) = o.display_name() else {
                     continue;
-                }
-                out.push(ItemObservation { key: o.id, name: o.printed_name, location: ObservedItemLocation::Carried });
+                };
+                out.push(ItemObservation { key: o.id, name, location: ObservedItemLocation::Carried, words: o });
             }
         }
         out
@@ -9011,6 +9080,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9087,6 +9157,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9158,6 +9229,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9218,6 +9290,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9321,6 +9394,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9383,6 +9457,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9429,6 +9504,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9489,6 +9565,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9587,6 +9664,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -9643,6 +9721,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -10237,6 +10316,7 @@ mod tests {
             world: std::cell::OnceCell::new(),
             parse_names: std::cell::OnceCell::new(),
             player_candidates: std::cell::OnceCell::new(),
+            player_hint: None,
             object_word_set: std::cell::RefCell::new(None),
             v6_model_memo: std::cell::RefCell::new(None),
             last_confirmed_pc: std::cell::Cell::new(None),
@@ -11097,8 +11177,48 @@ mod item_observation_tests {
     use super::*;
     use mapper::direction::Direction;
 
+    /// A synthetic observation whose `words` are `name`'s own content words (minus articles) —
+    /// good enough for every test here that isn't specifically about `words` diverging from
+    /// `name` (see [`item_obs_with_words`] for that case).
     fn item_obs(key: u32, name: &str, loc: ObservedItemLocation) -> ItemObservation {
-        ItemObservation { key, name: name.to_string(), location: loc }
+        let words: Vec<String> = name
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .filter(|w| !grammar_model::ARTICLES.contains(&w.as_str()))
+            .collect();
+        item_obs_with_words(key, name, &words.iter().map(String::as_str).collect::<Vec<_>>(), loc)
+    }
+
+    /// An observation whose parser `words` are given explicitly, independent of `name` — for
+    /// exercising [`take_noun_matches`]/[`classify_take_attempt`] against a printed name that
+    /// diverges from what the parser actually accepts (SQ-1631 Fix 2).
+    fn item_obs_with_words(key: u32, name: &str, words: &[&str], loc: ObservedItemLocation) -> ItemObservation {
+        ItemObservation {
+            key,
+            name: name.to_string(),
+            location: loc,
+            words: grammar_model::ObjectWords::new(
+                key,
+                name.to_string(),
+                words.iter().map(|w| w.to_string()).collect(),
+                None,
+                None,
+            ),
+        }
+    }
+
+    /// A minimal [`crate::vocab::StoryVocabulary`] with one verb reachable by every spelling in
+    /// `spellings` — enough to exercise [`take_command_target`]'s vocabulary-based resolution
+    /// (SQ-1631 Fix 4) without booting a real story.
+    fn vocab_with_take_verb(spellings: &[&str]) -> crate::vocab::StoryVocabulary {
+        let verb = grammar_model::Verb::new(1, 0, spellings.iter().map(|s| s.to_string()).collect(), Vec::new());
+        // `StoryVocabulary::verb_named` resolves through the flat dictionary (`words`) first —
+        // via its own private `stored()` — and only then through `by_word`, built from `verbs`
+        // alone; a spelling absent from `words` never resolves, however it appears in `verbs`.
+        let mut verb_role = grammar_model::WordRoles::default();
+        verb_role.verb = true; // `#[non_exhaustive]` forbids struct-literal syntax outside this crate
+        let words = spellings.iter().map(|s| (s.to_lowercase(), verb_role)).collect();
+        crate::vocab::StoryVocabulary::new(vec![verb], words, std::collections::BTreeSet::new(), 0)
     }
 
     fn result_with_items(number: mapper::graph::RoomId, name: &str, items: Vec<ItemObservation>) -> TurnResult {
@@ -11194,46 +11314,128 @@ mod item_observation_tests {
 
     #[test]
     fn take_command_target_recognises_the_bare_and_separable_forms() {
-        assert_eq!(take_command_target("take mailbox"), Some("mailbox".to_string()));
-        assert_eq!(take_command_target("Get the brass lantern"), Some("the brass lantern".to_string()));
-        assert_eq!(take_command_target("pick up the leaflet"), Some("the leaflet".to_string()));
-        assert_eq!(take_command_target("pick leaflet up"), Some("leaflet".to_string()));
+        let vocab = vocab_with_take_verb(&["take", "get", "carry"]);
+        assert_eq!(take_command_target("take mailbox", Some(&vocab)), Some("mailbox".to_string()));
+        assert_eq!(
+            take_command_target("Get the brass lantern", Some(&vocab)),
+            Some("the brass lantern".to_string())
+        );
+        assert_eq!(take_command_target("pick up the leaflet", Some(&vocab)), Some("the leaflet".to_string()));
+        assert_eq!(take_command_target("pick leaflet up", Some(&vocab)), Some("leaflet".to_string()));
     }
 
     #[test]
     fn take_command_target_rejects_unrelated_and_ambiguous_pick_forms() {
-        assert_eq!(take_command_target("look"), None);
-        assert_eq!(take_command_target("north"), None);
-        assert_eq!(take_command_target("pick lock"), None, "a different verb entirely");
-        assert_eq!(take_command_target("pick up"), None, "no noun named");
-        assert_eq!(take_command_target(""), None);
+        let vocab = vocab_with_take_verb(&["take", "get", "carry"]);
+        assert_eq!(take_command_target("look", Some(&vocab)), None);
+        assert_eq!(take_command_target("north", Some(&vocab)), None);
+        assert_eq!(take_command_target("pick lock", Some(&vocab)), None, "a different verb entirely");
+        assert_eq!(take_command_target("pick up", Some(&vocab)), None, "no noun named");
+        assert_eq!(take_command_target("", Some(&vocab)), None);
+    }
+
+    /// SQ-1631 Fix 4: `take lamp.` — with the trailing full stop a player actually types — must
+    /// still extract `lamp` as the noun. Falsifies a bare `split_whitespace` tokenizer, which
+    /// leaves the period glued to the last word and no candidate's `words` would ever match it.
+    #[test]
+    fn take_command_target_strips_trailing_punctuation_via_words_of() {
+        let vocab = vocab_with_take_verb(&["take"]);
+        assert_eq!(take_command_target("take lamp.", Some(&vocab)), Some("lamp".to_string()));
+    }
+
+    /// SQ-1631 Fix 4: a story's take-verb is resolved through its OWN grammar
+    /// ([`crate::vocab::StoryVocabulary::verb_named`]), not a hand-copied English word list —
+    /// falsified by `acquire`, a spelling that was never in the old hard-coded `TAKE_VERBS` list
+    /// and so the old code would have rejected outright, but which this story's own dictionary
+    /// files as a synonym of the same verb as `take`.
+    #[test]
+    fn take_command_target_recognises_a_storys_own_take_synonym_absent_from_the_old_hardcoded_list() {
+        let vocab = vocab_with_take_verb(&["take", "acquire"]);
+        assert_eq!(take_command_target("acquire lamp", Some(&vocab)), Some("lamp".to_string()));
+    }
+
+    /// SQ-1631 Fix 4: Zork I's own take-verb dictionary-first spelling is `carry` (`take` a mere
+    /// synonym reaching the same verb) — named explicitly in the audit as the case the OLD
+    /// `TAKE_VERBS` list only recognised by coincidence, not by resolving the story's own grammar.
+    #[test]
+    fn take_command_target_recognises_zork_ones_carry_spelling() {
+        let vocab = vocab_with_take_verb(&["carry", "take", "get"]);
+        assert_eq!(take_command_target("carry sword", Some(&vocab)), Some("sword".to_string()));
+    }
+
+    /// With no readable vocabulary at all (a menu-driven v6 game, or an engine with no dictionary
+    /// reader), the bare verb form is disabled outright rather than guessed — the "pick up"
+    /// particle forms are unaffected, since they never consult `vocab`.
+    #[test]
+    fn take_command_target_disables_the_bare_form_without_a_vocabulary() {
+        assert_eq!(take_command_target("take mailbox", None), None);
+        assert_eq!(take_command_target("pick up the leaflet", None), Some("the leaflet".to_string()));
     }
 
     #[test]
     fn classify_take_attempt_flags_a_single_unambiguous_refusal() {
+        let vocab = vocab_with_take_verb(&["take"]);
         let items = vec![item_obs(10, "a small mailbox", ObservedItemLocation::RoomDirect)];
-        assert_eq!(classify_take_attempt("take mailbox", &items), Some(10));
+        assert_eq!(classify_take_attempt("take mailbox", &items, Some(&vocab)), Some(10));
     }
 
     #[test]
     fn classify_take_attempt_is_silent_when_the_take_actually_worked() {
+        let vocab = vocab_with_take_verb(&["take"]);
         let items = vec![item_obs(11, "a leaflet", ObservedItemLocation::Carried)];
-        assert_eq!(classify_take_attempt("take leaflet", &items), None, "the take succeeded — nothing to flag");
+        assert_eq!(
+            classify_take_attempt("take leaflet", &items, Some(&vocab)),
+            None,
+            "the take succeeded — nothing to flag"
+        );
     }
 
     #[test]
     fn classify_take_attempt_is_silent_on_an_ambiguous_noun() {
+        let vocab = vocab_with_take_verb(&["take"]);
         let items = vec![
             item_obs(10, "a red box", ObservedItemLocation::RoomDirect),
             item_obs(11, "a blue box", ObservedItemLocation::RoomDirect),
         ];
-        assert_eq!(classify_take_attempt("take box", &items), None, "two candidates — never guess which");
+        assert_eq!(
+            classify_take_attempt("take box", &items, Some(&vocab)),
+            None,
+            "two candidates — never guess which"
+        );
     }
 
     #[test]
     fn classify_take_attempt_is_silent_on_no_candidate_or_non_take_command() {
+        let vocab = vocab_with_take_verb(&["take"]);
         let items = vec![item_obs(10, "a small mailbox", ObservedItemLocation::RoomDirect)];
-        assert_eq!(classify_take_attempt("take sword", &items), None, "no candidate answers to this noun");
-        assert_eq!(classify_take_attempt("look", &items), None, "not a take command at all");
+        assert_eq!(
+            classify_take_attempt("take sword", &items, Some(&vocab)),
+            None,
+            "no candidate answers to this noun"
+        );
+        assert_eq!(classify_take_attempt("look", &items, Some(&vocab)), None, "not a take command at all");
+    }
+
+    /// SQ-1631 Fix 2: falsifies the misattribution the old printed-name-overlap matcher was
+    /// capable of. Object 10 is the real "sword" — its parser accepts `sword`/`blade`, but its
+    /// printed name is "long blade" and never literally contains the word "sword". Object 11 is
+    /// an unrelated "sword fern" whose ONLY parser word is `fern`, but whose printed name happens
+    /// to contain the literal word "sword" as flavour text. Under the old matcher (overlap against
+    /// `name` alone), object 10 would MISS ("sword" isn't a word of "long blade") while object 11
+    /// would falsely MATCH ("sword" is a word of "sword fern") — a single, unambiguous, and WRONG
+    /// answer. The new matcher resolves through each object's own parser words instead.
+    #[test]
+    fn classify_take_attempt_never_misattributes_to_an_object_whose_printed_name_merely_shares_a_word() {
+        let vocab = vocab_with_take_verb(&["take"]);
+        let items = vec![
+            item_obs_with_words(10, "long blade", &["sword", "blade"], ObservedItemLocation::RoomDirect),
+            item_obs_with_words(11, "sword fern", &["fern"], ObservedItemLocation::RoomDirect),
+        ];
+        assert_eq!(
+            classify_take_attempt("take sword", &items, Some(&vocab)),
+            Some(10),
+            "resolves to the real sword (object 10) by its own parser words, never object 11 whose \
+             printed name merely contains the word"
+        );
     }
 }

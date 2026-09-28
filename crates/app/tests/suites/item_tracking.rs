@@ -13,6 +13,8 @@
 
 use crate::fixture_paths::fixture_path;
 
+use app::engine::{Engine, KeyInput};
+use app::glulx_session::GlulxSession;
 use app::session::GameSession;
 
 fn story(name: &str) -> Option<Vec<u8>> {
@@ -25,6 +27,37 @@ fn boot_zork1() -> Option<GameSession> {
         .expect("zork1 boots without a ZError");
     // Drain the boot's own banner/opening print first — same idiom `room_description.rs` uses.
     let _ = s.submit("");
+    Some(s)
+}
+
+/// The Glulx image inside a Blorb, or a bare `.ulx` passed through — same helper
+/// `glulx_inventory.rs` uses. `None` when the gitignored fixture is absent.
+fn glulx_image(name: &str) -> Option<Vec<u8>> {
+    let path = fixture_path(name);
+    let bytes = std::fs::read(&path).ok()?;
+    if !blorb::Blorb::is_blorb(&bytes) {
+        return Some(bytes);
+    }
+    let b = blorb::Blorb::parse(bytes).ok()?;
+    match b.executable() {
+        Ok((blorb::ExecKind::Glulx, data)) => Some(data.to_vec()),
+        _ => None,
+    }
+}
+
+/// Counterfeit Monkey (Inform 7 6M62, IF Archive release 10 / SQ-1454) past its "Can you hear
+/// me?" intro to the first real command prompt — see `glulx_inventory.rs`'s
+/// `counterfeit_monkey_refuses_an_avatar_it_cannot_identify` for why this exact fixture is the
+/// one Inform 7 game already documented here as having NO hardware short name on virtually any
+/// of its objects, avatar included.
+fn boot_cm() -> Option<GlulxSession> {
+    let image = glulx_image("CounterfeitMonkey-10.gblorb")?;
+    let mut s = GlulxSession::new(image, 80, 24, true, false, false, (1.0, 1.0), None, &[]).expect("GlulxSession::new");
+    for cmd in ["yes", "yes", "yes"] {
+        s.submit(cmd);
+    }
+    s.submit_key(KeyInput::Enter);
+    let _ = s.take_transcript();
     Some(s)
 }
 
@@ -139,7 +172,9 @@ fn taking_the_mailbox_confirms_it_fixed_in_place() {
     };
     let r = s.submit("take mailbox");
     assert!(r.transcript.contains("securely anchored"), "the real refusal text: {:?}", r.transcript);
-    let key = app::session::classify_take_attempt("take mailbox", &r.items).expect("one unambiguous candidate, visibly not carried");
+    let vocab = s.story_vocabulary();
+    let key = app::session::classify_take_attempt("take mailbox", &r.items, vocab.as_ref())
+        .expect("one unambiguous candidate, visibly not carried");
     let mailbox = r.items.iter().find(|o| o.key == key).unwrap();
     assert!(mailbox.name.contains("mailbox"));
     assert_ne!(mailbox.location, app::session::ObservedItemLocation::Carried);
@@ -156,8 +191,9 @@ fn taking_an_ordinary_takeable_item_is_not_flagged_fixed_in_place() {
     let _ = s.submit("open mailbox");
     let r = s.submit("take leaflet");
     assert!(r.transcript.contains("Taken"), "the real success text: {:?}", r.transcript);
+    let vocab = s.story_vocabulary();
     assert_eq!(
-        app::session::classify_take_attempt("take leaflet", &r.items),
+        app::session::classify_take_attempt("take leaflet", &r.items, vocab.as_ref()),
         None,
         "the take worked — nothing to flag"
     );
@@ -194,4 +230,100 @@ fn an_item_in_a_never_visited_room_never_appears_in_the_registry() {
     // Every item actually tracked must have an origin room the player did, in fact, walk
     // through this session (a resolved, non-synthetic location every `submit` above returned).
     assert!(!tracked_names.is_empty(), "West of House's own mailbox should still be tracked");
+}
+
+// ── Fix 1 / Fix 3 (SQ-1631) — a real Inform 7 game with an unidentifiable avatar ─────────────
+
+/// SQ-1631 Fix 1: Counterfeit Monkey (Inform 7 6M62, IF Archive release 10) is documented
+/// (`glulx_inventory.rs`'s `counterfeit_monkey_refuses_an_avatar_it_cannot_identify`) as having
+/// no hardware short name on virtually any of its objects, avatar included — every ordinary
+/// scenery object here prints through a `parse_name` rule instead of a static short name. Before
+/// this fix, `glulx_item_observations` filtered candidates on the raw (empty) printed name and
+/// dropped every one of them outright, so `result.items` was empty for this game's every room
+/// regardless of what was actually shown. Sigil Street — one `north` past the opening Back Alley,
+/// once the room lock has resolved a real address (turn 0 predates that and reports no items at
+/// all, which is why this drives one move first) — is a real specimen: its own "sky backdrops"
+/// scenery has an empty printed name and is named only by its parse words.
+#[test]
+fn glulx_item_observations_reaches_an_inform_7_object_with_no_printed_name() {
+    let Some(mut s) = boot_cm() else { return };
+    let r = s.submit("north"); // Back Alley -> Sigil Street
+    assert_eq!(
+        r.location.as_ref().map(|l| l.name.as_str()),
+        Some("Sigil Street"),
+        "premise: this walks to the specimen room: {:?}",
+        r.location
+    );
+
+    // Confirm the premise directly against the object list: this room really does hold an
+    // object with an empty raw printed name but a real display name.
+    let loc = r.location.clone().unwrap();
+    let room_objects = s.introspect().unwrap().room_objects_excluding(loc.number, None);
+    let unnamed: Vec<_> =
+        room_objects.iter().filter(|o| o.printed_name.is_empty() && o.display_name().is_some()).collect();
+    assert!(
+        !unnamed.is_empty(),
+        "premise: Sigil Street holds an Inform-7-style object with no printed name: {room_objects:?}"
+    );
+
+    // And it now reaches `result.items` — with its `display_name()` as `name`, never empty.
+    assert!(
+        r.items.iter().any(|i| unnamed.iter().any(|o| o.id == i.key) && !i.name.is_empty()),
+        "at least one such object now reaches result.items with a real display name: {:?}",
+        r.items
+    );
+}
+
+/// SQ-1631 Fix 3: `glulx_item_observations` must prefer [`app::engine::Engine::set_player_hint`]'s
+/// value over the raw [`app::engine::Introspect::player_object`] lookup, which for Counterfeit
+/// Monkey answers `None` FOREVER — no turn ever locks it by the engine's own name-based heuristic
+/// (`glulx_inventory.rs`'s `counterfeit_monkey_refuses_an_avatar_it_cannot_identify`). The host's
+/// own movement-tracking fallback (`app::inventory::detect_player_obj`) can still lock a real
+/// handle by watching what moved between rooms even when the engine's own lookup cannot, and
+/// `finish_command_turn` pushes that lock in via `set_player_hint`. This exercises the mechanism
+/// directly against CM's own real object tree: with no hint, nothing is excluded from "directly
+/// in this room" at all; with a hint set to a real handle this room holds, that ONE object is
+/// excluded — exactly as it would be if it really were the player.
+#[test]
+fn glulx_item_observations_prefers_the_set_player_hint_over_the_unidentifiable_raw_lookup() {
+    let Some(mut s) = boot_cm() else { return };
+    let r = s.submit("north");
+    let loc = r.location.clone().unwrap();
+    assert!(
+        s.introspect().unwrap().player_object().is_none(),
+        "premise: CM's avatar is unidentifiable by name"
+    );
+
+    let without_hint: std::collections::BTreeSet<u32> = r
+        .items
+        .iter()
+        .filter(|i| i.location == app::session::ObservedItemLocation::RoomDirect)
+        .map(|i| i.key)
+        .collect();
+    assert!(!without_hint.is_empty(), "premise: Sigil Street shows at least one room-direct item");
+
+    let handles = s.introspect().unwrap().children_of(loc.number);
+    let &stand_in = handles.iter().next().expect("Sigil Street holds at least one child object");
+
+    s.set_player_hint(Some(stand_in));
+    let with_hint = s.submit("look");
+    let after: std::collections::BTreeSet<u32> = with_hint
+        .items
+        .iter()
+        .filter(|i| i.location == app::session::ObservedItemLocation::RoomDirect)
+        .map(|i| i.key)
+        .collect();
+
+    assert_eq!(
+        after.len(),
+        without_hint.len().saturating_sub(1),
+        "exactly one object — the hinted handle — is now excluded from room-direct: before \
+         {without_hint:?}, after {after:?}"
+    );
+    assert_eq!(
+        without_hint.difference(&after).count(),
+        1,
+        "the excluded object was really among the previously-listed ones, not a coincidental \
+         absence: before {without_hint:?}, after {after:?}"
+    );
 }

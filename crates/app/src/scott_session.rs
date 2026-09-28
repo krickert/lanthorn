@@ -641,15 +641,25 @@ impl ScottSession {
     /// `/NOUN/` marker (pure scenery/messages the parser can't name at all — see that method's own
     /// doc), so those are left out here too: nothing a panel could show and nothing a player could
     /// type, the same filter every other engine's item listing already applies.
+    ///
+    /// The room half is skipped ENTIRELY while [`scott::vm::Vm::is_dark`] (SQ-1631 Fix 7) — the
+    /// same gate every `room_block_*` layout applies before it will call `items_in_room` at all
+    /// (see [`scott::vm::Vm::room_description_text`]'s doc): a dark room's items are never actually
+    /// shown to the player, so recording them as "observed" here would violate this feature's own
+    /// "never reveal what the player hasn't personally seen" rule. Carried items are unaffected —
+    /// darkness never hides what is already in your own hands, exactly as `print_inventory` doesn't
+    /// gate on it either.
     fn item_observations(&self) -> Vec<ItemObservation> {
         let db = self.vm.database();
         let mut out = Vec::new();
-        for idx in self.vm.item_indices_in_room() {
-            if let Some(ow) = db.item_words(idx) {
-                if ow.printed_name.is_empty() {
-                    continue;
+        if !self.vm.is_dark() {
+            for idx in self.vm.item_indices_in_room() {
+                if let Some(ow) = db.item_words(idx) {
+                    if ow.printed_name.is_empty() {
+                        continue;
+                    }
+                    out.push(ItemObservation { key: ow.id, name: ow.printed_name.clone(), location: ObservedItemLocation::RoomDirect, words: ow });
                 }
-                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::RoomDirect });
             }
         }
         for idx in self.vm.carried_item_indices() {
@@ -657,7 +667,7 @@ impl ScottSession {
                 if ow.printed_name.is_empty() {
                     continue;
                 }
-                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::Carried });
+                out.push(ItemObservation { key: ow.id, name: ow.printed_name.clone(), location: ObservedItemLocation::Carried, words: ow });
             }
         }
         out
@@ -1169,6 +1179,107 @@ mod tests {
 
     fn dat() -> Vec<u8> {
         include_bytes!("../../scott/tests/tiny_cave.dat").to_vec()
+    }
+
+    /// A hand-built two-room world (SQ-1631 Fix 7) — the same "build a `Database` by hand"
+    /// recipe the `scott` crate's own doc example uses (`crates/scott/src/lib.rs`'s `# Example`
+    /// section), rather than a `.dat` text file: room 1 starts the player in a permanently dark
+    /// room (opcode 56, "set dark flag", fired unconditionally by a verb-0/100%-chance occurrence
+    /// line that runs during `Vm::new`'s own opening pass — no light source is anywhere near it),
+    /// holding one real, nameable item (a rusty key) that never moves.
+    fn dark_room_session() -> ScottSession {
+        use scott::database::{Action, Condition, Item, Room};
+        use scott::{Database, Vm};
+
+        let db = Database {
+            max_carry: 6,
+            start_room: 1,
+            num_treasures: 0,
+            word_length: 0,
+            light_time: -1,
+            treasure_room: 0,
+            // Verb 0 / noun 100 = an occurrence line with a 100% roll chance, unconditional
+            // (all five conditions are code 0, "always true") — fires in `Vm::new`'s own opening
+            // pass. Opcode 56 is `Vm::run_commands`'s own "set DARK_FLAG" case.
+            actions: vec![Action {
+                verb: 0,
+                noun: 100,
+                conditions: [Condition { code: 0, value: 0 }; 5],
+                commands: [56, 0, 0, 0],
+            }],
+            verbs: vec![String::new()],
+            // "LAMP" / "KEY" need real vocabulary entries — `Database::item_words` resolves an
+            // item's `auto_noun` through `match_noun` against this table, so an item whose marker
+            // has no matching entry here answers `None` regardless of darkness, which would make
+            // this fixture's assertions pass for the wrong reason.
+            nouns: vec![String::new(), "LAMP".into(), "KEY".into()],
+            rooms: vec![
+                Room { exits: [0; 6], desc: "limbo".into(), literal: true }, // room 0: unused
+                Room { exits: [0; 6], desc: "a pitch-dark cave".into(), literal: true },
+            ],
+            messages: vec![],
+            // Item 9 MUST be the light source — `scott::database::LIGHT_SOURCE` is a fixed
+            // index, not a lookup — so items 0..=8 are unused placeholders and item 9 is a lamp
+            // kept in room 0 (limbo), nowhere near room 1 and never carried, so room 1 has no
+            // light of any kind from the moment the game boots.
+            items: (0..9)
+                .map(|_| Item { text: String::new(), treasure: false, auto_noun: None, start_loc: 0 })
+                .chain(std::iter::once(Item {
+                    text: "a brass lamp".into(),
+                    treasure: false,
+                    auto_noun: Some("LAMP".into()),
+                    start_loc: 0,
+                }))
+                .chain(std::iter::once(Item {
+                    text: "a rusty key".into(),
+                    treasure: false,
+                    auto_noun: Some("KEY".into()),
+                    start_loc: 1, // the dark room — this is the item under test
+                }))
+                .collect(),
+            adventure_number: 0,
+            ti99: None,
+            mysterious: false,
+            saga_us: None,
+        };
+        let vm = Vm::new(db);
+        assert!(vm.is_dark(), "premise: the opening occurrence pass set the dark flag");
+        assert_eq!(
+            vm.item_indices_in_room(),
+            vec![10],
+            "premise: the rusty key really is physically present in this room"
+        );
+        ScottSession {
+            vm,
+            intro: String::new(),
+            aux: BTreeMap::new(),
+            aux_dirty: false,
+            picts: crate::graphics::PictSource::new(None),
+            current_canvas: None,
+            current_pic_num: None,
+            current_overlays: Vec::new(),
+            pic_version: 0,
+            showing: VecDeque::new(),
+            showing_title_card: false,
+            deferred_save: false,
+        }
+    }
+
+    /// SQ-1631 Fix 7: `room_block` (and `room_description_text`) never call
+    /// `items_in_room`/`item_indices_in_room` at all while [`scott::Vm::is_dark`] — the player is
+    /// never actually SHOWN a dark room's items — so `item_observations` must respect the
+    /// identical gate. Before this fix, `item_indices_in_room()` (which does NOT gate on
+    /// darkness itself, unlike the presentation layer) fed straight into `item_observations`
+    /// unconditionally, so a dark room's contents were recorded as "seen" despite the player
+    /// never having been shown them.
+    #[test]
+    fn item_observations_never_reports_a_room_direct_item_while_the_room_is_dark() {
+        let s = dark_room_session();
+        assert!(
+            s.item_observations().is_empty(),
+            "the rusty key sits in this room but the room is dark — it must not be observed: {:?}",
+            s.item_observations()
+        );
     }
 
     #[test]

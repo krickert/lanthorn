@@ -70,6 +70,15 @@ pub struct ItemRecord {
     /// inventory. Structural signal only (see `session::classify_take_attempt`), and deliberately
     /// incomplete — most non-takeable items are never tested this way, so `false` means "never
     /// confirmed", not "portable". Absent from a map file written before this existed.
+    ///
+    /// **`true` does not mean the item IS fixed in place** (SQ-1631 audit) — it means only that the
+    /// last unambiguous take attempted against it did not put it in inventory. `classify_take_attempt`
+    /// cannot tell that refusal apart from "you're not strong enough", "your hands are full", "it's
+    /// too dark to see", or an NPC that refuses to hand it over: no structural signal distinguishes
+    /// a refusal's REASON, and per this feature's own discipline (`crate::probe::Refusals`'s own
+    /// doc makes the same argument) a hand-written phrase list guessing at the reason would
+    /// misclassify as often as it helps, so none is attempted. Treat `true` as "an unambiguous take
+    /// failed here at least once", not as a portability verdict.
     #[serde(default)]
     pub fixed_in_place: bool,
 }

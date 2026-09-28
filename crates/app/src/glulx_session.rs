@@ -209,6 +209,11 @@ pub struct GlulxSession {
     /// the walk decodes every object's name array — 2,494 of them on
     /// Counterfeit Monkey.
     player_addr: std::cell::RefCell<Option<Option<u32>>>,
+    /// The host's own locked player-object id (SQ-1631 Fix 3) — see `GameSession::player_hint`'s
+    /// doc (the Z-machine's twin field) for why [`Self::glulx_item_observations`] prefers this over
+    /// [`Introspect::player_object`]'s own raw lookup once the host has one. Set via
+    /// [`Engine::set_player_hint`].
+    player_hint: Option<u16>,
     /// Auxiliary persistent data (Glulx aux persistence is a later phase).
     aux: BTreeMap<String, Vec<u8>>,
     aux_dirty: bool,
@@ -688,6 +693,7 @@ impl GlulxSession {
             room_addrs: std::cell::RefCell::new(std::collections::HashMap::new()),
             object_word_set: std::cell::RefCell::new(None),
             player_addr: std::cell::RefCell::new(None),
+            player_hint: None,
             aux: BTreeMap::new(),
             aux_dirty: false,
             last_room: None,
@@ -1490,24 +1496,34 @@ impl GlulxSession {
     /// convention this format's own layout says nothing about, so there is no way to recurse into
     /// an open container at all, and every room sighting here is therefore already the room's
     /// direct top level.
+    ///
+    /// The player id prefers [`Self::player_hint`] over the raw [`Introspect::player_object`]
+    /// lookup (SQ-1631 Fix 3) — see `GameSession::zvm_item_observations`'s doc for why: on
+    /// virtually every Inform 7 game `result.items` was previously empty here regardless, because
+    /// this format's `printed_name` is routinely blank (Fix 1 below); once that filter is widened,
+    /// the player-id bypass alone would still misfire for an unnamed player object.
     fn glulx_item_observations(&self, location: Option<&LocationInfo>) -> Vec<crate::session::ItemObservation> {
         use crate::session::{ItemObservation, ObservedItemLocation};
         let mut out = Vec::new();
-        let player = Introspect::player_object(self);
+        let player = self.player_hint.or_else(|| Introspect::player_object(self));
         if let Some(loc) = location {
             for ow in self.room_objects_excluding(loc.number, player) {
-                if ow.printed_name.is_empty() {
+                // SQ-1631 Fix 1: `display_name`, not the raw printed name alone — Inform 7's
+                // objects routinely have no hardware short name at all, only parse words, and a
+                // filter on the bare printed name drops every one of them (the exact SQ-1042 bug
+                // this mirrors; see `render::room_info::list_room_objects_excluding`'s own doc).
+                let Some(name) = ow.display_name() else {
                     continue;
-                }
-                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::RoomDirect });
+                };
+                out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::RoomDirect, words: ow });
             }
         }
         if let Some(p) = player {
             for ow in self.contents(p) {
-                if ow.printed_name.is_empty() {
+                let Some(name) = ow.display_name() else {
                     continue;
-                }
-                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::Carried });
+                };
+                out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::Carried, words: ow });
             }
         }
         out
@@ -2521,6 +2537,10 @@ impl Engine for GlulxSession {
         self.machine.flush();
         let raw = self.appglk().take_transcript().0;
         if self.strip_prompt { strip_read_prompt_for(&raw, self.pending).to_owned() } else { raw }
+    }
+
+    fn set_player_hint(&mut self, hint: Option<u16>) {
+        self.player_hint = hint;
     }
 
     fn drain_screen_clear(&mut self) -> bool {

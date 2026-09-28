@@ -1021,6 +1021,23 @@ pub trait Engine {
     /// event path). (Lane M)
     fn set_mouse(&mut self, _y_px: u16, _x_px: u16) {}
 
+    /// Publish the host's own LOCKED player-object id
+    /// ([`crate::state::AppState::player_obj`]) into the engine (SQ-1631 Fix 3), mirroring
+    /// `set_mouse`/`set_screen_dims`/`set_default_colours`'s pattern of pushing a host-known fact
+    /// into the session rather than re-deriving it engine-side.
+    ///
+    /// Once the host has locked a player id — by watching what moved between rooms, for a story
+    /// whose player object carries no short name the engine's own heuristic could find directly —
+    /// every later per-turn item observation should prefer that hint over the raw heuristic, the
+    /// same fallback order [`crate::vocab::scope_split`]'s own `player_hint` parameter already
+    /// uses. `crate::host::turn::finish_command_turn` calls this once per command turn, right after
+    /// its own lock attempt, so the FOLLOWING turn's observations see it.
+    ///
+    /// Default no-op: only the Z-machine and Glulx sessions track item observations by object id
+    /// at all (Scott Adams has no player-object concept — every item is simply in a room, carried,
+    /// or nowhere) and override this to store it.
+    fn set_player_hint(&mut self, _hint: Option<u16>) {}
+
     /// The v6 screen's PAINTED ground — filled rectangles left by `erase_window`,
     /// in native pixels (SQ-0706). `None` for every engine and every game that
     /// never paints one, which is all of them but scopa-shaped v6 titles.

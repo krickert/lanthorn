@@ -394,7 +394,10 @@ pub fn finish_command_turn(
     // silent (no candidate, or an ambiguous one) rather than guessed. AFTER `apply_item_observations`
     // so it reads this turn's own freshly-updated locations, not stale ones from before the command.
     if !result.quit && !crate::session::turn_reports_death(&result.transcript) {
-        if let Some(key) = crate::session::classify_take_attempt(cmd, &result.items) {
+        // SQ-1631 Fix 4: the take-verb itself is resolved through the story's OWN grammar
+        // (`classify_take_attempt`'s own doc), the same cached read `command_band`'s verb column
+        // already pays for every render frame — never a cost this call site adds.
+        if let Some(key) = crate::session::classify_take_attempt(cmd, &result.items, state.vocab.get(&*session)) {
             mapper.graph.note_item_fixed_in_place(key);
         }
     }
@@ -758,6 +761,12 @@ fn post_turn_bookkeeping(
         if cmd_norm == "i" || cmd_norm == "inv" || cmd_norm == "inventory" {
             state.inventory_fallback = parse_inventory_output(&result.transcript);
         }
+
+        // SQ-1631 Fix 3: publish this turn's (possibly just-locked) player id back into the
+        // engine — mirroring `set_mouse`/`set_screen_dims`/`set_default_colours`'s pattern of
+        // pushing a host-known fact into the session — so the NEXT turn's item observations
+        // prefer it over each engine's raw per-turn heuristic. See `Engine::set_player_hint`'s doc.
+        session.set_player_hint(state.player_obj);
     }
 
     // ── The story's own words in what it has just printed (SQ-1116) ───
@@ -2034,7 +2043,12 @@ mod tests {
 
         let mut result = fault_test_result(false, None);
         result.location = Some(crate::engine::LocationInfo { number: 1, parent: 0, name: "West of House".into() });
-        result.items = vec![ItemObservation { key: 10, name: "a small mailbox".into(), location: ObservedItemLocation::RoomDirect }];
+        result.items = vec![ItemObservation {
+            key: 10,
+            name: "a small mailbox".into(),
+            location: ObservedItemLocation::RoomDirect,
+            words: grammar_model::ObjectWords::new(10, "a small mailbox".into(), vec!["mailbox".into()], None, None),
+        }];
 
         let _ = super::finish_resumed_turn(result, &mut mapper, &mut state, &mut eng, &dir, "TEST-IFID", rect);
 
