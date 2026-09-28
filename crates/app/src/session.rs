@@ -4815,8 +4815,9 @@ fn transcript_room_description(transcript: &str, name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let idx = transcript.lines().position(|l| l.trim().eq_ignore_ascii_case(name))?;
-    let rest = transcript.lines().skip(idx + 1).collect::<Vec<_>>().join("\n");
+    let lines: Vec<&str> = transcript.lines().collect();
+    let idx = lines.iter().rposition(|l| l.trim().eq_ignore_ascii_case(name))?;
+    let rest = lines[idx + 1..].join("\n");
     let trimmed = rest.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -6704,6 +6705,17 @@ mod tests {
         let transcript = "look\nWest of House\nYou are standing in an open field.\n";
         let desc = transcript_room_description(transcript, "West of House").unwrap();
         assert!(!desc.contains("look"), "the self-echoed command must not leak into the body: {desc:?}");
+        assert_eq!(desc, "You are standing in an open field.");
+    }
+
+    /// When the room's heading line is printed twice in one turn's transcript (e.g. a status
+    /// recap that reprints the bare name, followed by the real arrival heading), the text after
+    /// the LAST occurrence is the description — not the first, which would grab the text sitting
+    /// between the two as if it were the room's own body.
+    #[test]
+    fn transcript_room_description_uses_the_last_matching_heading_line() {
+        let transcript = "West of House\nSomething unrelated happens here.\nWest of House\nYou are standing in an open field.\n";
+        let desc = transcript_room_description(transcript, "West of House").unwrap();
         assert_eq!(desc, "You are standing in an open field.");
     }
 
