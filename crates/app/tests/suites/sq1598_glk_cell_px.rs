@@ -172,6 +172,7 @@ fn boot_via_terminal_facts(story: PathBuf, home: &Path, glk_cell_px: Option<(f64
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts { glk_cell_px, ..TerminalFacts::default() },
+        fresh_start: false,
     };
     boot_story(req, &mut QuietBoot).expect("the story boots headlessly")
 }

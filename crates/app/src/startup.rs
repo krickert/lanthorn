@@ -923,6 +923,9 @@ pub(crate) fn boot_story(
         data_base: ctx.data_base.clone(),
         flags: app::host::LaunchFlags::from(&ctx.cli),
         terminal,
+        // `--fresh-start` (SQ-1626): a host-requested boot that skips resume
+        // selection entirely, for a "reboot" that crosses a process boundary.
+        fresh_start: ctx.cli.fresh_start,
     };
     let mut hooks = TuiBootHooks::default();
     let booted = app::host::boot_story(req, &mut hooks);

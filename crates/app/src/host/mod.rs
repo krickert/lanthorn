@@ -53,8 +53,8 @@ pub mod turn;
 
 pub use assist::{refresh_band_data, set_guidance, BandData};
 pub use boot::{
-    boot_story, random_seed_line, resolve_pict_blorb, story_screen_in, BootError, BootHooks,
-    BootRequest, BootedStory, LaunchFlags, QuietBoot, TerminalFacts,
+    boot_story, random_seed_line, resolve_pict_blorb, resume_source, story_screen_in, BootError,
+    BootHooks, BootRequest, BootedStory, LaunchFlags, QuietBoot, ResumeSlot, TerminalFacts,
 };
 pub use turn::{
     apply_game_driven_result, finish_command_turn, finish_resumed_turn, Paging, TurnCtx,

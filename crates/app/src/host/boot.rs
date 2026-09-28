@@ -59,6 +59,15 @@ pub struct BootRequest<'a> {
     pub flags: LaunchFlags,
     /// What the terminal answered, or nothing for a headless host.
     pub terminal: TerminalFacts,
+    /// Skip resume selection ENTIRELY — no [`resume_source`] lookup, no
+    /// `load_archive`, mapper starts as [`Mapper::default`] — even when one of
+    /// the reserved slots holds a real resume point (SQ-1626). For a host whose
+    /// own "reboot"/"new game" is a genuinely separate boot that must not
+    /// resume anything, as opposed to `cfg.auto_load = false` (which still
+    /// offers the launch-resume dialog). Neither reserved save file is read OR
+    /// written when this is set — a quick save survives completely untouched,
+    /// ready to resume on the next ordinary boot. Default `false`.
+    pub fresh_start: bool,
 }
 
 /// The command-line facts a story boot reads, lifted off [`Cli`] so a host with
@@ -190,10 +199,12 @@ pub struct BootedStory {
     /// from `arc_file` so a quick-save survives the next auto-save (SQ-1624).
     pub quick_save_file: PathBuf,
     /// Whichever of `arc_file` / `quick_save_file` THIS boot actually resumed
-    /// from (the newer of the two, by `Meta::saved_at`) — the archive the
+    /// from, per [`resume_source`] (SQ-1624/SQ-1626) — the archive the
     /// launch-resume dialog's stashed save/transcript came from, so accepting
     /// it (`apply_launch_resume`) re-reads the map/turns from the SAME file
-    /// rather than always `arc_file` (SQ-1624).
+    /// rather than always `arc_file`. Falls back to `arc_file` when this boot
+    /// attempted no resume at all (`fresh_start`, or neither slot had
+    /// anything to offer).
     pub resume_source_file: PathBuf,
     pub story_bytes: Vec<u8>,
     pub story_path: PathBuf,
@@ -203,6 +214,87 @@ pub struct BootedStory {
     /// succeeded) rather than starting fresh. A headless host had no way to
     /// tell the two apart short of re-reading the archive itself (SQ-1545).
     pub resumed: bool,
+}
+
+/// Which of the two reserved save slots under a game's directory a resume
+/// would come from (SQ-1626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeSlot {
+    /// `<game_dir>/default.lanthorn`, the per-turn/exit auto-save slot.
+    AutoSave,
+    /// `<game_dir>/quick-save.lanthorn`, the manual quick-save slot.
+    QuickSave,
+}
+
+impl ResumeSlot {
+    /// The archive path this slot names, under `game_dir`.
+    pub fn path(self, game_dir: &Path) -> PathBuf {
+        match self {
+            ResumeSlot::AutoSave => default_state_path(game_dir),
+            ResumeSlot::QuickSave => quick_save_state_path(game_dir),
+        }
+    }
+}
+
+/// `Meta::saved_at` plus whether the archive carries a real resume point —
+/// the two cheaply-read facts [`resume_source`]'s comparison needs about one
+/// candidate archive.
+struct SlotFacts {
+    saved_at: String,
+    has_resume: bool,
+}
+
+fn slot_facts(path: &Path) -> Option<SlotFacts> {
+    let meta = read_archive_meta(path).ok()?;
+    // A slot whose meta is readable but whose save-bytes probe fails (a
+    // truncated/corrupt entry) is treated as having no resume point, the
+    // same conservative answer `boot_story`'s own `load_archive` error arm
+    // gives today.
+    let has_resume = crate::archive::archive_has_resume_point(path).unwrap_or(false);
+    Some(SlotFacts { saved_at: meta.saved_at, has_resume })
+}
+
+/// Which of the two reserved slots under `game_dir` a normal (non-`fresh_start`)
+/// boot would resume from, or `None` when neither has anything to offer at all
+/// (SQ-1626). This is the ONE place the decision is made — `boot_story` itself
+/// calls this rather than re-deriving the comparison, so an external host
+/// wanting to label "Continue will resume X" can never disagree with what a
+/// boot actually does.
+///
+/// A slot with a REAL resume point always beats one without, regardless of
+/// timestamp: [`crate::host::persist::exit_clear_resume_save`] rewrites
+/// `default.lanthorn` with a fresh `Meta::saved_at` but an EMPTY resume point
+/// on every clean game-driven quit, and comparing `saved_at` alone let that
+/// freshly-cleared autosave always bury an older-but-real quick save — the bug
+/// this function's introduction fixes. Between two slots that both carry a
+/// resume point (or both carry none — see below), the newer `saved_at` wins;
+/// on an exact tie (`Meta::saved_at`'s RFC3339 string has one-second
+/// resolution) the quick save wins, since it is the more deliberate of the
+/// two saves. When NEITHER slot has a resume point, falls back to the newest
+/// of the two files that DO exist, so the mapper/aux/command-history a clean
+/// quit still leaves behind (`exit_clear_resume_save`'s own doc) comes from
+/// the most recently written slot rather than always `default.lanthorn`.
+pub fn resume_source(game_dir: &Path) -> Option<ResumeSlot> {
+    let arc_file = default_state_path(game_dir);
+    let quick_save_file = quick_save_state_path(game_dir);
+    let a = slot_facts(&arc_file);
+    let q = slot_facts(&quick_save_file);
+    match (a, q) {
+        (Some(a), Some(q)) => Some(match (a.has_resume, q.has_resume) {
+            (true, false) => ResumeSlot::AutoSave,
+            (false, true) => ResumeSlot::QuickSave,
+            _ => {
+                if q.saved_at >= a.saved_at {
+                    ResumeSlot::QuickSave
+                } else {
+                    ResumeSlot::AutoSave
+                }
+            }
+        }),
+        (Some(_), None) => Some(ResumeSlot::AutoSave),
+        (None, Some(_)) => Some(ResumeSlot::QuickSave),
+        (None, None) => None,
+    }
 }
 
 /// An unrecoverable per-story boot failure (unreadable or invalid story, an
@@ -450,7 +542,7 @@ pub(super) fn bump_dim_for_floor(current: u16, floor: u16, probe: impl Fn(u16) -
 // See `pre_boot_host_screen` for the lint.
 #[allow(clippy::field_reassign_with_default)]
 pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<BootedStory, BootError> {
-    let BootRequest { story_path, disk_entry, overrides, mut cfg, data_base, flags, terminal } = req;
+    let BootRequest { story_path, disk_entry, overrides, mut cfg, data_base, flags, terminal, fresh_start } = req;
     let TerminalFacts {
         game_picker,
         game_picker_query_answered,
@@ -1296,19 +1388,15 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     let quick_save_file = quick_save_state_path(&game_dir);
 
     // Two reserved slots can each hold a resume point (SQ-1624): the auto-save's
-    // `arc_file` and the manual quick-save's `quick_save_file`. Boot picks
-    // whichever was saved more recently (by `Meta::saved_at`, which is a
-    // zero-padded RFC3339 string — chronological order IS string order) as the
-    // one to auto-load/offer, so a manual Ctrl+S checkpoint isn't buried by the
-    // very next per-turn auto-save landing in the OTHER file. Falls back to
-    // `arc_file` when neither is readable, so the `.exists()` check below still
-    // reports "nothing to resume" exactly as before.
-    let resume_path = match (read_archive_meta(&arc_file), read_archive_meta(&quick_save_file)) {
-        (Ok(a), Ok(q)) if q.saved_at > a.saved_at => quick_save_file.clone(),
-        (Ok(_), _) => arc_file.clone(),
-        (Err(_), Ok(_)) => quick_save_file.clone(),
-        (Err(_), Err(_)) => arc_file.clone(),
-    };
+    // `arc_file` and the manual quick-save's `quick_save_file`. `resume_source`
+    // (SQ-1626) is the ONE place that decides which of them a normal boot
+    // resumes from — see its doc for the has-a-resume-point-beats-newest rule
+    // and the same-second quick-save tie-break. `fresh_start` (SQ-1626) skips
+    // the lookup entirely: no resume is attempted from either slot, neither
+    // file is read or written, and `resume_path` is `None` exactly as if
+    // neither reserved slot existed for this one boot.
+    let resume_path: Option<PathBuf> =
+        if fresh_start { None } else { resume_source(&game_dir).map(|slot| slot.path(&game_dir)) };
 
     // Load mapper (and optionally restore the game save) from the archive.
     let mut startup_transcript: crate::state::LoadedTranscript = None;
@@ -1330,8 +1418,8 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     // Whether this boot actually resumed a past game (auto_load on, a save
     // present, and the restore succeeded) — `BootedStory::resumed` (SQ-1545).
     let mut resumed = false;
-    let mut mapper = if resume_path.exists() {
-        match load_archive(&resume_path) {
+    let mut mapper = if let Some(resume_path) = resume_path.as_ref().filter(|p| p.exists()) {
+        match load_archive(resume_path) {
             Ok(ac) => {
                 // Restore the machine from the saved game state only when auto_load is enabled.
                 if cfg.auto_load {
@@ -1862,9 +1950,12 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
         state,
         game_dir,
         ifid,
-        arc_file,
+        arc_file: arc_file.clone(),
         quick_save_file,
-        resume_source_file: resume_path,
+        // No resume was attempted at all (fresh_start, or neither slot had
+        // anything to offer) — fall back to `arc_file`, same as the "nothing
+        // to resume" case always has.
+        resume_source_file: resume_path.unwrap_or(arc_file),
         story_bytes,
         story_path,
         data_base,

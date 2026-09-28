@@ -102,6 +102,7 @@ fn boot_and_first_turn(cfg: Config, terminal: TerminalFacts, home: &Path) -> (Bo
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal,
+        fresh_start: false,
     };
     let mut b = boot_story(req, &mut QuietBoot).expect("Bureaucracy boots headlessly");
     let r = b.session.submit("");
@@ -639,6 +640,7 @@ fn boot_glulx(home: &Path, size: (u16, u16), min_story_screen: Option<(u16, u16)
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts { size: Some(size), min_story_screen, ..TerminalFacts::default() },
+        fresh_start: false,
     };
     Some(boot_story(req, &mut QuietBoot).expect("chlorophyll boots headlessly"))
 }

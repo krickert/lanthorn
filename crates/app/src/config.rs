@@ -541,6 +541,15 @@ pub struct Cli {
     /// (blue lines) persists across runs. (SQ-0449)
     #[arg(long)]
     pub debug: bool,
+
+    /// Boot with no resume attempted from either reserved save slot, even when
+    /// one holds a resume point — for a host whose own "reboot"/"new game"
+    /// crosses a process boundary and needs a genuinely fresh launch rather
+    /// than one that silently resumes an old quick save (SQ-1626). Sets
+    /// `BootRequest::fresh_start`; the quick save itself is left untouched on
+    /// disk either way, ready to resume on the next ordinary launch.
+    #[arg(long = "fresh-start")]
+    pub fresh_start: bool,
 }
 
 /// A boolean setting said the way its slash command says it, so a flag and the
@@ -3425,6 +3434,7 @@ mod tests {
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -3516,6 +3526,7 @@ mod tests {
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -3551,6 +3562,7 @@ mod tests {
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -3586,6 +3598,7 @@ mod tests {
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -3621,6 +3634,7 @@ mod tests {
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4379,6 +4393,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4412,6 +4427,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4462,6 +4478,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4562,6 +4579,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4597,6 +4615,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4633,6 +4652,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4704,6 +4724,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4768,6 +4789,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -4820,6 +4842,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -5056,6 +5079,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -5119,6 +5143,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,
@@ -5180,6 +5205,7 @@ use_defaults = false
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
             transcript_file: None,
             font_check: None,

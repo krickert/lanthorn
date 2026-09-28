@@ -40,6 +40,7 @@ fn boot(story: PathBuf, home: &Path) -> BootedStory {
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
     };
     boot_story(req, &mut QuietBoot).expect("the story boots headlessly")
 }

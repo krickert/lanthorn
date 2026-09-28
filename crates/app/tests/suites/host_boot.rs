@@ -19,7 +19,11 @@ use std::path::{Path, PathBuf};
 
 use app::config::Config;
 use app::engine::Engine;
-use app::host::{boot_story, BootRequest, BootedStory, LaunchFlags, QuietBoot, TerminalFacts};
+use app::host::persist::exit_clear_resume_save;
+use app::host::{
+    boot_story, resume_source, BootRequest, BootedStory, LaunchFlags, QuietBoot, ResumeSlot,
+    TerminalFacts,
+};
 use app::launch_options::LaunchOverrides;
 use app::session::InputKind;
 
@@ -48,6 +52,24 @@ fn boot(story: PathBuf, cfg: Config, data_base: &Path) -> BootedStory {
         data_base: data_base.to_path_buf(),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
+    };
+    boot_story(req, &mut QuietBoot).expect("the story boots headlessly")
+}
+
+/// [`boot`], but with `fresh_start: true` (SQ-1626): the host-requested boot
+/// that must attempt no resume at all, from either reserved slot.
+fn boot_fresh_start(story: PathBuf, cfg: Config, data_base: &Path) -> BootedStory {
+    let overrides = LaunchOverrides::default();
+    let req = BootRequest {
+        story_path: story,
+        disk_entry: None,
+        overrides: &overrides,
+        cfg,
+        data_base: data_base.to_path_buf(),
+        flags: LaunchFlags::default(),
+        terminal: TerminalFacts::default(),
+        fresh_start: true,
     };
     boot_story(req, &mut QuietBoot).expect("the story boots headlessly")
 }
@@ -133,6 +155,7 @@ fn the_text_only_override_boots_a_picture_bearing_story_with_no_picture_source()
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
     };
     let b = boot_story(req, &mut QuietBoot).expect("boots with the text-only override");
     // Not `assert_ready`: a v6 game's intro screen does not necessarily land
@@ -177,6 +200,7 @@ fn an_unreadable_story_is_an_error_not_an_exit() {
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
     };
     let err = boot_story(req, &mut QuietBoot).err().expect("a missing story does not boot");
     assert!(err.0.contains("cannot read"), "says why: {err}");
@@ -218,6 +242,7 @@ fn a_launch_dialog_honour_override_survives_a_second_style_reload() {
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
     };
     let mut b = boot_story(req, &mut QuietBoot).expect("boots with the launch override");
     assert!(
@@ -256,6 +281,7 @@ fn a_settings_edit_ends_the_launch_dialog_honour_hold() {
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
     };
     let mut b = boot_story(req, &mut QuietBoot).expect("boots with the launch override");
     assert!(!b.state.config.honor_game_colours, "the override is in force after boot");
@@ -479,6 +505,184 @@ fn boot_auto_load_falls_back_to_the_only_slot_present() {
         second.resume_source_file, second.arc_file,
         "with no quick-save file, the auto-save slot is the resume source"
     );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1626 Fix 1: `exit_clear_resume_save` (a clean, game-driven quit) rewrites
+/// `default.lanthorn` with a fresh `Meta::saved_at` but an EMPTY resume point
+/// (see its own doc). Comparing `saved_at` alone — the pre-SQ-1626 rule — would
+/// let that freshly-cleared, resume-less autosave always beat an
+/// older-but-real quick save, defeating the entire point of giving Ctrl+S its
+/// own slot. A slot that actually HAS a resume point must win regardless of
+/// timestamp.
+#[test]
+fn boot_resumes_the_quick_save_that_survives_a_clean_quit() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-quicksave-survives-quit");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    play(&mut first, "look");
+    let quick_save_room = here(&first);
+    let quick_save_path = first.quick_save_file.clone();
+    // The quick save is OLD, but it is the only slot with a real resume point.
+    write_resume_archive_to(&mut first, &quick_save_path, "2020-01-01T00:00:00Z");
+
+    // A clean, game-driven quit: `default.lanthorn` gets rewritten with a
+    // brand-new `saved_at` (now) and no resume point.
+    let outcome = exit_clear_resume_save(&mut *first.session, &first.mapper, &first.state, &first.ifid, &first.arc_file);
+    assert!(matches!(outcome, app::host::persist::ExitSave::Saved), "the clean-quit rewrite itself succeeds: {outcome:?}");
+    assert!(first.arc_file.exists(), "premise: the clean quit left a (resume-less) archive behind");
+
+    let second = boot(story, headless_config(&home), &data_base);
+    assert!(second.resumed, "the quick save's real resume point is still there to resume (SQ-1626)");
+    assert_eq!(
+        second.resume_source_file, quick_save_path,
+        "the quick save wins despite being OLDER, because the autosave slot has no resume point at all"
+    );
+    assert_eq!(here(&second), quick_save_room, "and its room is the quick save's room");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1626 Fix 2: a host-requested `fresh_start` boot must not resume from
+/// EITHER reserved slot, must not even load the mapper/aux/command-history
+/// from whichever slot would otherwise have won, and must leave a quick save
+/// on disk completely untouched — ready to resume on the NEXT ordinary boot.
+#[test]
+fn fresh_start_resumes_nothing_and_leaves_the_quick_save_untouched() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-fresh-start");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    play(&mut first, "look");
+    // Explore a SECOND room before saving, so the quick save's map is
+    // distinguishable from the one room boot always observes on its own
+    // (`Observe the starting room…`, `boot_story`) — a fresh boot with no
+    // resume attempted still shows that one room; the question is whether it
+    // ALSO carries this save's second one.
+    play(&mut first, "south");
+    let explored_rooms = first.mapper.graph.rooms().count();
+    assert!(explored_rooms >= 2, "premise: the quick save's map has more than just the starting room");
+    let quick_save_path = first.quick_save_file.clone();
+    write_resume_archive_to(&mut first, &quick_save_path, "2020-01-01T00:00:00Z");
+    assert!(!first.arc_file.exists(), "premise: no autosave was ever written, only the quick save");
+    let quick_save_bytes_before = std::fs::read(&quick_save_path).expect("the quick save is readable before the fresh-start boot");
+
+    let second = boot_fresh_start(story, headless_config(&home), &data_base);
+    assert!(!second.resumed, "fresh_start must not resume ANYTHING, even though a real resume point exists (SQ-1626)");
+    assert!(
+        second.mapper.graph.rooms().count() < explored_rooms,
+        "fresh_start must not load the mapper from whichever slot would otherwise have won: got {} rooms, same as the explored quick save",
+        second.mapper.graph.rooms().count()
+    );
+
+    let quick_save_bytes_after = std::fs::read(&quick_save_path).expect("the quick save is still readable after the fresh-start boot");
+    assert_eq!(
+        quick_save_bytes_before, quick_save_bytes_after,
+        "fresh_start must leave the quick save byte-for-byte untouched on disk"
+    );
+    assert!(!first.arc_file.exists(), "fresh_start must not write the autosave slot either");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1626 Fix 3: `resume_source` is the ONE place the resume-slot decision is
+/// made, and `boot_story` itself calls it — so the two can never disagree.
+/// Checked in the plain "no saves at all" case, and in the "clean quit
+/// clears the autosave but the quick save survives" case from
+/// `boot_resumes_the_quick_save_that_survives_a_clean_quit` above.
+#[test]
+fn resume_source_agrees_with_what_boot_story_actually_does() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+
+    // Case 1: nothing saved at all.
+    {
+        let home = app::scratch_dir("host-boot-resume-source-none");
+        let data_base = home.join("saves");
+        let first = boot(story.clone(), headless_config(&home), &data_base);
+        assert!(!first.resumed, "premise: a first-ever boot has nothing to resume");
+        assert_eq!(
+            resume_source(&first.game_dir),
+            None,
+            "resume_source agrees there is nothing to offer"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // Case 2: a clean quit clears the autosave, but the quick save survives.
+    {
+        let home = app::scratch_dir("host-boot-resume-source-quicksave");
+        let data_base = home.join("saves");
+        let mut first = boot(story.clone(), headless_config(&home), &data_base);
+        play(&mut first, "look");
+        let quick_save_path = first.quick_save_file.clone();
+        write_resume_archive_to(&mut first, &quick_save_path, "2020-01-01T00:00:00Z");
+        let outcome = exit_clear_resume_save(&mut *first.session, &first.mapper, &first.state, &first.ifid, &first.arc_file);
+        assert!(matches!(outcome, app::host::persist::ExitSave::Saved), "the clean-quit rewrite itself succeeds: {outcome:?}");
+
+        assert_eq!(
+            resume_source(&first.game_dir),
+            Some(ResumeSlot::QuickSave),
+            "resume_source picks the quick save, matching Fix 1"
+        );
+
+        let second = boot(story.clone(), headless_config(&home), &data_base);
+        assert!(second.resumed);
+        assert_eq!(
+            second.resume_source_file,
+            ResumeSlot::QuickSave.path(&first.game_dir),
+            "and boot_story's own choice is exactly what resume_source predicted"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// SQ-1626 Fix 4: `Meta::saved_at` is an RFC3339 string with one-second
+/// resolution, so two saves in the same second are indistinguishable by
+/// timestamp alone. On an exact tie, the quick save wins — it is the more
+/// deliberate of the two saves.
+#[test]
+fn resume_source_breaks_a_same_second_tie_toward_the_quick_save() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-same-second-tie");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    play(&mut first, "look");
+    let arc_path = first.arc_file.clone();
+    write_resume_archive_to(&mut first, &arc_path, "2025-06-15T12:00:00Z");
+
+    play(&mut first, "south");
+    let room_at_quick_save = here(&first);
+    let quick_save_path = first.quick_save_file.clone();
+    write_resume_archive_to(&mut first, &quick_save_path, "2025-06-15T12:00:00Z");
+
+    let second = boot(story, headless_config(&home), &data_base);
+    assert!(second.resumed);
+    assert_eq!(
+        second.resume_source_file, quick_save_path,
+        "on an exact same-second tie, the quick save wins"
+    );
+    assert_eq!(here(&second), room_at_quick_save);
 
     let _ = std::fs::remove_dir_all(&home);
 }

@@ -1546,6 +1546,37 @@ pub fn read_archive_meta(path: &Path) -> io::Result<Meta> {
     Ok(meta)
 }
 
+/// Whether the archive at `path` has a real resume point — i.e. its
+/// `game.<ext>` entry (the `EngineSave::bytes` `load_archive`/`ArchiveContents`
+/// would hand back as `save`) is non-empty (SQ-1626). `write_cleared_resume_archive`
+/// (`exit_clear_resume_save`'s doc) is the writer that produces the empty case:
+/// a fresh `meta.json` with no resume point, on every clean game-driven quit.
+///
+/// Reads only `engine.txt` (to know which entry name to look at) and that
+/// entry's SIZE from the zip directory — no decompression, so this is cheap
+/// enough to call on both reserved slots at every boot, unlike `load_archive`
+/// (which would also unzip the map, transcript, history, screen and pictures
+/// just to answer one bool).
+pub fn archive_has_resume_point(path: &Path) -> io::Result<bool> {
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let engine = match zip.by_name(ENTRY_ENGINE) {
+        Ok(mut entry) => {
+            let mut buf = String::new();
+            let _ = entry.read_to_string(&mut buf);
+            let t = buf.trim();
+            if t.is_empty() { DEFAULT_ENGINE.to_string() } else { t.to_string() }
+        }
+        Err(_) => DEFAULT_ENGINE.to_string(),
+    };
+    let name = format!("game.{}", save_ext(&engine));
+    let entry = zip.by_name(&name).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("missing {name}: {e}"))
+    })?;
+    Ok(entry.size() > 0)
+}
+
 /// Rewrite `old_path`'s `meta.json` with a new display `name` and write the
 /// result to `new_path`, copying every OTHER entry byte-for-byte via
 /// `ZipWriter::raw_copy_file` (SQ-1556) — never through
@@ -2645,6 +2676,57 @@ mod tests {
         assert_eq!(ac.meta.turns, 0, "turns defaults to 0");
         assert_eq!(ac.meta.saved_at, "", "saved_at defaults to empty string");
         assert_eq!(ac.meta.ifid.as_deref(), Some("ZCODE-1-000000-0000"));
+    }
+
+    // -------------------------------------------------------------------------
+    // archive_has_resume_point (SQ-1626): a real save's bytes are non-empty,
+    // a cleared one's are empty — and the answer must agree with what
+    // `load_archive` itself hands back as `save`.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn archive_has_resume_point_is_true_for_a_real_save() {
+        let path = temp_archive_path("has-resume-true");
+        let save = EngineSave::new(DEFAULT_ENGINE, 1, vec![1, 2, 3, 4]);
+        let meta = Meta {
+            format_version: CURRENT_FORMAT_VERSION,
+            ifid: None,
+            name: None,
+            turns: 0,
+            saved_at: String::new(),
+            location: None,
+            score: None,
+            trigger: SaveTrigger::HostState,
+        };
+        save_archive_meta(&path, &Mapper::default(), &save, None, &BTreeMap::new(), meta, &[], &[], &[], &[], &[], &[])
+            .expect("save_archive_meta");
+
+        let ac = load_archive(&path).expect("loads");
+        assert!(!ac.save.is_empty(), "premise: this archive's save bytes are non-empty");
+        assert!(archive_has_resume_point(&path).expect("readable"), "a real save has a resume point");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn archive_has_resume_point_is_false_for_a_cleared_save() {
+        let path = temp_archive_path("has-resume-false");
+        let save = EngineSave::new(DEFAULT_ENGINE, 1, Vec::new());
+        let meta = Meta {
+            format_version: CURRENT_FORMAT_VERSION,
+            ifid: None,
+            name: None,
+            turns: 0,
+            saved_at: String::new(),
+            location: None,
+            score: None,
+            trigger: SaveTrigger::HostState,
+        };
+        save_archive_meta(&path, &Mapper::default(), &save, None, &BTreeMap::new(), meta, &[], &[], &[], &[], &[], &[])
+            .expect("save_archive_meta");
+
+        let ac = load_archive(&path).expect("loads");
+        assert!(ac.save.is_empty(), "premise: this archive's save bytes are empty");
+        assert!(!archive_has_resume_point(&path).expect("readable"), "an empty save has no resume point");
+        let _ = std::fs::remove_file(&path);
     }
 
     // -------------------------------------------------------------------------

@@ -1095,6 +1095,7 @@ fn boot_host(file: &str, want_release: u16, tag: &str) -> Option<BootedStory> {
         data_base: home.join("saves"),
         flags: LaunchFlags::default(),
         terminal: TerminalFacts::default(),
+        fresh_start: false,
     };
     Some(boot_story(req, &mut QuietBoot).expect("the story boots headlessly"))
 }
