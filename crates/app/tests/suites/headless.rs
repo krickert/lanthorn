@@ -62,6 +62,7 @@ fn turn(number: mapper::graph::RoomId, name: &str) -> TurnResult {
         prose_retired: None,
         declared_exit: None,
         description: None,
+        items: Vec::new(),
     }
 }
 

@@ -34,6 +34,8 @@ mod return_probe;
 mod declared_exit;
 #[path = "suites/room_description.rs"]
 mod room_description;
+#[path = "suites/item_tracking.rs"]
+mod item_tracking;
 #[path = "suites/matrix_path_highlight.rs"]
 mod matrix_path_highlight;
 #[path = "suites/matrix_view.rs"]

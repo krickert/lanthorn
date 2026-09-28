@@ -8770,6 +8770,7 @@ mod tests {
                 prose_retired: None,
                 declared_exit: None,
             description: None,
+            items: Vec::new(),
             };
             apply_turn(&mut mapper, "", &seed_result, &mut Default::default());
             state.select_room(Some(snap_number as mapper::graph::RoomId));
@@ -8824,6 +8825,7 @@ mod tests {
                 prose_retired: None,
                 declared_exit: None,
             description: None,
+            items: Vec::new(),
             };
             apply_turn(&mut mapper, "", &seed_result, &mut Default::default());
             state.select_room(Some(snap_number as mapper::graph::RoomId));

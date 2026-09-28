@@ -16,7 +16,7 @@ use crate::engine::{
     ScreenModel, Split, StatusModel, WinNode,
 };
 use crate::graphics::PictSource;
-use crate::session::{InputKind, PendingIo, TurnResult};
+use crate::session::{InputKind, ItemObservation, ObservedItemLocation, PendingIo, TurnResult};
 
 /// The engine tag recorded in an `EngineSave` produced by the Scott adapter.
 pub const SCOTT_ENGINE: &str = "scott";
@@ -628,7 +628,39 @@ impl ScottSession {
             // SQ-1625: a direct query of live VM state, not a transcript heuristic — always
             // available, so unlike the other two engines this is never `None` while a room exists.
             description: Some(self.vm.room_description_text()).filter(|s| !s.is_empty()),
+            // SQ-1627: a Scott Adams database has no containment model at all — an item is either
+            // in a room, carried, or nowhere (`scott::vm::Vm`'s own doc) — so `items_in_room`/
+            // `carried_item_indices` are already exhaustive, DIRECT listings; there is no nested
+            // half to query separately, unlike the other two engines.
+            items: self.item_observations(),
         }
+    }
+
+    /// This turn's item observations (SQ-1627) — see `turn`'s own doc for why Scott needs only
+    /// one query per vantage point. `Database::item_words` answers `None` for an item with no
+    /// `/NOUN/` marker (pure scenery/messages the parser can't name at all — see that method's own
+    /// doc), so those are left out here too: nothing a panel could show and nothing a player could
+    /// type, the same filter every other engine's item listing already applies.
+    fn item_observations(&self) -> Vec<ItemObservation> {
+        let db = self.vm.database();
+        let mut out = Vec::new();
+        for idx in self.vm.item_indices_in_room() {
+            if let Some(ow) = db.item_words(idx) {
+                if ow.printed_name.is_empty() {
+                    continue;
+                }
+                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::RoomDirect });
+            }
+        }
+        for idx in self.vm.carried_item_indices() {
+            if let Some(ow) = db.item_words(idx) {
+                if ow.printed_name.is_empty() {
+                    continue;
+                }
+                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::Carried });
+            }
+        }
+        out
     }
 
     fn snapshot_location(&self) -> Option<LocationInfo> {

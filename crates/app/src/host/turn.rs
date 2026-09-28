@@ -385,6 +385,19 @@ pub fn finish_command_turn(
     // `TurnResult::description`'s doc for what each engine will and won't fill in. `state.turns`
     // was already advanced above, so it names THIS turn.
     crate::session::apply_room_description(mapper, state.turns, &result);
+    // SQ-1627: this command's own item observations, if any — the item-keyed sibling of the
+    // description capture immediately above, wired at the same call site for the same reason.
+    crate::session::apply_item_observations(mapper, state.turns, &result);
+    // SQ-1627, Facet 3: a take-style command that visibly failed to move its (unambiguous) target
+    // into inventory is confirmed fixed-in-place — structural only (no death/quit this turn, no
+    // phrase match on the refusal text; see `classify_take_attempt`'s own doc), and deliberately
+    // silent (no candidate, or an ambiguous one) rather than guessed. AFTER `apply_item_observations`
+    // so it reads this turn's own freshly-updated locations, not stale ones from before the command.
+    if !result.quit && !crate::session::turn_reports_death(&result.transcript) {
+        if let Some(key) = crate::session::classify_take_attempt(cmd, &result.items) {
+            mapper.graph.note_item_fixed_in_place(key);
+        }
+    }
 
     // A move that killed the player proved nothing about the passage, so its `tried` record is
     // taken back and the direction stays untried (`·`, not `×`). Fires for the turn that
@@ -891,6 +904,10 @@ pub fn finish_resumed_turn(
     // already advanced for this command by `finish_command_turn`; a resume is the second half
     // of that SAME turn, not a new one.
     crate::session::apply_room_description(mapper, state.turns, &result);
+    // SQ-1627: same reasoning as the description capture immediately above — the resumed half of
+    // a turn can carry real item observations too, and this is the exact gap SQ-1625 missed on
+    // its first pass (a follow-up commit had to add the description call here after the fact).
+    crate::session::apply_item_observations(mapper, state.turns, &result);
     // The resumed half of a turn can be where the death lands; it names no direction of its own,
     // so only the move still held from the submit path can be rolled back. (SQ-0671)
     crate::session::rollback_tried_on_death(
@@ -1100,10 +1117,10 @@ fn apply_turn_events(state: &mut AppState, result: &TurnResult) {
 /// beep/location/diagnostic events, applies the mapper turn, opens a
 /// game-initiated save/restore dialog if requested, and recenters on a location
 /// change. Deliberately skips `post_turn_bookkeeping` (history/inventory/
-/// auto-save) AND `apply_room_description` (SQ-1625): this is not a completed
-/// player turn, and `state.turns` was never advanced for it, so there is no
-/// turn number a captured description could correctly be stamped with. Returns
-/// `true` if the game quit (the caller should break the event loop).
+/// auto-save) AND `apply_room_description` (SQ-1625) AND `apply_item_observations` (SQ-1627):
+/// this is not a completed player turn, and `state.turns` was never advanced for it, so there is
+/// no turn number a captured description or item observation could correctly be stamped with.
+/// Returns `true` if the game quit (the caller should break the event loop).
 pub fn apply_game_driven_result(
     state: &mut AppState,
     mapper: &mut Mapper,
@@ -1744,6 +1761,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         }
     }
 
@@ -1767,6 +1785,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         }
     }
 
@@ -1990,6 +2009,38 @@ mod tests {
             !arc_file.exists(),
             "the quit turn's own per-turn auto-save must be skipped entirely, not merely emptied"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1627: `finish_resumed_turn` must capture item observations too — the exact gap SQ-1625
+    /// missed on its first pass for `description` (a follow-up commit had to wire it in here
+    /// after the fact; see that commit's own message). Mirrors this file's own
+    /// `a_clean_quit_sets_game_ended…` harness shape: drive `finish_resumed_turn` directly with a
+    /// `TurnResult` carrying a real location and item observation, and read the answer straight
+    /// off the mapper it was handed.
+    #[test]
+    fn finish_resumed_turn_captures_item_observations_too_sq1627() {
+        use crate::session::{ItemObservation, ObservedItemLocation};
+
+        let dir = crate::scratch_dir("sq1627-resumed-turn-items");
+        let mut state = crate::state::AppState::default();
+        state.config.auto_save = false; // avoid touching TraceOnlyEngine's unreachable!() save_state
+        state.turns = 1; // as if `finish_command_turn` had already advanced it for this command
+        let mut mapper = mapper::mapper::Mapper::default();
+        mapper.observe(1, "West of House", None);
+        let mut eng = TraceOnlyEngine { line: None, v6: None, filename_req: None };
+        let rect = Some((20u16, 20u16));
+
+        let mut result = fault_test_result(false, None);
+        result.location = Some(crate::engine::LocationInfo { number: 1, parent: 0, name: "West of House".into() });
+        result.items = vec![ItemObservation { key: 10, name: "a small mailbox".into(), location: ObservedItemLocation::RoomDirect }];
+
+        let _ = super::finish_resumed_turn(result, &mut mapper, &mut state, &mut eng, &dir, "TEST-IFID", rect);
+
+        let rec = mapper.graph.item(10).expect("the resumed turn's own item observation reached the mapper");
+        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true });
+        assert_eq!(rec.origin_turn, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

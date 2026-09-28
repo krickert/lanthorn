@@ -1453,6 +1453,10 @@ impl GlulxSession {
         self.check_room_lock_against_story(&ram, movement, story_named.as_deref());
         let location = self.last_room.clone();
         let location_method = location.as_ref().map(|_| LocationMethod::RoomHeading);
+        // SQ-1627: a direct `Introspect` query, not a transcript heuristic — no v6-style gate
+        // needed. See the helper's own doc for why Glulx needs only one room query (unlike the
+        // Z-machine): this format has no way to tell an OPEN container from a closed one at all.
+        let items = self.glulx_item_observations(location.as_ref());
         TurnResult {
             transcript,
             transcript_runs,
@@ -1475,7 +1479,38 @@ impl GlulxSession {
             prose_retired: None,
             declared_exit: None,
             description,
+            items,
         }
+    }
+
+    /// This turn's item observations (SQ-1627) — the room the player is standing in and their
+    /// own carried inventory, exactly like `GameSession::zvm_item_observations`'s sibling, but
+    /// with only ONE room query rather than two: [`Introspect::room_objects_excluding`]'s own doc
+    /// explains why — Inform's `container`/`open`/`transparent` attribute NUMBERING is a library
+    /// convention this format's own layout says nothing about, so there is no way to recurse into
+    /// an open container at all, and every room sighting here is therefore already the room's
+    /// direct top level.
+    fn glulx_item_observations(&self, location: Option<&LocationInfo>) -> Vec<crate::session::ItemObservation> {
+        use crate::session::{ItemObservation, ObservedItemLocation};
+        let mut out = Vec::new();
+        let player = Introspect::player_object(self);
+        if let Some(loc) = location {
+            for ow in self.room_objects_excluding(loc.number, player) {
+                if ow.printed_name.is_empty() {
+                    continue;
+                }
+                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::RoomDirect });
+            }
+        }
+        if let Some(p) = player {
+            for ow in self.contents(p) {
+                if ow.printed_name.is_empty() {
+                    continue;
+                }
+                out.push(ItemObservation { key: ow.id, name: ow.printed_name, location: ObservedItemLocation::Carried });
+            }
+        }
+        out
     }
 
     /// Words of RAM the room-lock learner scans, from `ramstart`.

@@ -705,6 +705,40 @@ pub struct TurnResult {
     ///   `zvm_capture_room_description`); a v6 game's extra windows leave it `None` permanently —
     ///   a deliberate gap, not a bug.
     pub description: Option<String>,
+    /// Every item this turn's two OBSERVED vantage points actually showed the player (SQ-1627):
+    /// the room they are standing in and their own carried inventory. Never anything broader —
+    /// this app is a personal-exploration companion, so an item the player has not stood in a room
+    /// with or held must never appear here, however completely an engine's debug tooling could
+    /// otherwise enumerate it. See `apply_item_observations`'s own doc for how the mapper turns
+    /// this into [`mapper::graph::ItemRecord`]s, and each engine's own turn-builder (`session.rs`'s
+    /// Z-machine walk, `glulx_session.rs`'s `Introspect` calls, `scott_session.rs`'s item-index
+    /// helpers) for what it can state with confidence. Empty when this turn observed nothing new
+    /// (no location resolved yet, no player object locked on, or the room and inventory both hold
+    /// nothing) — never a failure, just nothing to report.
+    pub items: Vec<ItemObservation>,
+}
+
+/// One item [`TurnResult::items`] observed this turn (SQ-1627): its engine-defined identity (the
+/// same space [`grammar_model::ObjectWords::id`] and [`mapper::graph::ItemKey`] already share —
+/// object number/address/item index), its printed name as of this turn, and where it was seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemObservation {
+    pub key: mapper::graph::ItemKey,
+    pub name: String,
+    pub location: ObservedItemLocation,
+}
+
+/// Where [`ItemObservation`] saw an item this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedItemLocation {
+    /// The current room's own top level — a bare child of the room object, never reached by
+    /// recursing into a container. The only kind an item needs to have been seen as, LAST, to be
+    /// eligible for `Vanished` on a later absence (see `mapper::graph::ItemLocation`'s own doc).
+    RoomDirect,
+    /// The current room, reached only by recursing into an open container. Never vanish-eligible.
+    RoomNested,
+    /// The player's own inventory.
+    Carried,
 }
 
 impl TurnResult {
@@ -2032,6 +2066,10 @@ impl GameSession {
         // SQ-1625 Tier 3: see `zvm_room_description`'s own doc for the bound (v6 excluded
         // outright) and what counts as evidence (the room's name reprinted as its own line).
         let description = zvm_room_description(&self.machine, &transcript, location.as_ref());
+        // SQ-1627: unlike `description`, this is a direct object-tree query, not a transcript
+        // heuristic — it works the same for a v6 game as any other version (see the helper's own
+        // doc for why no gate is needed here).
+        let items = self.zvm_item_observations(location.as_ref());
 
         let diagnostics = self.machine.take_diagnostics();
         let fault = self.machine.take_fault_trace().map(|t| t.to_lines());
@@ -2151,6 +2189,7 @@ impl GameSession {
             prose_retired,
             declared_exit: None,
             description,
+            items,
         }
     }
 
@@ -4544,6 +4583,133 @@ pub fn apply_room_description(mapper: &mut Mapper, turn: u32, result: &TurnResul
     }
 }
 
+/// Update the map's item registry from this turn's OBSERVED item state (SQ-1627,
+/// [`TurnResult::items`]) — the item-keyed sibling of [`apply_room_description`], for the
+/// identical reason: the mapper needs the current turn number, and only the host
+/// (`AppState::turns`) has it.
+///
+/// Order matters and is fixed here rather than left to each engine: every observation this turn
+/// named (carried, in the current room, or nested in it) is applied FIRST, and only THEN is the
+/// current room swept for items absent from all of it — see
+/// [`mapper::graph::MapGraph::note_items_absent`]'s own doc for why an item touched anywhere this
+/// turn is never swept, so only a real, unexplained absence in the room the player is standing in
+/// ever reads as [`mapper::graph::ItemLocation::Vanished`].
+///
+/// Carried observations are applied even when `result.location` is `None` — the player's own
+/// hands are not the room's business — but the room sweep itself is skipped then, for the same
+/// reason [`apply_room_description`] has nothing to attach a description to without a room.
+pub fn apply_item_observations(mapper: &mut Mapper, turn: u32, result: &TurnResult) {
+    let mut touched = std::collections::BTreeSet::new();
+    for obs in &result.items {
+        touched.insert(obs.key);
+        match obs.location {
+            ObservedItemLocation::Carried => {
+                // Only actually consulted for an item the graph has never seen before (see
+                // `note_item_carried`'s own doc) — the room the player happens to be standing in
+                // when first noticed holding it, or 0 (no real room ever has this id) when even
+                // that is unresolved, e.g. the very first turn of a session that starts mid-story.
+                let origin = result.location.as_ref().map_or(0, |l| l.number);
+                mapper.graph.note_item_carried(obs.key, obs.name.clone(), origin, turn);
+            }
+            ObservedItemLocation::RoomDirect => {
+                if let Some(loc) = &result.location {
+                    mapper.graph.note_item_seen(obs.key, obs.name.clone(), loc.number, true, turn);
+                }
+            }
+            ObservedItemLocation::RoomNested => {
+                if let Some(loc) = &result.location {
+                    mapper.graph.note_item_seen(obs.key, obs.name.clone(), loc.number, false, turn);
+                }
+            }
+        }
+    }
+    if let Some(loc) = &result.location {
+        mapper.graph.note_items_absent(loc.number, turn, &touched);
+    }
+}
+
+/// The verb family [`classify_take_attempt`] recognises (SQ-1627, Facet 3) — `verb_synonyms`'s
+/// own "take" synonym group (`crates/verb-synonyms/src/synonym_groups.tsv`: `take  hold  carry
+/// get  grab  remove`), reused rather than invented fresh, exactly the discipline
+/// `mapper::direction::is_travel_to_command` sets for its own travel-verb list.
+const TAKE_VERBS: &[&str] = &["take", "get", "grab", "carry", "hold", "remove"];
+
+/// The noun phrase after a take-family verb, or `None` when `cmd` isn't shaped like a take-style
+/// command at all (SQ-1627, Facet 3) — structural parsing of the command's own words, the same
+/// shape [`mapper::direction::is_travel_to_command`] uses for a travel command, never a guess at
+/// what the STORY's reply means.
+///
+/// Recognises the bare `<verb> <noun>` form (verb from [`TAKE_VERBS`]) plus the two common
+/// separable-particle spellings, "pick up <noun>" and "pick <noun> up" — "pick" alone is not in
+/// `TAKE_VERBS` because a bare "pick lock" names a different verb entirely.
+fn take_command_target(cmd: &str) -> Option<String> {
+    let lower = cmd.trim().to_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let (&first, rest) = tokens.split_first()?;
+    if first == "pick" {
+        let (&last, body) = rest.split_last()?;
+        if rest.first() == Some(&"up") && rest.len() > 1 {
+            return Some(rest[1..].join(" "));
+        }
+        if last == "up" && !body.is_empty() {
+            return Some(body.join(" "));
+        }
+        return None;
+    }
+    if TAKE_VERBS.contains(&first) && !rest.is_empty() {
+        return Some(rest.join(" "));
+    }
+    None
+}
+
+/// Whether `noun` (already lower-cased by [`take_command_target`]) names `printed_name` — every
+/// word of `noun`, minus a leading article, must appear somewhere among `printed_name`'s own
+/// words (case-insensitively). A DELIBERATELY weaker match than the parser's own: this app has no
+/// engine-neutral access to an item's parser-accepted words at this call site (only its printed
+/// name — see [`ItemObservation`]), so "take lamp" will not match a Zork I object whose printed
+/// name is "brass lantern" even though the parser accepts "lamp" for it. A known, documented gap
+/// (Facet 3 is allowed to be the least-complete facet of this quest) rather than a reason to guess.
+fn take_noun_matches(noun: &str, printed_name: &str) -> bool {
+    const ARTICLES: &[&str] = &["a", "an", "the"];
+    let name_lower = printed_name.to_lowercase();
+    let name_words: std::collections::HashSet<&str> = name_lower.split_whitespace().collect();
+    let mut any = false;
+    for word in noun.split_whitespace().filter(|w| !ARTICLES.contains(w)) {
+        any = true;
+        if !name_words.contains(word) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Confirm an item fixed-in-place (SQ-1627, Facet 3): `cmd` is a take-style command
+/// ([`take_command_target`]), its noun matches EXACTLY ONE of `items` ([`take_noun_matches`]
+/// against each observation's printed name), and that one item's location this turn is anything
+/// OTHER than [`ObservedItemLocation::Carried`] — i.e. the take visibly did not put it in the
+/// player's hands. Returns that item's key, or `None` when the command isn't a take attempt at
+/// all, the noun matches zero or more-than-one candidate (ambiguous — never guess which), or the
+/// take actually worked.
+///
+/// Deliberately narrow, structural-only, and allowed to under-report (see this function's own
+/// callers for the "no death/quit this turn" guard, which lives at the call site because only it
+/// knows the turn's `quit` flag and has the transcript for [`turn_reports_death`]) — never a
+/// phrase match against the game's own refusal text, mirroring the discipline
+/// [`crate::probe::Refusals`] documents for the same reason (every family of game phrases a
+/// refusal differently, so a fixed list would misclassify as often as it helps).
+pub fn classify_take_attempt(cmd: &str, items: &[ItemObservation]) -> Option<mapper::graph::ItemKey> {
+    let noun = take_command_target(cmd)?;
+    let mut candidates = items.iter().filter(|o| take_noun_matches(&noun, &o.name));
+    let first = candidates.next()?;
+    if candidates.next().is_some() {
+        return None; // ambiguous — more than one thing here answers to this noun
+    }
+    if first.location == ObservedItemLocation::Carried {
+        return None; // the take worked; nothing to flag
+    }
+    Some(first.key)
+}
+
 /// What the mapper still owes a death the game has not finished with (SQ-0671, SQ-0673).
 ///
 /// A death is not one turn's event. Adventure kills you, offers to reincarnate you, insists
@@ -6129,6 +6295,79 @@ impl GameSession {
         self.player_candidates
             .get_or_init(|| PlayerCandidates::build(&self.machine.mem, self.parse_names()))
     }
+
+    /// This turn's item observations (SQ-1627) — the two vantage points the player has actually
+    /// seen: the room they are standing in and their own carried inventory. NEVER the DEBUG-only
+    /// whole-object-tree walk (`build_object_tree` in this file) — this feature must not reveal an
+    /// item the player has not personally stood in a room with or held, however completely the
+    /// debug tooling could enumerate it.
+    ///
+    /// A direct object-tree query, not a transcript heuristic like [`zvm_room_description`], so
+    /// unlike `description` this needs no v6 gate — the object tree exists and answers the same
+    /// way whatever the story's window layout looks like this turn.
+    ///
+    /// Two separate room queries, not one, per the SQ-1627 correction: [`crate::inventory::list_inventory`]
+    /// walked over the room object itself gives the DIRECT top level only (get_child/get_sibling,
+    /// no recursion — the exact walk it already does for a holder's contents, just applied to a
+    /// room instead of a player), while
+    /// [`crate::render::room_info::list_room_objects_excluding`] gives everything the room reveals
+    /// INCLUDING what's on a supporter or inside an open container. Anything in the second set but
+    /// not the first is nested; the caller ([`apply_item_observations`]) needs that distinction to
+    /// decide vanish-eligibility later.
+    fn zvm_item_observations(&self, location: Option<&LocationInfo>) -> Vec<ItemObservation> {
+        let mut out = Vec::new();
+        let names = self.parse_names();
+        let player_obj = zvm::location::find_player_object_with(&self.machine, self.player_candidates());
+        if let Some(loc) = location {
+            if let Ok(room_num) = u16::try_from(loc.number) {
+                // The room's own top level. The player object is structurally a child of
+                // whatever room they stand in (SQ-0667's exact hazard) — excluded by id, not name.
+                let direct = crate::inventory::list_inventory(&self.machine.mem, names, room_num)
+                    .into_iter()
+                    .filter(|o| Some(o.id) != player_obj.map(u32::from))
+                    .collect::<Vec<_>>();
+                let direct_ids: std::collections::BTreeSet<u32> = direct.iter().map(|o| o.id).collect();
+                for o in &direct {
+                    if o.printed_name.is_empty() {
+                        continue; // nothing a panel could show, nothing a player could type
+                    }
+                    out.push(ItemObservation {
+                        key: o.id,
+                        name: o.printed_name.clone(),
+                        location: ObservedItemLocation::RoomDirect,
+                    });
+                }
+                // Everything else the room reveals is nested by construction: it was excluded
+                // from `direct` above, so any object here that isn't in `direct_ids` was reached
+                // only by recursing into a supporter/container/scenery bucket.
+                for o in crate::render::room_info::list_room_objects_excluding(
+                    self.world_model(),
+                    names,
+                    &self.machine.mem,
+                    loc.number,
+                    player_obj.unwrap_or(0),
+                ) {
+                    if direct_ids.contains(&o.id) || o.printed_name.is_empty() {
+                        continue;
+                    }
+                    out.push(ItemObservation {
+                        key: o.id,
+                        name: o.printed_name,
+                        location: ObservedItemLocation::RoomNested,
+                    });
+                }
+            }
+        }
+        if let Some(p) = player_obj {
+            for o in crate::inventory::list_inventory(&self.machine.mem, names, p) {
+                if o.printed_name.is_empty() {
+                    continue;
+                }
+                out.push(ItemObservation { key: o.id, name: o.printed_name, location: ObservedItemLocation::Carried });
+            }
+        }
+        out
+    }
 }
 
 impl Introspect for GameSession {
@@ -7062,6 +7301,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "look", &first, &mut Default::default());
         assert_eq!(m.graph.current(), Some(1));
@@ -7088,6 +7328,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "north", &second, &mut Default::default());
         assert!(m.graph.room(2).is_some());
@@ -7129,6 +7370,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "look", &enter, &mut Default::default());
         assert_eq!(m.graph.current(), Some(1));
@@ -7153,6 +7395,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "west", &west, &mut Default::default());
 
@@ -7191,6 +7434,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "look", &enter, &mut Default::default());
         assert_eq!(m.graph.current(), Some(183));
@@ -7215,6 +7459,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "north", &north, &mut Default::default());
 
@@ -7330,6 +7575,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "look", &result, &mut Default::default());
         assert_eq!(m.graph.current(), None);
@@ -7376,6 +7622,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "Living Room", "Living Room\n"), &mut Default::default());
@@ -7430,6 +7677,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "The Bar", "The Bar\n"), &mut Default::default());
@@ -7487,6 +7735,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "The Bar", "The Bar\n"), &mut Default::default());
@@ -7525,6 +7774,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
 
         let mut m = Mapper::default();
@@ -7585,6 +7835,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         apply_turn(&mut m, "", &result, &mut Default::default());
         assert_eq!(m.graph.current(), Some(333));
@@ -7615,6 +7866,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         };
         assert!(r.info.is_none());
     }
@@ -7642,6 +7894,7 @@ mod tests {
             prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         }
     }
 
@@ -10583,6 +10836,7 @@ mod untried_turn_tests {
             pictures: Vec::new(), transcript_elems: Vec::new(), prose_retired: None,
             declared_exit: None,
             description: None,
+            items: Vec::new(),
         }
     }
 
@@ -10830,5 +11084,156 @@ mod inherited_random_pool_tests {
             None,
             "a move with no direction has nothing to mark"
         );
+    }
+
+}
+
+/// SQ-1627: `apply_item_observations` (the item-registry sibling of `apply_room_description`),
+/// `take_command_target` and `classify_take_attempt` (Facet 3's structural refusal detector). A
+/// separate module rather than folded into `tests` or `inherited_random_pool_tests` above, since
+/// this feature is not what either of those is about.
+#[cfg(all(test, feature = "t-session"))]
+mod item_observation_tests {
+    use super::*;
+    use mapper::direction::Direction;
+
+    fn item_obs(key: u32, name: &str, loc: ObservedItemLocation) -> ItemObservation {
+        ItemObservation { key, name: name.to_string(), location: loc }
+    }
+
+    fn result_with_items(number: mapper::graph::RoomId, name: &str, items: Vec<ItemObservation>) -> TurnResult {
+        TurnResult {
+            location: Some(LocationInfo { number, parent: 0, name: name.to_string() }),
+            items,
+            ..TurnResult::default()
+        }
+    }
+
+    // ── apply_item_observations ─────────────────────────────────────────────────
+
+    #[test]
+    fn apply_item_observations_mints_a_new_direct_sighting() {
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        let result = result_with_items(1, "West of House", vec![item_obs(10, "a small mailbox", ObservedItemLocation::RoomDirect)]);
+        apply_item_observations(&mut m, 1, &result);
+        let rec = m.graph.item(10).unwrap();
+        assert_eq!(rec.origin_room, 1);
+        assert_eq!(rec.origin_turn, 1);
+        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true });
+    }
+
+    #[test]
+    fn apply_item_observations_carries_and_then_drops_in_a_different_room() {
+        let mut m = Mapper::default();
+        m.observe(1, "A", None);
+        m.observe(2, "B", Some(Direction::N));
+        // Turn 1: the coin sits loose in room A.
+        apply_item_observations(&mut m, 1, &result_with_items(1, "A", vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect)]));
+        // Turn 2: picked up (now in room A, but carried).
+        apply_item_observations(&mut m, 2, &result_with_items(1, "A", vec![item_obs(10, "a coin", ObservedItemLocation::Carried)]));
+        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Carried);
+        // Turn 3: walked to B and dropped there.
+        apply_item_observations(&mut m, 3, &result_with_items(2, "B", vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect)]));
+        let rec = m.graph.item(10).unwrap();
+        assert_eq!(rec.origin_room, 1, "origin never moves");
+        assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Room { room: 2, direct: true }, "current location is B");
+        // Turn 4: re-entering A observes nothing of the coin there (it is in B) — this must NOT
+        // read as Vanished-in-A, and must NOT resurrect a stale Room(A). It is simply not evidence
+        // about A at all, because the record already says B.
+        apply_item_observations(&mut m, 4, &result_with_items(1, "A", vec![]));
+        assert_eq!(
+            m.graph.item(10).unwrap().last_seen,
+            mapper::graph::ItemLocation::Room { room: 2, direct: true },
+            "re-entering A must not disturb a record that already correctly says B"
+        );
+    }
+
+    #[test]
+    fn apply_item_observations_vanishes_a_direct_item_absent_and_uncarried() {
+        let mut m = Mapper::default();
+        m.observe(1, "Room", None);
+        apply_item_observations(&mut m, 1, &result_with_items(1, "Room", vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect)]));
+        // Later turn, same room, the coin is simply gone and not carried.
+        apply_item_observations(&mut m, 2, &result_with_items(1, "Room", vec![]));
+        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Vanished);
+    }
+
+    #[test]
+    fn apply_item_observations_never_vanishes_a_nested_only_sighting_when_its_container_closes() {
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        // The leaflet is seen only by recursing into the open mailbox.
+        apply_item_observations(&mut m, 1, &result_with_items(1, "West of House", vec![item_obs(11, "a leaflet", ObservedItemLocation::RoomNested)]));
+        // The mailbox is now closed — the leaflet is unreachable and absent from this turn's
+        // observations entirely, exactly like a real "close mailbox" + "look" turn.
+        apply_item_observations(&mut m, 2, &result_with_items(1, "West of House", vec![]));
+        assert_eq!(
+            m.graph.item(11).unwrap().last_seen,
+            mapper::graph::ItemLocation::Room { room: 1, direct: false },
+            "a nested-only sighting is never vanish-eligible — the record is untouched"
+        );
+    }
+
+    #[test]
+    fn apply_item_observations_scopes_carried_and_room_correctly_in_one_turn() {
+        let mut m = Mapper::default();
+        m.observe(1, "Room", None);
+        let result = result_with_items(
+            1,
+            "Room",
+            vec![item_obs(10, "a coin", ObservedItemLocation::RoomDirect), item_obs(20, "a lamp", ObservedItemLocation::Carried)],
+        );
+        apply_item_observations(&mut m, 1, &result);
+        assert_eq!(m.graph.item(10).unwrap().last_seen, mapper::graph::ItemLocation::Room { room: 1, direct: true });
+        assert_eq!(m.graph.item(20).unwrap().last_seen, mapper::graph::ItemLocation::Carried);
+        assert_eq!(m.graph.item(20).unwrap().origin_room, 1, "carried-from-first-sighting still names an origin");
+    }
+
+    // ── take_command_target / classify_take_attempt ────────────────────────────
+
+    #[test]
+    fn take_command_target_recognises_the_bare_and_separable_forms() {
+        assert_eq!(take_command_target("take mailbox"), Some("mailbox".to_string()));
+        assert_eq!(take_command_target("Get the brass lantern"), Some("the brass lantern".to_string()));
+        assert_eq!(take_command_target("pick up the leaflet"), Some("the leaflet".to_string()));
+        assert_eq!(take_command_target("pick leaflet up"), Some("leaflet".to_string()));
+    }
+
+    #[test]
+    fn take_command_target_rejects_unrelated_and_ambiguous_pick_forms() {
+        assert_eq!(take_command_target("look"), None);
+        assert_eq!(take_command_target("north"), None);
+        assert_eq!(take_command_target("pick lock"), None, "a different verb entirely");
+        assert_eq!(take_command_target("pick up"), None, "no noun named");
+        assert_eq!(take_command_target(""), None);
+    }
+
+    #[test]
+    fn classify_take_attempt_flags_a_single_unambiguous_refusal() {
+        let items = vec![item_obs(10, "a small mailbox", ObservedItemLocation::RoomDirect)];
+        assert_eq!(classify_take_attempt("take mailbox", &items), Some(10));
+    }
+
+    #[test]
+    fn classify_take_attempt_is_silent_when_the_take_actually_worked() {
+        let items = vec![item_obs(11, "a leaflet", ObservedItemLocation::Carried)];
+        assert_eq!(classify_take_attempt("take leaflet", &items), None, "the take succeeded — nothing to flag");
+    }
+
+    #[test]
+    fn classify_take_attempt_is_silent_on_an_ambiguous_noun() {
+        let items = vec![
+            item_obs(10, "a red box", ObservedItemLocation::RoomDirect),
+            item_obs(11, "a blue box", ObservedItemLocation::RoomDirect),
+        ];
+        assert_eq!(classify_take_attempt("take box", &items), None, "two candidates — never guess which");
+    }
+
+    #[test]
+    fn classify_take_attempt_is_silent_on_no_candidate_or_non_take_command() {
+        let items = vec![item_obs(10, "a small mailbox", ObservedItemLocation::RoomDirect)];
+        assert_eq!(classify_take_attempt("take sword", &items), None, "no candidate answers to this noun");
+        assert_eq!(classify_take_attempt("look", &items), None, "not a take command at all");
     }
 }

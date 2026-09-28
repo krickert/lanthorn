@@ -87,6 +87,7 @@ fn seed_of(snap: app::engine::LocationInfo) -> TurnResult {
         prose_retired: None,
         declared_exit: None,
     description: None,
+    items: Vec::new(),
     }
 }
 
