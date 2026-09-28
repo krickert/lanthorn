@@ -741,3 +741,69 @@ fn resume_selection_ignores_source_even_on_a_same_second_tie() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// SQ-1634: `state.turns` isn't restored from the resumed archive until AFTER the
+/// boot drain that re-observes the starting room's description and items (see
+/// `host/boot.rs`'s own comment at that call site) — so on a resume, that drain
+/// used to stamp everything it captured with the pre-restore `state.turns`
+/// (always 0 on a fresh process) instead of the save's real turn count, losing
+/// "last seen at move N" for the starting room and everything in it.
+///
+/// Real-game repro from the quest: Zork I r88, open the mailbox, take the
+/// leaflet, four more no-op moves (six total) without leaving West of House,
+/// save, exit, resume — the mailbox and the front door (both re-observed by
+/// the resumed boot's own drain, independent of anything the transcript says)
+/// must come back stamped with turn 6, not 0.
+#[test]
+fn a_resumed_boots_own_drain_stamps_the_restored_turn_not_zero() {
+    let story = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../stories/zork1-r88-s840726.z3");
+    if !story.is_file() {
+        eprintln!("SKIP: gitignored story missing at {}", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-resume-turn-stamp");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    assert!(!first.resumed, "the first boot found no archive to resume from");
+    let start_room = here(&first);
+    play(&mut first, "open mailbox");
+    play(&mut first, "take leaflet");
+    play(&mut first, "wait");
+    play(&mut first, "wait");
+    play(&mut first, "wait");
+    play(&mut first, "wait");
+    assert_eq!(first.state.turns, 6, "premise: six moves played, all inside West of House");
+    assert_eq!(here(&first), start_room, "premise: none of the six moves left the starting room");
+    write_resume_archive(&mut first);
+
+    let second = boot(story, headless_config(&home), &data_base);
+    assert!(second.resumed, "the second boot restored the archive the first one wrote");
+    assert_eq!(second.state.turns, 6, "the restored turn counter carries over");
+
+    let mailbox = second
+        .mapper
+        .graph
+        .items()
+        .map(|(_, rec)| rec)
+        .find(|rec| rec.name.to_lowercase().contains("mailbox"))
+        .expect("the resumed boot's own drain re-observes the mailbox");
+    assert_eq!(
+        mailbox.last_seen_turn, 6,
+        "the mailbox must come back stamped with the save's real turn count, not 0 (SQ-1634)"
+    );
+
+    let door = second
+        .mapper
+        .graph
+        .items()
+        .map(|(_, rec)| rec)
+        .find(|rec| rec.name.to_lowercase().contains("door"))
+        .expect("the resumed boot's own drain re-observes the front door");
+    assert_eq!(
+        door.last_seen_turn, 6,
+        "the front door must come back stamped with the save's real turn count, not 0 (SQ-1634)"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

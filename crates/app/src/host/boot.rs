@@ -1849,8 +1849,14 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
         // (SQ-1625/SQ-1627); this closes the one gap those lanes left — the room the story
         // STARTS in, which no command ever arrives for and which the player has not yet typed
         // `look` at either.
-        crate::session::apply_room_description(&mut mapper, state.turns, &seed_result);
-        crate::session::apply_item_observations(&mut mapper, state.turns, &seed_result);
+        // SQ-1634: `state.turns` isn't restored from the save until further down
+        // (`startup_turns`, applied below) — on a resume, stamping this drain's
+        // observations with the pre-restore `state.turns` (still 0) instead of
+        // the save's actual turn count loses "last seen at move N" for the
+        // starting room's own description and every item it re-observes here.
+        let drain_turns = startup_turns.unwrap_or(state.turns);
+        crate::session::apply_room_description(&mut mapper, drain_turns, &seed_result);
+        crate::session::apply_item_observations(&mut mapper, drain_turns, &seed_result);
         flush_screen_trace(&state.config.user_dir, &mut *session, state.config.trace.screen);
         flush_v6_trace(&state.config.user_dir, &mut *session, state.config.trace.v6);
         if state.config.trace.any() {
