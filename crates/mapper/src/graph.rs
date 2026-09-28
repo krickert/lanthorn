@@ -1248,19 +1248,24 @@ impl MapGraph {
     /// Record this turn's freshly-observed room description (SQ-1625), replacing whatever was
     /// there before — the map keeps only the MOST RECENT description per room, never an
     /// accumulating log. A no-op when `id` isn't in the graph yet (e.g. the pre-corroboration
-    /// NameOnly gate `app::session::apply_turn` applies before a room's first real edge), which
-    /// mirrors every other room setter here.
+    /// NameOnly gate `app::session::apply_turn` applies before a room's first real edge).
+    ///
+    /// Deliberately does NOT call [`Self::touch_layout`], unlike [`Self::set_notes`]'s otherwise
+    /// identical shape — `set_notes` is a rare, explicit user action, but this is called
+    /// automatically on every captured turn (`app::session::apply_room_description`), and
+    /// `struct_gen` exists specifically for the drawn-LAYOUT memo (see its own field doc): the
+    /// text a room's description holds is never part of that layout. Bumping it here fed the
+    /// per-turn `map_changed = struct_gen_before != struct_gen_after` check
+    /// (`app::host::turn::post_turn_bookkeeping`) a false "structural change" on a turn that
+    /// merely re-captured an already-known room's description, wrongly giving it its own
+    /// `map_snapshot` and reddening `host_session::replay_location_names_the_turns_own_room_not_an_older_snapshots`
+    /// on CI (2026-09-28).
     pub fn set_description(&mut self, id: RoomId, description: Option<String>, turn: u32) {
-        let mut changed = false;
         if let Some(room) = self.rooms.get_mut(&id) {
             if room.description != description {
                 room.description = description;
                 room.description_turn = Some(turn);
-                changed = true;
             }
-        }
-        if changed {
-            self.touch_layout();
         }
     }
 
@@ -2060,6 +2065,21 @@ mod struct_gen_tests {
         let gen = g.struct_gen();
         g.set_notes(1, "a loose brick".into()); // unchanged text
         assert_eq!(g.struct_gen(), gen, "an unchanged note must not bump");
+    }
+
+    /// SQ-1625 regression (2026-09-28): unlike `set_notes`, `set_description` must NEVER bump
+    /// `struct_gen` — it runs automatically on every captured turn, and a bump here fed a false
+    /// "structural change" into `map_changed`, giving an already-known room's re-captured
+    /// description its own spurious `map_snapshot`.
+    #[test]
+    fn set_description_never_bumps_struct_gen() {
+        let mut g = MapGraph::new();
+        g.upsert_room(1, "Hall".into());
+        let gen = g.struct_gen();
+        g.set_description(1, Some("A drafty hall.".into()), 1);
+        assert_eq!(g.struct_gen(), gen, "setting a description must not bump struct_gen");
+        g.set_description(1, Some("A drafty hall, now lit.".into()), 2);
+        assert_eq!(g.struct_gen(), gen, "changing a description must not bump struct_gen either");
     }
 
     #[test]
