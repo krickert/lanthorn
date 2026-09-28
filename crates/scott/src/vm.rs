@@ -2239,12 +2239,14 @@ impl Vm {
     /// none, when the room is `*`-literal) — without the exits/items sections [`Self::room_block`]
     /// appends after it (SQ-1625: what a host persists as the room's last-seen description).
     ///
-    /// Mirrors each `room_block_*` layout's own head computation rather than parsing it back out
-    /// of the composed block string: [`Self::room_name`] and [`Self::room_is_literal`] are already
-    /// public and sufficient for the ordinary layouts, but the exact PREFIX text depends on
-    /// [`Self::wording`], which is private to this crate — so a host cannot compose the same head
-    /// itself, and this exists to hand it over directly. Deliberately excludes `Trs80`'s decorative
-    /// `<---->` rule line: that is presentation framing, not room content.
+    /// **This is the one place the head is computed** (SQ-1631 Fix 5): each `room_block_*` layout
+    /// now calls this for its own head instead of recomputing it independently, so the darkness
+    /// line, the `room_prefix`/literal-name handling, and the TI-99 trailing-period quirk live in
+    /// exactly one place rather than four. [`Self::room_name`] and [`Self::room_is_literal`] are
+    /// already public and sufficient for the ordinary layouts, but the exact PREFIX text depends
+    /// on [`Self::wording`], which is private to this crate — so a host cannot compose the same
+    /// head itself, and this exists to hand it over directly. Deliberately excludes `Trs80`'s
+    /// decorative `<---->` rule line: that is presentation framing, not room content.
     pub fn room_description_text(&self) -> String {
         let w = self.wording();
         if self.is_dark() {
@@ -2299,17 +2301,13 @@ impl Vm {
     /// forms of both fields are the literals this layout carried.
     fn room_block_c64(&self) -> String {
         let w = self.wording();
+        // SQ-1631 Fix 5: the head (darkness line, or the prefixed/literal room text) is
+        // `room_description_text`'s own job now, not recomputed here — see that method's doc.
+        let mut s = self.room_description_text();
         if self.is_dark() {
-            return "It is too dark to see.".to_string();
+            return s;
         }
-        let mut s = String::new();
         if self.db.rooms.get(self.player).is_some() {
-            if self.room_is_literal() {
-                s.push_str(self.room_name(self.player));
-            } else {
-                s.push_str(w.room_prefix);
-                s.push_str(self.room_name(self.player));
-            }
             let exits = self.room_exits();
             s.push_str("\n\nObvious exits: ");
             s.push_str(&if exits.is_empty() {
@@ -2351,19 +2349,14 @@ impl Vm {
     /// punctuation on nearly every frame.
     fn room_block_ti994a(&self) -> String {
         let w = self.wording();
+        // SQ-1631 Fix 5: the head is `room_description_text`'s own job now — see that method's
+        // doc. It already applies this dialect's own prefix and trailing-period rule.
+        let mut s = self.room_description_text();
         if self.is_dark() {
-            return w.too_dark_to_see.trim_end().to_string();
+            return s;
         }
-        let mut s = String::new();
         let visible = self.items_in_room();
         if self.db.rooms.get(self.player).is_some() {
-            if !self.room_is_literal() {
-                s.push_str(w.room_prefix);
-            }
-            s.push_str(self.room_name(self.player));
-            if !visible.is_empty() && !ends_in_sentence_punctuation(&s) {
-                s.push('.');
-            }
             let exits = self.room_exits();
             s.push_str("\n\nObvious exits : ");
             if exits.is_empty() {
@@ -2393,21 +2386,16 @@ impl Vm {
     fn room_block_scottfree(&self, trs80: bool) -> String {
         const TRS80_LINE: &str = "\n<------------------------------------------------------------>\n";
         let w = self.wording();
+        // SQ-1631 Fix 5: the head is `room_description_text`'s own job now — see that method's
+        // doc.
+        let mut s = self.room_description_text();
         if self.is_dark() {
-            let mut s = w.too_dark_to_see.trim_end().to_string();
             if trs80 {
                 s.push_str(TRS80_LINE);
             }
             return s;
         }
-        let mut s = String::new();
         if self.db.rooms.get(self.player).is_some() {
-            if self.room_is_literal() {
-                s.push_str(self.room_name(self.player));
-            } else {
-                s.push_str(w.room_prefix);
-                s.push_str(self.room_name(self.player));
-            }
             let exits = self.room_exits();
             s.push_str("\n\nObvious exits: ");
             if exits.is_empty() {
@@ -3728,24 +3716,35 @@ mod tests {
         assert_eq!(vm.room_block(), "It is too dark to see.");
     }
 
-    /// SQ-1625: [`Vm::room_description_text`] is `room_block`'s own head — the darkness line, or
-    /// the prefixed/literal room text — with none of the exits/items sections after it. Falsified
-    /// by swapping the call to `self.room_block()`: that fails immediately, since the block
-    /// contains "Obvious exits" and the item text this assertion says must be absent.
+    /// SQ-1625 / SQ-1631 Fix 5: [`Vm::room_description_text`] is `room_block`'s own head — the
+    /// darkness line, or the prefixed/literal room text — with none of the exits/items sections
+    /// after it. Checked across all three [`Presentation`]s (SQ-1631's audit found this pinned
+    /// C64-only): each `room_block_*` now CALLS `room_description_text` for its head rather than
+    /// recomputing it independently, so `block.starts_with(&desc)` fails immediately the moment
+    /// that delegation stops holding — swapping the call to `self.room_block()` for `desc` itself
+    /// falsifies it the same way, since the block contains "Obvious exits" and the item text this
+    /// assertion says must be absent.
     #[test]
     fn room_description_text_is_room_blocks_head_without_exits_or_items() {
         let mut db = tiny_world();
         db.rooms[1].literal = false;
         db.rooms[1].desc = "forest".into();
         db.rooms[1].exits = [2, 0, 0, 0, 0, 3];
-        let vm = Vm::new(db);
 
-        let block = vm.room_block();
-        let desc = vm.room_description_text();
-        assert_eq!(desc, "I'm in a forest", "the prefixed room text, nothing else: {desc:?}");
-        assert!(block.starts_with(&desc), "room_block's own head is exactly this: {block:?}");
-        assert!(!desc.contains("Obvious exits"), "no exits section: {desc:?}");
-        assert!(!desc.contains("lamp"), "no items section: {desc:?}");
+        for (presentation, expected_desc) in [
+            (Presentation::C64, "I'm in a forest"),
+            (Presentation::ScottFree, "I'm in a forest"),
+            (Presentation::Trs80, "I'm in a forest"),
+            (Presentation::Ti994a, "I am in a forest."),
+        ] {
+            let vm = Vm::new_full(db.clone(), false, Vm::DEFAULT_RNG_SEED, Options::new().with_presentation(presentation));
+            let block = vm.room_block();
+            let desc = vm.room_description_text();
+            assert_eq!(desc, expected_desc, "{presentation:?}: the prefixed room text, nothing else: {desc:?}");
+            assert!(block.starts_with(&desc), "{presentation:?}: room_block's own head is exactly this: {block:?}");
+            assert!(!desc.contains("Obvious exits"), "{presentation:?}: no exits section: {desc:?}");
+            assert!(!desc.contains("lamp"), "{presentation:?}: no items section: {desc:?}");
+        }
     }
 
     /// A `*`-literal room's description text is exactly its raw stored text, with no prefix.
