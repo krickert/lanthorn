@@ -1743,7 +1743,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         }
     }
 
@@ -1766,7 +1766,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         }
     }
 

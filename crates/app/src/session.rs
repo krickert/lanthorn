@@ -7049,7 +7049,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "look", &first, &mut Default::default());
         assert_eq!(m.graph.current(), Some(1));
@@ -7075,7 +7075,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "north", &second, &mut Default::default());
         assert!(m.graph.room(2).is_some());
@@ -7116,7 +7116,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "look", &enter, &mut Default::default());
         assert_eq!(m.graph.current(), Some(1));
@@ -7140,7 +7140,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "west", &west, &mut Default::default());
 
@@ -7178,7 +7178,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "look", &enter, &mut Default::default());
         assert_eq!(m.graph.current(), Some(183));
@@ -7202,7 +7202,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "north", &north, &mut Default::default());
 
@@ -7317,7 +7317,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "look", &result, &mut Default::default());
         assert_eq!(m.graph.current(), None);
@@ -7363,7 +7363,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "Living Room", "Living Room\n"), &mut Default::default());
@@ -7417,7 +7417,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "The Bar", "The Bar\n"), &mut Default::default());
@@ -7474,7 +7474,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "The Bar", "The Bar\n"), &mut Default::default());
@@ -7512,7 +7512,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
 
         let mut m = Mapper::default();
@@ -7572,7 +7572,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         apply_turn(&mut m, "", &result, &mut Default::default());
         assert_eq!(m.graph.current(), Some(333));
@@ -7602,7 +7602,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         };
         assert!(r.info.is_none());
     }
@@ -7629,7 +7629,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         }
     }
 
@@ -10570,7 +10570,7 @@ mod untried_turn_tests {
             location_method: None, pending_io: None, timed_out: false,
             pictures: Vec::new(), transcript_elems: Vec::new(), prose_retired: None,
             declared_exit: None,
-        description: None,
+            description: None,
         }
     }
 
