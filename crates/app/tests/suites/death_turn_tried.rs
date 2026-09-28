@@ -44,6 +44,7 @@ fn turn(num: mapper::graph::RoomId, name: &str, transcript: &str) -> TurnResult 
         transcript_elems: Vec::new(),
         prose_retired: None,
         declared_exit: None,
+    description: None,
     }
 }
 

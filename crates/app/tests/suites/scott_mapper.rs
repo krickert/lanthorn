@@ -42,6 +42,7 @@ fn scott_walk_drives_the_automapper() {
         transcript_elems: Vec::new(),
         prose_retired: None,
         declared_exit: None,
+        description: None,
     };
     apply_turn(&mut mapper, "", &seed_result, &mut Default::default());
 

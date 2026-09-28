@@ -133,6 +133,17 @@ pub struct Room {
     /// [`MapGraph::from_parts`] could not tell "missing" from "really seq 0".
     #[serde(default = "room_seq_missing")]
     pub seq: u64,
+    /// The text the game printed for this room's LAST-seen description — on arrival or on an
+    /// explicit LOOK (SQ-1625) — kept only as the most recent one, overwritten rather than
+    /// accumulated. `None` for a room mapped before this existed, an engine/story shape this
+    /// isn't captured for (any v6 Z-machine game; see `app::session`'s Z-machine turn builder),
+    /// or a room no capture has reached yet.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The turn [`Room::description`] was captured on, for a host that wants to show how stale
+    /// it is. `None` exactly when `description` is `None`.
+    #[serde(default)]
+    pub description_turn: Option<u32>,
 }
 
 impl Room {
@@ -636,6 +647,8 @@ impl MapGraph {
                     random_inherited: Vec::new(),
                     aliases: Vec::new(),
                     seq,
+                    description: None,
+                    description_turn: None,
                 });
                 changed = true;
             }
@@ -1232,6 +1245,25 @@ impl MapGraph {
         }
     }
 
+    /// Record this turn's freshly-observed room description (SQ-1625), replacing whatever was
+    /// there before — the map keeps only the MOST RECENT description per room, never an
+    /// accumulating log. A no-op when `id` isn't in the graph yet (e.g. the pre-corroboration
+    /// NameOnly gate `app::session::apply_turn` applies before a room's first real edge), which
+    /// mirrors every other room setter here.
+    pub fn set_description(&mut self, id: RoomId, description: Option<String>, turn: u32) {
+        let mut changed = false;
+        if let Some(room) = self.rooms.get_mut(&id) {
+            if room.description != description {
+                room.description = description;
+                room.description_turn = Some(turn);
+                changed = true;
+            }
+        }
+        if changed {
+            self.touch_layout();
+        }
+    }
+
     /// Remove the connection(s) with key (origin, dir). Returns true if any was removed.
     /// For a real direction that is at most one edge; for `Unknown` — which may hold several
     /// stubs (see [`MapGraph::add_edge`]) — every `?` edge out of `origin` goes at once, as the
@@ -1800,6 +1832,8 @@ mod tests {
             random_inherited: Vec::new(),
             aliases: Vec::new(),
             seq: ROOM_SEQ_MISSING,
+            description: None,
+            description_turn: None,
         };
         let rooms = vec![mk(5), mk(2), mk(9)];
         let g = MapGraph::from_parts(rooms, Vec::new(), None, BTreeMap::new(), 1, BTreeMap::new(), 0);
@@ -1833,6 +1867,8 @@ mod tests {
             random_inherited: Vec::new(),
             aliases: Vec::new(),
             seq,
+            description: None,
+            description_turn: None,
         };
         // Array order (2, 1) deliberately disagrees with seq order (1, 0): if the backfill fired
         // here by mistake it would silently overwrite these with array positions instead.

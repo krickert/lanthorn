@@ -691,6 +691,20 @@ pub struct TurnResult {
     /// (tests, history replay, a host restore) leaves this `None`, which is
     /// the correct "behave exactly as today" answer for all of them.
     pub declared_exit: Option<crate::engine::DeclaredExit>,
+    /// The text this turn printed for the CURRENT room's description — on arrival or an explicit
+    /// LOOK (SQ-1625) — for the mapper to persist against `location`, or `None` when this turn
+    /// captured no such text. Each engine decides for itself what it can state with confidence
+    /// rather than guess at:
+    ///
+    /// - Scott always fills this from `scott::Vm::room_description_text`, a direct query of live
+    ///   VM state — no transcript heuristic involved.
+    /// - Glulx fills this only when `AppGlk`'s room-heading detector confirmed a heading is
+    ///   joined to prose (see `AppGlk::take_room_description`), the same evidence
+    ///   `take_room_heading` already requires.
+    /// - The Z-machine fills this only for the common single-scrolling-window convention (see
+    ///   `zvm_capture_room_description`); a v6 game's extra windows leave it `None` permanently —
+    ///   a deliberate gap, not a bug.
+    pub description: Option<String>,
 }
 
 impl TurnResult {
@@ -2015,6 +2029,9 @@ impl GameSession {
         let detected = detect_location_with(&self.machine, self.player_candidates());
         let location = detected.as_ref().map(location_to_snapshot);
         let location_method = detected.as_ref().map(Location::method);
+        // SQ-1625 Tier 3: see `zvm_room_description`'s own doc for the bound (v6 excluded
+        // outright) and what counts as evidence (the room's name reprinted as its own line).
+        let description = zvm_room_description(&self.machine, &transcript, location.as_ref());
 
         let diagnostics = self.machine.take_diagnostics();
         let fault = self.machine.take_fault_trace().map(|t| t.to_lines());
@@ -2133,6 +2150,7 @@ impl GameSession {
             transcript_elems,
             prose_retired,
             declared_exit: None,
+            description,
         }
     }
 
@@ -4510,6 +4528,22 @@ pub fn apply_turn(
     }
 }
 
+/// Record this turn's freshly-observed room description into the map, if the engine captured
+/// one (SQ-1625, `TurnResult::description`) — kept alongside [`apply_turn`] rather than folded
+/// into it because `apply_turn` is engine-neutral and pure, and has no turn counter of its own:
+/// only the host knows the current turn number (`AppState::turns`), so it is handed in here as a
+/// plain argument instead of the map trying to derive it from anything on the graph.
+///
+/// A no-op when `result.description` is `None` (nothing captured this turn), and separately a
+/// no-op when `result.location`'s room isn't in the graph yet ([`mapper::graph::MapGraph::set_description`]
+/// mirrors every other room setter here) — the pre-corroboration NameOnly gate in [`apply_turn`]
+/// can leave the map's first room unminted even though `result.location` is `Some`.
+pub fn apply_room_description(mapper: &mut Mapper, turn: u32, result: &TurnResult) {
+    if let (Some(snap), Some(desc)) = (&result.location, &result.description) {
+        mapper.graph.set_description(snap.number, Some(desc.clone()), turn);
+    }
+}
+
 /// What the mapper still owes a death the game has not finished with (SQ-0671, SQ-0673).
 ///
 /// A death is not one turn's event. Adventure kills you, offers to reincarnate you, insists
@@ -4734,6 +4768,57 @@ pub fn rollback_tried_on_death(
 fn reprinted_room_heading(transcript: &str, name: &str) -> bool {
     let name = name.trim();
     !name.is_empty() && transcript.lines().any(|l| l.trim().eq_ignore_ascii_case(name))
+}
+
+/// SQ-1625 Tier 3: this turn's room description, for a Z-machine story that keeps to the common
+/// single-window convention — a status-line window plus exactly one scrolling text window, the
+/// vast majority of v1/v3/v5 games.
+///
+/// `None` outright for a v6 story (`machine.screen.v6.is_some()`, the same signal
+/// `zvm::location::detect_location_with` already special-cases for exactly this reason: a v6
+/// game paints into its own window model rather than the v1-v5 status-line grid, so nothing here
+/// is safe to read as "the" scrolling window's transcript). This is a deliberate, permanent gap
+/// per any v6 game (Zork Zero, Arthur, Journey, Shogun…), not an attempt that was tried and
+/// discarded — attempting extraction on a v6 frame and discarding a bad result is exactly what
+/// this function is not allowed to do (see the falsification test that removes this gate).
+///
+/// Otherwise defers to [`transcript_room_description`], which is its own evidence for "arrival or
+/// an explicit LOOK" — the same reprinted-heading fact [`reprinted_room_heading`] uses for the
+/// mapper edge, just kept as the matched line's INDEX rather than a bool so the text after it can
+/// be sliced out.
+fn zvm_room_description(machine: &Machine, transcript: &str, location: Option<&LocationInfo>) -> Option<String> {
+    if machine.screen.v6.is_some() {
+        return None;
+    }
+    transcript_room_description(transcript, &location?.name)
+}
+
+/// The transcript text that followed the LAST line exactly matching `name` (trimmed,
+/// case-insensitive) — the room heading a successful move, a self-loop, or a bare LOOK reprints
+/// (see [`reprinted_room_heading`]) — trimmed of leading/trailing blank lines. `None` when no such
+/// line exists: a refusal ("You can't go that way.") or an unrelated turn reprints no heading at
+/// all, and there is deliberately no fallback to "whatever WAS printed" for one, matching this
+/// engine's bounded scope (SQ-1625) rather than guessing at what counts as description prose.
+///
+/// Deliberately excludes the heading line itself — matching the Glk detector's own heading/prose
+/// split (`AppGlk::take_room_description`), so a `Room`'s bare name (`Room.name`/`Room.label`) and
+/// its `description` state two different facts on every engine that captures one.
+///
+/// This is also why no separate command-echo or parser-error filter is needed here, unlike the
+/// Glk detector: the slice starts strictly AFTER the heading line, so a self-echoed command
+/// (rare on this engine — most Z-machine games never print their own input back) sits entirely
+/// BEFORE it and falls away on its own. A trailing parser aside chained onto the SAME turn as a
+/// real arrival is a known, accepted gap — rare enough in practice that a dedicated detector for
+/// it is not worth carrying.
+fn transcript_room_description(transcript: &str, name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let idx = transcript.lines().position(|l| l.trim().eq_ignore_ascii_case(name))?;
+    let rest = transcript.lines().skip(idx + 1).collect::<Vec<_>>().join("\n");
+    let trimmed = rest.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// True when this turn's output carries a death/end banner — the interpreter
@@ -6561,6 +6646,124 @@ mod tests {
     use super::*;
     use mapper::direction::Direction;
 
+    // ── SQ-1625 Tier 3: transcript_room_description ────────────────────────────
+
+    #[test]
+    fn transcript_room_description_returns_text_after_the_heading_line() {
+        let transcript = "West of House\nYou are standing in an open field west of a white house.\n";
+        assert_eq!(
+            transcript_room_description(transcript, "West of House").as_deref(),
+            Some("You are standing in an open field west of a white house.")
+        );
+    }
+
+    /// The heading itself is excluded — `Room.name` already states it; the description is the
+    /// paragraph beneath it, matching the Glk detector's own heading/prose split.
+    #[test]
+    fn transcript_room_description_excludes_the_heading_line_itself() {
+        let transcript = "West of House\nYou are standing in an open field.\n";
+        let desc = transcript_room_description(transcript, "West of House").unwrap();
+        assert!(!desc.contains("West of House"), "the heading must not reappear inside the body: {desc:?}");
+    }
+
+    /// A multi-paragraph description survives whole — unlike the Glk cap this mirrors
+    /// conceptually, nothing here truncates.
+    #[test]
+    fn transcript_room_description_keeps_a_multi_paragraph_body() {
+        let transcript = "Attic\nA dusty attic.\n\nA loose board catches your eye.\n";
+        assert_eq!(
+            transcript_room_description(transcript, "Attic").as_deref(),
+            Some("A dusty attic.\n\nA loose board catches your eye.")
+        );
+    }
+
+    /// A refusal reprints no heading at all — "arrival or explicit LOOK" is this function's OWN
+    /// evidence (SQ-1625), not a separate flag the caller has to check first.
+    #[test]
+    fn transcript_room_description_is_none_when_the_room_name_never_appears() {
+        let transcript = "You can't go that way.\n";
+        assert_eq!(transcript_room_description(transcript, "West of House"), None);
+    }
+
+    #[test]
+    fn transcript_room_description_is_none_for_an_empty_name() {
+        assert_eq!(transcript_room_description("Some text.\n", ""), None);
+    }
+
+    /// A heading with literally nothing after it (an empty room, or the room name is the very
+    /// last thing printed this turn) is `None`, not `Some("")`.
+    #[test]
+    fn transcript_room_description_is_none_when_nothing_follows_the_heading() {
+        assert_eq!(transcript_room_description("West of House\n", "West of House"), None);
+    }
+
+    /// A rare self-echoing game's command echo sits BEFORE the heading line and falls away on
+    /// its own — this function needs no separate command-echo filter (see its own doc).
+    #[test]
+    fn transcript_room_description_drops_a_leading_self_echo_by_construction() {
+        let transcript = "look\nWest of House\nYou are standing in an open field.\n";
+        let desc = transcript_room_description(transcript, "West of House").unwrap();
+        assert!(!desc.contains("look"), "the self-echoed command must not leak into the body: {desc:?}");
+        assert_eq!(desc, "You are standing in an open field.");
+    }
+
+    /// A minimal valid Machine (same recipe as `headless.rs`'s `minimal_machine`), for the one
+    /// test below that needs a real `&Machine` to flip `screen.v6` on.
+    fn minimal_machine() -> Machine {
+        use zvm::memory::Memory;
+        let mut buf = vec![0u8; 0x0800];
+        buf[0x00] = 3; // version = 3 (the `screen.v6` field is what matters, not the header)
+        buf[0x04] = 0x00; buf[0x05] = 0x40;
+        buf[0x06] = 0x00; buf[0x07] = 0x40;
+        buf[0x0A] = 0x00; buf[0x0B] = 0x80;
+        buf[0x0C] = 0x01; buf[0x0D] = 0x00;
+        buf[0x0E] = 0x03; buf[0x0F] = 0x00;
+        buf[0x08] = 0x04; buf[0x09] = 0x00;
+        buf[0x18] = 0x00; buf[0x19] = 0x60;
+        buf[0x0080] = 0;
+        buf[0x0081] = 4;
+        buf[0x0082] = 0; buf[0x0083] = 0;
+        buf[0x0040] = 0xba;
+        let mem = Memory::new(buf).expect("minimal story");
+        Machine::new(mem)
+    }
+
+    /// SQ-1625: the falsifying case for the v6 gate in [`zvm_room_description`] — a transcript
+    /// shaped exactly like a real v6 frame CAN be (several windows' text flattened into one
+    /// string, with a bare line that happens to equal the detected room name sitting in front of
+    /// text from an ENTIRELY DIFFERENT window) produces a WRONG answer once the gate is removed,
+    /// which is what proves the gate is doing real work rather than guarding against nothing.
+    /// `docs/internals/...`/CLAUDE.md's own v6 geometry conventions single out `screen.v6` as the
+    /// one signal `detect_location_with` already special-cases for exactly this reason.
+    #[test]
+    fn zvm_room_description_is_gated_off_for_a_v6_story() {
+        let mut machine = minimal_machine();
+        let loc = LocationInfo { number: 1, parent: 0, name: "Banquet Hall".to_string() };
+
+        // A transcript shaped like Zork Zero's own opening banquet scene: the room heading,
+        // then several UNRELATED windows' text (a dialogue window, a status strip) flattened
+        // into the one string this engine's non-v6 path treats as "the" scrolling window.
+        let v6_shaped_transcript = "Banquet Hall\n\"Frobnitz! Frobnosia!\" the wizard bellows, and the hall erupts in flame.";
+
+        // Without the gate (`machine.screen.v6` left `None`), the ordinary single-window rule
+        // fires and returns exactly the wrong thing for a v6 frame: text from a scripted
+        // cutscene window, presented as though it were this room's own description.
+        assert_eq!(
+            zvm_room_description(&machine, v6_shaped_transcript, Some(&loc)).as_deref(),
+            Some("\"Frobnitz! Frobnosia!\" the wizard bellows, and the hall erupts in flame."),
+            "sanity: the ungated single-window rule DOES fire on this shape"
+        );
+
+        // With the gate — `screen.v6` set, exactly as a real v6 boot leaves it — the same
+        // transcript and location must yield `None` outright, never the wrong text above.
+        machine.screen.v6 = Some(zvm::screen::V6Windows::new(Default::default(), 0));
+        assert_eq!(
+            zvm_room_description(&machine, v6_shaped_transcript, Some(&loc)),
+            None,
+            "the v6 gate must refuse extraction outright, not merely discard a bad result"
+        );
+    }
+
     // ── Object tree ordering ──────────────────────────────────────────────────
 
     #[test]
@@ -6846,6 +7049,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "look", &first, &mut Default::default());
         assert_eq!(m.graph.current(), Some(1));
@@ -6871,6 +7075,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "north", &second, &mut Default::default());
         assert!(m.graph.room(2).is_some());
@@ -6911,6 +7116,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "look", &enter, &mut Default::default());
         assert_eq!(m.graph.current(), Some(1));
@@ -6934,6 +7140,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "west", &west, &mut Default::default());
 
@@ -6971,6 +7178,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "look", &enter, &mut Default::default());
         assert_eq!(m.graph.current(), Some(183));
@@ -6994,6 +7202,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "north", &north, &mut Default::default());
 
@@ -7108,6 +7317,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "look", &result, &mut Default::default());
         assert_eq!(m.graph.current(), None);
@@ -7153,6 +7363,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "Living Room", "Living Room\n"), &mut Default::default());
@@ -7206,6 +7417,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "The Bar", "The Bar\n"), &mut Default::default());
@@ -7262,6 +7474,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         let mut m = Mapper::default();
         apply_turn(&mut m, "", &mk(1, "The Bar", "The Bar\n"), &mut Default::default());
@@ -7299,6 +7512,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
 
         let mut m = Mapper::default();
@@ -7358,6 +7572,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         apply_turn(&mut m, "", &result, &mut Default::default());
         assert_eq!(m.graph.current(), Some(333));
@@ -7387,6 +7602,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         };
         assert!(r.info.is_none());
     }
@@ -7413,6 +7629,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         }
     }
 
@@ -10353,6 +10570,7 @@ mod untried_turn_tests {
             location_method: None, pending_io: None, timed_out: false,
             pictures: Vec::new(), transcript_elems: Vec::new(), prose_retired: None,
             declared_exit: None,
+        description: None,
         }
     }
 

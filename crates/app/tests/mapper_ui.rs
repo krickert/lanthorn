@@ -32,6 +32,8 @@ mod border_controls;
 mod return_probe;
 #[path = "suites/declared_exit.rs"]
 mod declared_exit;
+#[path = "suites/room_description.rs"]
+mod room_description;
 #[path = "suites/matrix_path_highlight.rs"]
 mod matrix_path_highlight;
 #[path = "suites/matrix_view.rs"]

@@ -625,6 +625,9 @@ impl ScottSession {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+            // SQ-1625: a direct query of live VM state, not a transcript heuristic — always
+            // available, so unlike the other two engines this is never `None` while a room exists.
+            description: Some(self.vm.room_description_text()).filter(|s| !s.is_empty()),
         }
     }
 

@@ -381,6 +381,10 @@ pub fn finish_command_turn(
         crate::random_exit_probe::declared_exit_for_command(cmd, room_before, |o, d| session.declared_exit(o, d));
 
     apply_turn(mapper, cmd, &result, &mut state.death_watch);
+    // SQ-1625: this command's own room description, if the engine captured one — see
+    // `TurnResult::description`'s doc for what each engine will and won't fill in. `state.turns`
+    // was already advanced above, so it names THIS turn.
+    crate::session::apply_room_description(mapper, state.turns, &result);
 
     // A move that killed the player proved nothing about the passage, so its `tried` record is
     // taken back and the direction stays untried (`·`, not `×`). Fires for the turn that
@@ -1730,6 +1734,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         }
     }
 
@@ -1752,6 +1757,7 @@ mod tests {
             transcript_elems: Vec::new(),
             prose_retired: None,
             declared_exit: None,
+        description: None,
         }
     }
 

@@ -8466,6 +8466,7 @@ mod tests {
             transcript_elems: vec![],
             prose_retired: None,
             declared_exit: None,
+        description: None,
         }
     }
 

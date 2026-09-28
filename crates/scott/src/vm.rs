@@ -2234,6 +2234,53 @@ impl Vm {
         }
     }
 
+    /// The current room's description text ALONE — the darkness line when dark, otherwise the
+    /// room's raw text with whatever prefix the active [`Presentation`] puts in front of it (or
+    /// none, when the room is `*`-literal) — without the exits/items sections [`Self::room_block`]
+    /// appends after it (SQ-1625: what a host persists as the room's last-seen description).
+    ///
+    /// Mirrors each `room_block_*` layout's own head computation rather than parsing it back out
+    /// of the composed block string: [`Self::room_name`] and [`Self::room_is_literal`] are already
+    /// public and sufficient for the ordinary layouts, but the exact PREFIX text depends on
+    /// [`Self::wording`], which is private to this crate — so a host cannot compose the same head
+    /// itself, and this exists to hand it over directly. Deliberately excludes `Trs80`'s decorative
+    /// `<---->` rule line: that is presentation framing, not room content.
+    pub fn room_description_text(&self) -> String {
+        let w = self.wording();
+        if self.is_dark() {
+            return match self.options.presentation {
+                Presentation::C64 => "It is too dark to see.".to_string(),
+                Presentation::ScottFree | Presentation::Trs80 | Presentation::Ti994a => {
+                    w.too_dark_to_see.trim_end().to_string()
+                }
+            };
+        }
+        if self.db.rooms.get(self.player).is_none() {
+            return String::new();
+        }
+        let mut s = String::new();
+        match self.options.presentation {
+            Presentation::Ti994a => {
+                if !self.room_is_literal() {
+                    s.push_str(w.room_prefix);
+                }
+                s.push_str(self.room_name(self.player));
+                if !self.items_in_room().is_empty() && !ends_in_sentence_punctuation(&s) {
+                    s.push('.');
+                }
+            }
+            Presentation::C64 | Presentation::ScottFree | Presentation::Trs80 => {
+                if self.room_is_literal() {
+                    s.push_str(self.room_name(self.player));
+                } else {
+                    s.push_str(w.room_prefix);
+                    s.push_str(self.room_name(self.player));
+                }
+            }
+        }
+        s
+    }
+
     /// This crate's own pre-existing layout (matches neither of ScottFree's,
     /// see [`Presentation::C64`]'s doc): exits joined ". ", items each on
     /// their own indented line under "I can also see:". A `*`-literal room
@@ -3679,6 +3726,48 @@ mod tests {
         vm.flag_set(DARK_FLAG, true);
         assert!(vm.is_dark());
         assert_eq!(vm.room_block(), "It is too dark to see.");
+    }
+
+    /// SQ-1625: [`Vm::room_description_text`] is `room_block`'s own head — the darkness line, or
+    /// the prefixed/literal room text — with none of the exits/items sections after it. Falsified
+    /// by swapping the call to `self.room_block()`: that fails immediately, since the block
+    /// contains "Obvious exits" and the item text this assertion says must be absent.
+    #[test]
+    fn room_description_text_is_room_blocks_head_without_exits_or_items() {
+        let mut db = tiny_world();
+        db.rooms[1].literal = false;
+        db.rooms[1].desc = "forest".into();
+        db.rooms[1].exits = [2, 0, 0, 0, 0, 3];
+        let vm = Vm::new(db);
+
+        let block = vm.room_block();
+        let desc = vm.room_description_text();
+        assert_eq!(desc, "I'm in a forest", "the prefixed room text, nothing else: {desc:?}");
+        assert!(block.starts_with(&desc), "room_block's own head is exactly this: {block:?}");
+        assert!(!desc.contains("Obvious exits"), "no exits section: {desc:?}");
+        assert!(!desc.contains("lamp"), "no items section: {desc:?}");
+    }
+
+    /// A `*`-literal room's description text is exactly its raw stored text, with no prefix.
+    #[test]
+    fn room_description_text_of_a_literal_room_has_no_prefix() {
+        let mut db = tiny_world();
+        db.rooms[1].literal = true;
+        db.rooms[1].desc = "Outside a large gothic looking building.".into();
+        let vm = Vm::new(db);
+        assert_eq!(vm.room_description_text(), "Outside a large gothic looking building.");
+    }
+
+    /// A dark room's description text is the darkness line alone — the same head `room_block`
+    /// falls back to, and the same thing that happens to be its ENTIRE output when dark.
+    #[test]
+    fn room_description_text_is_the_darkness_line_when_dark() {
+        let mut vm = Vm::new(tiny_world());
+        vm.set_item_loc(LIGHT_SOURCE, 0); // banish the lamp to nowhere
+        vm.flag_set(DARK_FLAG, true);
+        assert!(vm.is_dark());
+        assert_eq!(vm.room_description_text(), "It is too dark to see.");
+        assert_eq!(vm.room_description_text(), vm.room_block(), "dark room_block IS just this line");
     }
 
     /// `room_block` is documented as one convenience layout of

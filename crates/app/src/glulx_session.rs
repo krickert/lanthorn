@@ -1357,6 +1357,12 @@ impl GlulxSession {
         // command — cragne Manor's content warning (SQ-0733).
         let awaiting_line_input = self.pending == InputKind::Line;
         let heading = self.appglk().take_room_heading(awaiting_line_input);
+        // SQ-1625: must follow `take_room_heading` immediately (same drain) — see that
+        // accessor's own doc. Read regardless of what happens to `heading` below
+        // (`refuse_banner_the_status_line_contradicts`, `name_this_room`): those decide whether
+        // THIS app trusts the heading as a room change, not whether the story printed a
+        // description alongside it.
+        let description = self.appglk().take_room_description();
         // SQ-1351: and a banner the story's own status line contradicts is not a
         // heading at all, whatever it is styled as.
         let heading = self.refuse_banner_the_status_line_contradicts(heading);
@@ -1468,6 +1474,7 @@ impl GlulxSession {
             transcript_elems: elems,
             prose_retired: None,
             declared_exit: None,
+            description,
         }
     }
 

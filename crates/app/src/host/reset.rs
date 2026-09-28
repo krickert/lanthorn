@@ -445,25 +445,11 @@ pub fn reset_game(
             crate::pager::arm_opening_banner(state, &*session);
             if let Some(snap) = start_loc {
                 let snap_number = snap.number;
-                let seed_result = TurnResult {
-                    transcript: String::new(),
-                    transcript_runs: Vec::new(),
-                    location: Some(snap),
-                    quit: false,
-                    erase_lower: false,
-                    info: None,
-                    sounds: Vec::new(),
-                    glulx_sound_ops: Vec::new(),
-                    diagnostics: vec![],
-                    fault: None,
-                    location_method: None,
-                    pending_io: None,
-                    timed_out: false,
-                    pictures: Vec::new(),
-                    transcript_elems: Vec::new(),
-                    prose_retired: None,
-                    declared_exit: None,
-                };
+                // Every other field here already matched `TurnResult::default()` by hand
+                // (SQ-1625: rather than add `description: None` as one more explicit line to
+                // this literal, use the helper that exists for exactly this "location only"
+                // seed shape — see its own doc).
+                let seed_result = TurnResult::observation(snap);
                 apply_turn(mapper, "", &seed_result, &mut state.death_watch);
                 let rid = snap_number as mapper::graph::RoomId;
                 state.select_room(Some(rid));

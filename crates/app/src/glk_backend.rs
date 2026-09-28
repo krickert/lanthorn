@@ -406,6 +406,31 @@ struct StoryScan {
     /// answer "does the stream end at the game's read prompt?" — the test for a
     /// parser command prompt rather than a bare line read.
     prompt_tail: String,
+    /// The prose captured alongside the CURRENT heading candidate, once
+    /// [`Self::advance_heading_tail`] has decided it is joined-or-detached body text rather
+    /// than the candidate's own line (SQ-1625) — the same evidence
+    /// [`Self::heading_tail_text`]/[`Self::heading_tail_prose`] classify, just kept in full
+    /// rather than capped at [`HEADING_TAIL_CAP`]: once something is worth classifying as
+    /// prose, the whole of it is worth keeping, however long. Cleared everywhere
+    /// `heading_tail_text` is (a rejection, a displaced candidate's fresh replacement, a
+    /// window clear, and — critically — every [`Self::take_room_heading`] drain, confirmed
+    /// or discarded alike), so it can never describe a candidate other than the one that
+    /// was just settled.
+    body_acc: String,
+    /// Whether [`Self::advance_heading_tail`] is currently inside `body_acc`'s window: true
+    /// from the first body character onward (either the joined case's very next char after
+    /// the candidate's own line, or the first char past the blank line that detaches it),
+    /// false again the moment that candidate is settled one way or the other. Needed because
+    /// the JOINED case confirms the heading (and resets [`Self::heading_tail`] to `Idle`)
+    /// after only ONE character of the body — every character after that flows through the
+    /// no-op `Idle` arm of `advance_heading_tail`, and this is what keeps `body_acc` growing
+    /// through it regardless.
+    capturing_body: bool,
+    /// The body text [`Self::take_room_heading`] resolved for THIS turn's confirmed heading,
+    /// if any — `None` on a turn that confirmed no heading, or confirmed one with nothing
+    /// following it (SQ-1625). Read once, right after `take_room_heading`, by
+    /// [`AppGlk::take_room_description`].
+    last_description: Option<String>,
 }
 
 impl Default for StoryScan {
@@ -422,6 +447,9 @@ impl Default for StoryScan {
             heading_line_rest: String::new(),
             heading_displaced: None,
             prompt_tail: String::new(),
+            body_acc: String::new(),
+            capturing_body: false,
+            last_description: None,
         }
     }
 }
@@ -813,6 +841,17 @@ impl AppGlk {
         self.primary_scan()?.take_room_heading(at_command_prompt)
     }
 
+    /// Return and clear the prose [`Self::take_room_heading`] found joined to the heading it
+    /// just drained (SQ-1625) — `None` when that call confirmed no heading, or confirmed one
+    /// with nothing following it. **Must be called AFTER `take_room_heading`, on the same
+    /// drain** — the scan's own `take_room_description` only ever has something to return
+    /// once `take_room_heading` has just settled this turn's candidate one way or the other;
+    /// called on its own, or before `take_room_heading`, it can only see what an EARLIER
+    /// drain left behind.
+    pub fn take_room_description(&mut self) -> Option<String> {
+        self.primary_scan()?.take_room_description()
+    }
+
     /// The room name painted on the game's STATUS LINE — its first text-grid
     /// window — or `None` if it holds nothing that could be one (SQ-1302).
     ///
@@ -914,6 +953,14 @@ impl StoryScan {
                         self.heading_tail_prose = false;
                         self.heading_line_rest.clear();
                     }
+                    // SQ-1625: a fresh candidate starting supersedes whatever body text was
+                    // captured for whatever preceded it, the same way it is about to supersede
+                    // `heading_pending` — "the LAST heading in a turn wins" applies to the body
+                    // that follows it too. Always empty here in the `heading_displaced` case
+                    // above (that candidate never reached the body-capture states below), so this
+                    // is a safe no-op there.
+                    self.body_acc.clear();
+                    self.capturing_body = false;
                     self.in_heading = true; // a heading begins only at line start
                 }
                 if self.in_heading {
@@ -946,7 +993,16 @@ impl StoryScan {
     /// [`Self::take_room_heading`] decides from there.
     fn advance_heading_tail(&mut self, ch: char) {
         match self.heading_tail {
-            HeadingTail::Idle => {}
+            // SQ-1625: once a joined body's very first character has flipped `capturing_body`
+            // on (in the `LineEnd` arm below), `confirm_heading` resets `heading_tail` back to
+            // `Idle` immediately — every character of the body AFTER that first one arrives
+            // here, not through `LineEnd`/`Detached` again, so this is where the rest of a
+            // joined body is actually collected.
+            HeadingTail::Idle => {
+                if self.capturing_body {
+                    self.body_acc.push(ch);
+                }
+            }
             HeadingTail::Line => {
                 if ch == '\n' {
                     if self.line_rest_disqualifies() {
@@ -966,6 +1022,10 @@ impl StoryScan {
                 if ch == '\n' {
                     self.heading_tail = HeadingTail::Detached;
                 } else {
+                    // SQ-1625: the heading and its description share one paragraph with no
+                    // blank line between them — this character is the description's first.
+                    self.capturing_body = true;
+                    self.body_acc.push(ch);
                     self.confirm_heading();
                 }
             }
@@ -975,6 +1035,12 @@ impl StoryScan {
                 } else {
                     self.heading_tail_prose = true;
                 }
+                // SQ-1625: unbounded, unlike `heading_tail_text` above — kept speculatively for
+                // every detached tail, even ones `take_room_heading` goes on to discard as a
+                // banner/cutscene page (which clears it there); classifying WHETHER this is
+                // prose is `heading_tail_text`'s job, not this field's.
+                self.capturing_body = true;
+                self.body_acc.push(ch);
             }
         }
     }
@@ -1120,13 +1186,39 @@ impl StoryScan {
             self.heading_tail = HeadingTail::Idle;
             self.heading_tail_text.clear();
             self.heading_tail_prose = false;
+            // SQ-1625: a banner/cutscene page, not a room — whatever body text was
+            // speculatively captured alongside it describes nothing.
+            self.body_acc.clear();
+            self.capturing_body = false;
+            self.last_description = None;
         } else {
             self.confirm_heading();
+            // SQ-1625: this turn's confirmed heading's body, if any followed it — the joined
+            // case's body may have started many characters (even many `capture_heading` calls)
+            // before this drain, growing through the `Idle` arm of `advance_heading_tail` the
+            // whole way; the detached case's body is exactly what was just classified as prose
+            // above. Either way, drained and reset here so it can never leak into next turn's
+            // drain. `strip_read_prompt` takes off the same trailing "\n>" the classification
+            // above already looks past (`superbrief`'s bare prompt) — the read prompt is the
+            // interpreter's own chrome, never room content.
+            let body = crate::session::strip_read_prompt(&self.body_acc).trim();
+            self.last_description = (!body.is_empty()).then(|| body.to_string());
+            self.body_acc.clear();
+            self.capturing_body = false;
         }
         // A parked candidate is per-turn evidence; it must never be promoted by a
         // rejection that happens on some later turn (SQ-1295).
         self.heading_displaced = None;
         self.last_heading.take()
+    }
+
+    /// Return and clear the body text [`Self::take_room_heading`] resolved for THIS turn's
+    /// confirmed heading (SQ-1625) — `None` on a turn that confirmed no heading, or confirmed
+    /// one with nothing following it. Must be called AFTER `take_room_heading` for the same
+    /// turn (which is the only thing that ever sets it); [`AppGlk::take_room_description`] is
+    /// the one caller, right after `AppGlk::take_room_heading`.
+    fn take_room_description(&mut self) -> Option<String> {
+        self.last_description.take()
     }
 
     /// Reset what a `glk_window_clear` on this window invalidates: the cursor is
@@ -1139,6 +1231,12 @@ impl StoryScan {
         self.in_heading = false;
         self.heading_acc.clear();
         self.prompt_tail.clear();
+        // SQ-1625: whatever body text was captured before the clear is exactly what the wiped
+        // window just carried away with it — unlike the heading NAME just below (a short, stable
+        // fact `confirm_heading` may still promote here), there is no reliable "body" left to
+        // hand `take_room_description` once the screen it was printed on is gone.
+        self.body_acc.clear();
+        self.capturing_body = false;
         if self.heading_tail == HeadingTail::Line && self.line_rest_disqualifies() {
             self.reject_heading(); // a sentence, not a heading — settle it that way
         } else {
@@ -2954,6 +3052,90 @@ mod heading_tests {
         put(&mut b, GlkStyle::Normal, "\n\nYou stand on a platform. There is a wooden bench, ");
         put(&mut b, GlkStyle::Normal, "a storage locker, and a vending machine.\n\n>");
         assert_eq!(b.take_room_heading(true).as_deref(), Some("Railway Platform"));
+    }
+
+    // ── SQ-1625: the description text joined to a confirmed heading ──────────
+
+    /// The joined case (no blank line): the body may run to many characters, well past
+    /// [`HEADING_TAIL_CAP`]'s 32 — unlike the classification-only `heading_tail_text`, the full
+    /// body is kept. Must be called AFTER `take_room_heading`, on the same drain.
+    #[test]
+    fn a_heading_joined_to_its_description_captures_the_whole_body() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Master's Bedroom\n");
+        put(&mut b, GlkStyle::Normal,
+            "To the west, you could enter the upstairs corridor. A four-poster bed dominates \
+             the room, and moonlight streams in through a tall window overlooking the garden.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Master's Bedroom"));
+        let desc = b.take_room_description();
+        assert_eq!(
+            desc.as_deref(),
+            Some(
+                "To the west, you could enter the upstairs corridor. A four-poster bed dominates \
+                 the room, and moonlight streams in through a tall window overlooking the garden."
+            )
+        );
+    }
+
+    /// The detached case (a blank line, then prose, then the command prompt): the prose between
+    /// the blank line and the prompt is the description, with the prompt itself excluded.
+    #[test]
+    fn a_detached_heading_at_the_command_prompt_captures_its_description() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Railway Platform");
+        put(&mut b, GlkStyle::Normal, "\n\nYou stand on a platform. There is a wooden bench, ");
+        put(&mut b, GlkStyle::Normal, "a storage locker, and a vending machine.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Railway Platform"));
+        assert_eq!(
+            b.take_room_description().as_deref(),
+            Some("You stand on a platform. There is a wooden bench, a storage locker, and a vending machine.")
+        );
+    }
+
+    /// A banner on a keypress page is not a room at all (SQ-0732) — falsified by the discard
+    /// branch alone: revert it to always fall into the confirm branch and this fails by
+    /// returning `Some` instead of `None`.
+    #[test]
+    fn a_rejected_banner_captures_no_description() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Prologue • ACT I • Interlude • Epilogue");
+        put(&mut b, GlkStyle::Normal, " \n\n[Please press any key to continue.]\n");
+        assert_eq!(b.take_room_heading(false), None);
+        assert_eq!(b.take_room_description(), None, "no room means no description either");
+    }
+
+    /// A confirmed heading with nothing at all following it (a superbrief empty room: heading,
+    /// blank line, bare prompt) has no description — an empty body is `None`, not `Some("")`.
+    #[test]
+    fn a_heading_with_nothing_following_it_has_no_description() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "At End Of Road\n");
+        put(&mut b, GlkStyle::Normal, "\n>");
+        assert_eq!(b.take_room_heading(false).as_deref(), Some("At End Of Road"));
+        assert_eq!(b.take_room_description(), None);
+    }
+
+    /// SQ-1625: the map keeps only the MOST RECENT description — a second turn's capture (a LOOK
+    /// after the room changed, or simply the next arrival) must replace the first, never
+    /// accumulate alongside it. Exercises `capturing_body`/`body_acc` actually resetting on drain.
+    #[test]
+    fn a_second_turns_description_replaces_the_first_not_accumulates() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Kitchen\n");
+        put(&mut b, GlkStyle::Normal, "A dark kitchen. You smell gas.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Kitchen"));
+        assert_eq!(b.take_room_description().as_deref(), Some("A dark kitchen. You smell gas."));
+
+        // Next turn: a LOOK re-prints the SAME room with different text (the lamp is now lit).
+        put(&mut b, GlkStyle::Subheader, "Kitchen\n");
+        put(&mut b, GlkStyle::Normal, "A well-lit kitchen. There is a lamp here.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Kitchen"));
+        let desc = b.take_room_description();
+        assert_eq!(desc.as_deref(), Some("A well-lit kitchen. There is a lamp here."));
+        assert!(
+            !desc.unwrap().contains("dark kitchen"),
+            "the previous turn's text must not survive alongside the new one"
+        );
     }
 
     #[test]

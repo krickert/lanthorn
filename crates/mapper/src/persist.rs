@@ -239,6 +239,52 @@ mod tests {
         assert!(m.graph.room(1).unwrap().aliases.is_empty());
     }
 
+    /// SQ-1625: the most recently captured room description, and the turn it was captured on,
+    /// survive a save/load round trip.
+    #[test]
+    fn round_trips_room_description() {
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        m.graph.set_description(1, Some("You are standing in an open field.".to_string()), 3);
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        assert_eq!(
+            m2.graph.room(1).unwrap().description.as_deref(),
+            Some("You are standing in an open field.")
+        );
+        assert_eq!(m2.graph.room(1).unwrap().description_turn, Some(3));
+    }
+
+    /// The map keeps only the MOST RECENT description per room — never an accumulating log — so
+    /// a second capture (a LOOK after something in the room changed) replaces the first outright
+    /// rather than appending to it.
+    #[test]
+    fn setting_a_new_description_overwrites_the_old_one_not_accumulates() {
+        let mut m = Mapper::default();
+        m.observe(1, "Kitchen", None);
+        m.graph.set_description(1, Some("A dark kitchen.".to_string()), 1);
+        m.graph.set_description(1, Some("A now-lit kitchen. There is a lamp here.".to_string()), 5);
+
+        let room = m.graph.room(1).unwrap();
+        assert_eq!(room.description.as_deref(), Some("A now-lit kitchen. There is a lamp here."));
+        assert_eq!(room.description_turn, Some(5));
+        assert!(
+            !room.description.as_ref().unwrap().contains("A dark kitchen"),
+            "the old text must not survive alongside the new one"
+        );
+    }
+
+    /// A map file saved before SQ-1625 has no `description`/`description_turn` fields at all; it
+    /// must load fine with both `None`, the same back-compat shape as `aliases` above.
+    #[test]
+    fn a_pre_sq1625_map_file_has_no_description_field_and_loads_fine() {
+        let old = r#"{"version":1,"rooms":[{"id":1,"name":"Hall","label_override":null,"notes":"","pos":[0,0]}],"connections":[],"current":1}"#;
+        let m = from_json(old).unwrap();
+        let room = m.graph.room(1).unwrap();
+        assert!(room.description.is_none());
+        assert!(room.description_turn.is_none());
+    }
+
     /// SQ-0672: the per-layer "last room visited" memory must survive a save/load round trip, or
     /// a layer switch after a restore would always fall back to the bounding-box centre instead
     /// of the room the player actually last stood on there.
