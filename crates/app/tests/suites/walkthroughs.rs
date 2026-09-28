@@ -142,6 +142,7 @@ fn mid_script_persistence_checks(session: &mut GameSession) {
         Some("Landing site".to_string()),
         None,
         &SessionRecord::empty(),
+        &archive::SaveSource::default(),
     )
     .expect("the @save archive writes");
     let path = dir.join("slot.lanthorn");
@@ -180,6 +181,7 @@ fn mid_script_persistence_checks(session: &mut GameSession) {
             location: Some("Landing site".to_string()),
             score: None,
             trigger: SaveTrigger::HostState,
+            source: archive::SaveSource::default(),
         },
         &SessionRecord::empty(),
         &[],

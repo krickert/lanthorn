@@ -145,6 +145,10 @@ pub fn save_named(
     // and nothing else, which is how the rewind/replay history came to be dropped
     // here — see `SessionRecord` and SQ-1090.
     session: &crate::archive::SessionRecord<'_>,
+    // Which physical copy of the story release this session was booted from
+    // (SQ-1633, informational only — see `archive::SaveSource`); pass
+    // `&state.source`.
+    source: &crate::archive::SaveSource,
 ) -> io::Result<()> {
     let path = named_save_path(game_dir, name)?;
 
@@ -158,6 +162,7 @@ pub fn save_named(
         location,
         score,
         trigger,
+        source: source.clone(),
     };
     // Command history is per-game, not per-slot, so a named save deliberately
     // writes none — and says so by NAME. The rewind/replay history is not covered
@@ -522,6 +527,7 @@ mod tests {
                 command_history: &commands,
                 ..crate::archive::SessionRecord::empty()
             },
+            &crate::archive::SaveSource::default(),
         )
         .expect("save_named");
 
@@ -666,7 +672,7 @@ mod tests {
         mapper.observe(1, "Foyer", None);
 
         let ifid = "ZCODE-1-TEST00-0001";
-        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, None, None, &crate::archive::SessionRecord::empty())
+        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect("save_named ok");
 
         // Path is `<slug>.lanthorn` inside the game dir (no ifid in the name).
@@ -697,7 +703,7 @@ mod tests {
         let dir = make_temp_dir("summary");
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0411";
-        super::save_named(&dir, ifid, "at-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 7, Some("The Troll Room".into()), Some(10), &crate::archive::SessionRecord::empty())
+        super::save_named(&dir, ifid, "at-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 7, Some("The Troll Room".into()), Some(10), &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect("save_named ok");
 
         let saves = super::list_saves(&dir);
@@ -720,7 +726,7 @@ mod tests {
         let ifid = "ZCODE-1-TEST00-0009";
 
         // "Default" slugifies to "default" — reserved for the auto/singleton slot.
-        let err = super::save_named(&dir, ifid, "Default", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty())
+        let err = super::save_named(&dir, ifid, "Default", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect_err("reserved slug must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(!dir.join("default.lanthorn").exists(), "must not clobber the default slot");
@@ -737,7 +743,7 @@ mod tests {
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0011";
 
-        let err = super::save_named(&dir, ifid, "Quick Save", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty())
+        let err = super::save_named(&dir, ifid, "Quick Save", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect_err("reserved slug must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(!dir.join("quick-save.lanthorn").exists(), "must not clobber the quick-save slot");
@@ -758,11 +764,11 @@ mod tests {
             .expect("default save ok");
 
         // Write two named saves.
-        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
         // Small sleep between named saves so timestamps differ, but since we
         // can't sleep in tests, we directly patch the timestamps via the archive
         // — instead, just verify ordering constraint is maintained.
-        super::save_named(&dir, ifid, "save-b", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 20, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "save-b", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 20, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
 
         let saves = super::list_saves(&dir);
         assert_eq!(saves.len(), 3, "should find 3 saves (1 default + 2 named)");
@@ -792,7 +798,7 @@ mod tests {
         let quick_save_path = crate::storage::quick_save_state_path(&dir);
         crate::archive::save_archive(&quick_save_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
             .expect("quick-save ok");
-        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
 
         let saves = super::list_saves(&dir);
         assert_eq!(saves.len(), 3, "should find 3 saves (default + quick-save + 1 named)");
@@ -878,7 +884,7 @@ mod tests {
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0004";
 
-        super::save_named(&dir, ifid, "to-delete", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 5, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "to-delete", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 5, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
         let saves = super::list_saves(&dir);
         assert_eq!(saves.len(), 1);
         let path = saves[0].path.clone();
@@ -900,7 +906,7 @@ mod tests {
         mapper.observe(1, "Foyer", None);
         let ifid = "ZCODE-1-TEST00-0005";
 
-        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, Some("Foyer".into()), Some(7), &crate::archive::SessionRecord::empty())
+        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, Some("Foyer".into()), Some(7), &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect("save_named ok");
         let old_path = dir.join("before-troll.lanthorn");
         assert!(old_path.exists());
@@ -941,7 +947,7 @@ mod tests {
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0006";
 
-        super::save_named(&dir, ifid, "Before Troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty())
+        super::save_named(&dir, ifid, "Before Troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect("save_named ok");
         let path = dir.join("before-troll.lanthorn");
         assert!(path.exists());
@@ -999,8 +1005,8 @@ mod tests {
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0007";
 
-        super::save_named(&dir, ifid, "alpha", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty()).unwrap();
-        super::save_named(&dir, ifid, "beta", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 2, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "alpha", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
+        super::save_named(&dir, ifid, "beta", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 2, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
 
         let alpha_path = dir.join("alpha.lanthorn");
         let err = super::rename_save(&alpha_path, "beta").expect_err("must not clobber an existing save");

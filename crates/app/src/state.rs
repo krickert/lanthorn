@@ -3514,6 +3514,14 @@ pub struct AppState {
     /// title/hint lookup. Empty until set.
     pub ifid: String,
 
+    /// Which physical copy of this story's release this session was booted
+    /// from — the file (and disk-image entry/machine, if any), set once at
+    /// startup alongside `ifid` (SQ-1633). Informational only, for display
+    /// (e.g. "Continue on the Amiga version"): `storage::game_dir`'s
+    /// IFID-keyed grouping of every copy of one release into a single shared
+    /// save folder, and which slot a boot resumes from, never read this.
+    pub source: crate::archive::SaveSource,
+
     /// The per-game storage directory (`<data_base>/<story-key>.save/`) holding
     /// this story's saves and sidecars, including the per-game `style.toml` and
     /// `config.toml` overrides. Set once at startup; empty until then (no
@@ -3967,6 +3975,7 @@ impl Default for AppState {
             title: String::new(),
             pane_title: String::new(),
             ifid: String::new(),
+            source: crate::archive::SaveSource::default(),
             game_dir: std::path::PathBuf::new(),
             show_inventory: false,
             player_obj: None,

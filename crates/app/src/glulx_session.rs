@@ -3553,6 +3553,7 @@ mod tests {
         crate::persist_files::save_named(
             &dir, "GLULX-TEST-0531", "slot", SaveTrigger::Ingame, &mapper::mapper::Mapper::default(),
             &ingame, None, &[], None, None, sess.aux_data(), 3, None, None, &crate::archive::SessionRecord::empty(),
+            &crate::archive::SaveSource::default(),
         )
         .expect("save_named writes the Glulx archive");
         let path = dir.join("slot.lanthorn");

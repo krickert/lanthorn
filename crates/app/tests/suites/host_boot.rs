@@ -335,6 +335,7 @@ fn write_resume_archive(b: &mut BootedStory) {
         location: b.state.current_room_name.clone(),
         score: None,
         trigger: app::archive::SaveTrigger::HostState,
+        source: b.state.source.clone(),
     };
     let screen = app::engine_helpers::zvm_session_opt(&*b.session).map(|z| z.machine.screen.clone());
     app::archive::save_archive_meta_pics(
@@ -366,6 +367,7 @@ fn write_resume_archive_to(b: &mut BootedStory, path: &Path, saved_at: &str) {
         location: b.state.current_room_name.clone(),
         score: None,
         trigger: app::archive::SaveTrigger::HostState,
+        source: b.state.source.clone(),
     };
     let screen = app::engine_helpers::zvm_session_opt(&*b.session).map(|z| z.machine.screen.clone());
     app::archive::save_archive_meta_pics(
@@ -681,6 +683,59 @@ fn resume_source_breaks_a_same_second_tie_toward_the_quick_save() {
     assert_eq!(
         second.resume_source_file, quick_save_path,
         "on an exact same-second tie, the quick save wins"
+    );
+    assert_eq!(here(&second), room_at_quick_save);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SQ-1633: `Meta::source` is informational-only display metadata and must
+/// have ZERO effect on which slot a boot resumes from. Mirrors
+/// `resume_source_breaks_a_same_second_tie_toward_the_quick_save` exactly,
+/// except the two writes carry DIFFERENT (and non-default) `source` values —
+/// the tie-break must still land on the quick save, precisely as it does
+/// with no `source` in play at all.
+#[test]
+fn resume_selection_ignores_source_even_on_a_same_second_tie() {
+    let story = fixture_path("Tangle.z5");
+    if !story.is_file() {
+        eprintln!("SKIP: {} absent", story.display());
+        return;
+    }
+    let home = app::scratch_dir("host-boot-source-ignored-tie");
+    let data_base = home.join("saves");
+
+    let mut first = boot(story.clone(), headless_config(&home), &data_base);
+    play(&mut first, "look");
+    first.state.source = app::archive::SaveSource {
+        story_file: Some("Tangle (copy A).z5".to_string()),
+        disk_entry: None,
+        machine: Some(app::archive::MachineDto::Amiga),
+    };
+    let arc_path = first.arc_file.clone();
+    write_resume_archive_to(&mut first, &arc_path, "2025-06-15T12:00:00Z");
+
+    play(&mut first, "south");
+    let room_at_quick_save = here(&first);
+    first.state.source = app::archive::SaveSource {
+        story_file: Some("Tangle (copy B).z5".to_string()),
+        disk_entry: None,
+        machine: None,
+    };
+    let quick_save_path = first.quick_save_file.clone();
+    write_resume_archive_to(&mut first, &quick_save_path, "2025-06-15T12:00:00Z");
+
+    assert_eq!(
+        resume_source(&first.game_dir),
+        Some(ResumeSlot::QuickSave),
+        "the tie-break must still favour the quick save, exactly as with no source recorded at all"
+    );
+
+    let second = boot(story, headless_config(&home), &data_base);
+    assert!(second.resumed);
+    assert_eq!(
+        second.resume_source_file, quick_save_path,
+        "on an exact same-second tie, the quick save still wins regardless of either slot's source"
     );
     assert_eq!(here(&second), room_at_quick_save);
 

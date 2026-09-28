@@ -167,6 +167,7 @@ fn mid_script_persistence_checks(session: &mut ScottSession) {
             location: Some("damp hollow stump in the swamp".to_string()),
             score: None,
             trigger: SaveTrigger::HostState,
+            source: archive::SaveSource::default(),
         },
         &archive::SessionRecord::empty(),
         &[],

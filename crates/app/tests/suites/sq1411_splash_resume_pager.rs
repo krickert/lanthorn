@@ -203,6 +203,7 @@ fn save_state_archive(path: &Path, mapper: &mapper::mapper::Mapper, session: &Ga
             location: None,
             score: None,
             trigger: SaveTrigger::HostState,
+            source: app::archive::SaveSource::default(),
         },
         &SessionRecord::of(state),
         &pics,

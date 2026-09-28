@@ -809,6 +809,7 @@ fn post_turn_bookkeeping(
             location,
             score,
             trigger: crate::archive::SaveTrigger::HostState,
+            source: state.source.clone(),
         };
         // v6 graphics canvases ride along so a resumed v6 story's pictures redraw
         // (SQ-0516); empty for non-v6 sessions, leaving the archive layout unchanged.
@@ -1648,6 +1649,7 @@ mod tests {
             location: None,
             score: None,
             trigger: crate::archive::SaveTrigger::HostState,
+            source: crate::archive::SaveSource::default(),
         };
         crate::archive::save_archive_meta(
             &arc, &mapper::mapper::Mapper::default(), &save, None,
@@ -1717,6 +1719,7 @@ mod tests {
             location: None,
             score: None,
             trigger: crate::archive::SaveTrigger::HostState,
+            source: crate::archive::SaveSource::default(),
         };
         crate::archive::save_archive_meta_pics(
             &arc, &mapper::mapper::Mapper::default(), &save, Some(&src.machine.screen),
@@ -2161,6 +2164,7 @@ mod tests {
             format_version: crate::archive::CURRENT_FORMAT_VERSION,
             ifid: None, name: None, turns: 1, saved_at: String::new(), location: None, score: None,
             trigger: crate::archive::SaveTrigger::HostState,
+            source: crate::archive::SaveSource::default(),
         };
         crate::archive::save_archive_meta(
             &arc_file, &mapper::mapper::Mapper::default(), &seed_sess.save_state(), None,
@@ -2186,6 +2190,37 @@ mod tests {
         assert!(state.archive_worker.drain_failures().is_empty(), "the auto-save must succeed");
         let after = std::fs::read(&arc_file).unwrap();
         assert_ne!(after, before, "the auto-save actually wrote over the existing slot, silently");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1633: the per-turn auto-save builds its `Meta` inline here, its own
+    /// call site distinct from every other save path — it must carry the
+    /// booted session's `source` too.
+    #[test]
+    fn per_turn_auto_save_names_the_booted_sessions_source_sq1633() {
+        use crate::session::GameSession;
+
+        let dir = crate::scratch_dir("sq1633-per-turn-source");
+        let arc_file = dir.join("default.lanthorn");
+
+        let mut sess = GameSession::new(crate::engine_helpers::tests::read_char_then_save_v4_story(), true, false, None).expect("new");
+        let mut state = crate::state::AppState::default();
+        state.config.auto_save = true;
+        state.source = crate::archive::SaveSource {
+            story_file: Some("zork1-r88-s840726.z3".to_string()),
+            disk_entry: None,
+            machine: None,
+        };
+        let mapper = mapper::mapper::Mapper::default();
+        let result = game_driven_result(None);
+
+        super::post_turn_bookkeeping(&mut state, &mapper, &mut sess, &result, "look", mapper.struct_gen(), "TEST-IFID", &arc_file, &mut crate::engine::TurnSave::default());
+        state.archive_worker.flush();
+        assert!(state.archive_worker.drain_failures().is_empty(), "the auto-save must succeed");
+
+        let meta = crate::archive::read_archive_meta(&arc_file).expect("archive readable");
+        assert_eq!(meta.source, state.source, "the per-turn auto-save must name the booted copy's own source");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

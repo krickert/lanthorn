@@ -61,7 +61,7 @@ fn a_real_glulx_ingame_save_archive_restores_through_the_host_path() {
     app::persist_files::save_named(
         &dir, "GLULX-ADVENT-0556", "slot", SaveTrigger::Ingame, &mapper::mapper::Mapper::default(),
         &ingame, None, &[], None, None, sess.aux_data(), 3, Some(saved_room), None,
-        &app::archive::SessionRecord::empty(),
+        &app::archive::SessionRecord::empty(), &app::archive::SaveSource::default(),
     )
     .expect("the @save archive is written");
     let path = dir.join("slot.lanthorn");

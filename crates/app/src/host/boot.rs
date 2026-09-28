@@ -1741,6 +1741,17 @@ pub fn boot_story(req: BootRequest<'_>, hooks: &mut dyn BootHooks) -> Result<Boo
     state.pane_title =
         crate::session::format_pane_title(&state.title, story_filename, disk_image.is_some());
     state.ifid = ifid.clone();
+    // SQ-1633: which physical copy of this release actually wrote this session's
+    // saves — the file name, the disk-image entry (if any), and the machine the
+    // medium implies (if any). Informational only, for display: `storage::
+    // game_dir`'s IFID-keyed grouping of every copy of a release into one shared
+    // save folder, and resume-slot selection, never read this — see
+    // `archive::SaveSource`'s own doc.
+    state.source = crate::archive::SaveSource {
+        story_file: story_path.file_name().and_then(|n| n.to_str()).map(str::to_string),
+        disk_entry: disk_entry.map(str::to_string),
+        machine: disk_image.and_then(blorb::medium::DiskImage::machine).map(Into::into),
+    };
     state.game_dir = game_dir.clone();
     // Restore the per-game map-panel visibility (SQ-0304): if the user last hid
     // the map for this story, start with it hidden.

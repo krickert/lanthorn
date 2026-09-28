@@ -389,6 +389,7 @@ pub(crate) fn dispatch_slash_outcome(
                     location,
                     score,
                     trigger: app::archive::SaveTrigger::HostState,
+                    source: state.source.clone(),
                 };
                 let result = save_archive_meta_pics(quick_save_file, &*mapper, &session.save_state(), zvm_session_opt(&*session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref())
                     .map(|()| "saved".to_string())
@@ -1094,7 +1095,7 @@ pub(crate) fn write_named_save(
         game_dir, ifid, name, app::archive::SaveTrigger::HostState, mapper, &session.save_state(),
         zvm_session_opt(&*session).map(|z| &z.machine.screen), &v6_pics, v6_display.as_ref(),
         v6_ground.as_deref(), session.aux_data(), state.turns, location, score,
-        &app::archive::SessionRecord::of(state),
+        &app::archive::SessionRecord::of(state), &state.source,
     )
         .map(|()| format!("saved as \"{}\"", name))
         .map_err(|e| format!("save failed: {}", e))
@@ -1577,6 +1578,7 @@ mod debug_dispatch_tests {
             format_version: app::archive::CURRENT_FORMAT_VERSION,
             ifid: None, name: None, turns: 1, saved_at: String::new(), location: None, score: None,
             trigger: app::archive::SaveTrigger::HostState,
+            source: app::archive::SaveSource::default(),
         };
         // Seed BOTH reserved slots so the write can be shown to land in exactly
         // one of them.
@@ -1613,6 +1615,58 @@ mod debug_dispatch_tests {
             after_default, before_default,
             "a bare /save-state must NOT touch the auto-save slot (SQ-1624)"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1633: the bare `/save-state` (quick-save) write builds its `Meta`
+    /// inline in this arm, a separate code path from `write_named_save` below —
+    /// it must carry the booted session's `source` too.
+    #[test]
+    fn slash_save_default_archive_names_its_own_source_sq1633() {
+        let dir = temp_dir("source-quicksave");
+        let mut state = AppState::default();
+        state.source = app::archive::SaveSource {
+            story_file: Some("Beyond Zork (1988)(Infocom).2mg".to_string()),
+            disk_entry: None,
+            machine: Some(app::archive::MachineDto::AppleII),
+        };
+        let mut mapper = Mapper::default();
+        let mut engine = MockEngine { has_debugger: false, aux: BTreeMap::new() };
+        let mut style_watcher: Option<app::watch::StyleWatcher> = None;
+        let arc_file = dir.join("default.lanthorn");
+        let quick_save_file = dir.join("quick-save.lanthorn");
+        let should_break = dispatch_slash_outcome(
+            SlashOutcome::Save(None),
+            &mut state, &mut mapper, &mut engine, &mut style_watcher,
+            &dir, "IFIDTEST", &arc_file, &quick_save_file, &[], &dir,
+            Rect::default(), Rect::default(), false,
+        );
+        assert!(!should_break);
+        let meta = app::archive::read_archive_meta(&quick_save_file).expect("archive readable");
+        assert_eq!(meta.source, state.source, "the quick-save must name the booted copy's own source");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1633: `/save <name>` (`write_named_save`) is a third, separate call
+    /// site from the quick-save arm above and `save_named` itself — it must
+    /// also carry the booted session's `source`.
+    #[test]
+    fn slash_write_named_save_names_its_own_source_sq1633() {
+        let dir = temp_dir("source-named");
+        let mapper = Mapper::default();
+        let mut engine = MockEngine { has_debugger: false, aux: BTreeMap::new() };
+        let mut state = AppState::default();
+        state.source = app::archive::SaveSource {
+            story_file: Some("zork1-r88-s840726.z3".to_string()),
+            disk_entry: None,
+            machine: None,
+        };
+        super::write_named_save(&dir, "IFIDTEST", "checkpoint", &mapper, &mut engine, &mut state)
+            .expect("write succeeds");
+        let meta = app::archive::read_archive_meta(&dir.join("checkpoint.lanthorn")).expect("archive readable");
+        assert_eq!(meta.source, state.source, "a named save must name the booted copy's own source");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

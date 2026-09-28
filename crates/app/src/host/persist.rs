@@ -52,6 +52,7 @@ fn write_save_state(
         location,
         score,
         trigger: crate::archive::SaveTrigger::HostState,
+        source: state.source.clone(),
     };
     let (v6_pics, v6_display, v6_ground, v6_diags) = crate::engine_helpers::v6_save_payload(session);
     for d in &v6_diags {
@@ -150,6 +151,7 @@ pub fn exit_clear_resume_save(
         ifid,
         now_rfc3339(),
         &state.command_history,
+        &state.source,
     ) {
         Ok(()) => ExitSave::Saved,
         Err(e) => ExitSave::Failed(e.to_string()),

@@ -368,6 +368,7 @@ mod tests {
                 location: None,
                 score: None,
                 trigger: app::archive::SaveTrigger::HostState,
+                source: app::archive::SaveSource::default(),
             },
             session: app::archive::SessionRecord::empty().snapshot(),
             pictures: Vec::new(),
@@ -421,6 +422,7 @@ mod tests {
             location: Some("Lab".to_string()),
             score: Some(10),
             trigger: app::archive::SaveTrigger::HostState,
+            source: app::archive::SaveSource::default(),
         };
         let lines = vec!["You are in a lab.".to_string()];
         let kinds = vec![app::state::TranscriptKind::Story];
@@ -502,6 +504,7 @@ mod tests {
                 location: None,
                 score: None,
                 trigger: app::archive::SaveTrigger::HostState,
+                source: app::archive::SaveSource::default(),
             },
             session: app::archive::SessionRecord::empty().snapshot(),
             pictures: Vec::new(),
@@ -519,5 +522,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── SQ-1633: the booted session's source rides along on every exit write ───
+
+    /// `exit_auto_save` delegates to `app::host::persist::write_save_state`,
+    /// which `save_state_now` also shares (see `host::persist`'s own doc) — so
+    /// this one case covers both, rather than being duplicated per caller.
+    #[test]
+    fn exit_auto_save_writes_the_booted_sessions_source_sq1633() {
+        let mut engine = SnapshotableEngine::new();
+        let mut state = app::state::AppState::default();
+        state.config.auto_save = true;
+        state.source = app::archive::SaveSource {
+            story_file: Some("Zork I - The Great Underground Empire.adf".to_string()),
+            disk_entry: None,
+            machine: Some(app::archive::MachineDto::Amiga),
+        };
+        let mapper = mapper::mapper::Mapper::default();
+        let arc_file = std::env::temp_dir().join(format!("bm-sq1633-exit-source-{}.lanthorn", std::process::id()));
+        let _ = std::fs::remove_file(&arc_file);
+
+        super::exit_auto_save(&mut engine, &mapper, &state, "ZCODE-1", &arc_file);
+
+        let meta = app::archive::read_archive_meta(&arc_file).expect("archive readable");
+        assert_eq!(meta.source, state.source, "the exit auto-save must name the booted copy's own source");
+        let _ = std::fs::remove_file(&arc_file);
+    }
+
+    /// The clean-quit clearing write (`write_cleared_resume_archive`) is a
+    /// SEPARATE function from `write_save_state` above — it must carry `source`
+    /// too, not just the ordinary save.
+    #[test]
+    fn exit_clear_resume_save_writes_the_booted_sessions_source_sq1633() {
+        let mut engine = SnapshotableEngine::new();
+        let mut state = app::state::AppState::default();
+        state.config.auto_save = true;
+        state.source = app::archive::SaveSource {
+            story_file: Some("zork1-r88-s840726.z3".to_string()),
+            disk_entry: None,
+            machine: None,
+        };
+        let mapper = mapper::mapper::Mapper::default();
+        let arc_file = std::env::temp_dir().join(format!("bm-sq1633-clear-source-{}.lanthorn", std::process::id()));
+        let _ = std::fs::remove_file(&arc_file);
+
+        super::exit_clear_resume_save(&mut engine, &mapper, &state, "ZCODE-1", &arc_file);
+
+        let meta = app::archive::read_archive_meta(&arc_file).expect("archive readable");
+        assert_eq!(meta.source, state.source, "the clearing write must still name the booted copy's own source");
+        let _ = std::fs::remove_file(&arc_file);
     }
 }

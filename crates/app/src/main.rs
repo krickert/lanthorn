@@ -3917,6 +3917,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     location,
                     score,
                     trigger: app::archive::SaveTrigger::HostState,
+                    source: state.source.clone(),
                 };
                 // v6 graphics canvases ride along (Lane P): empty for non-v6
                 // sessions, so the archive layout is unchanged for them.

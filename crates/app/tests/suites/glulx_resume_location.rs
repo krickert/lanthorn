@@ -79,6 +79,7 @@ fn a_resumed_glulx_game_reports_the_room_it_was_saved_in() {
             location: Some(saved.name.clone()),
             score: None,
             trigger: app::archive::SaveTrigger::HostState,
+            source: app::archive::SaveSource::default(),
         },
         &app::archive::SessionRecord::empty(),
         &[],

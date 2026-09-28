@@ -19,6 +19,8 @@ mod sq1462_hint_echo_contrast;
 
 #[path = "suites/host_boot.rs"]
 mod host_boot;
+#[path = "suites/sq1633_save_source.rs"]
+mod sq1633_save_source;
 #[path = "suites/host_probe.rs"]
 mod host_probe;
 #[path = "suites/host_session.rs"]
