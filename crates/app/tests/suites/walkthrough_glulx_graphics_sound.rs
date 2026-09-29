@@ -122,7 +122,7 @@ use app::glulx_session::GlulxSession;
 use app::hints;
 use app::host::hints::{available, open, HintAvailability};
 use app::ifid::compute_ifid;
-use app::session::{apply_turn, DeathWatch, InputKind, PendingIo, TurnResult};
+use app::session::{apply_item_observations, apply_turn, DeathWatch, InputKind, PendingIo, TurnResult};
 use mapper::mapper::Mapper;
 
 use crate::fixture_paths::fixture_path;
@@ -416,6 +416,7 @@ fn play_full_script(mut session: GlulxSession, commands: &[String]) -> PlayOutco
         transcript.push_str(&result.transcript);
         transcript.push('\n');
         apply_turn(&mut mapper, cmd, &result, &mut death);
+        apply_item_observations(&mut mapper, (i + 1) as u32, &result);
 
         if i + 1 == CHECKPOINT_AFTER_COMMAND {
             mid_script_persistence_checks(&mut session);
@@ -462,6 +463,69 @@ fn anchorhead_walkthrough_reaches_the_sewer_with_no_fault_and_a_populated_map() 
 
     check_restart_reboots();
     check_hints_machinery_agrees(&path, &bytes);
+
+    // ---- SQ-1647: item-tracking sanity (deliberately no exact item list/count pinning —
+    // see the quest; this repo's own `synonym_groups.tsv` precedent is that pinned lines
+    // break on unrelated changes) ----
+    //
+    // Empirically (SQ-1647): the full 629-command partial playthrough tracks 30 distinct
+    // items. A generous floor well under that, not the exact figure, so an unrelated future
+    // script edit doesn't need to touch this assertion — the point is only that item
+    // detection didn't quietly stop working.
+    let items: Vec<_> = outcome.mapper.graph.items().collect();
+    assert!(
+        items.len() > 10,
+        "Anchorhead is a real Inform 7 game with plenty of inventory objects; a partial \
+         playthrough across two days of the town and house should track well over a dozen, got {}",
+        items.len()
+    );
+
+    // SQ-1640 regression, exercised across the WHOLE walkthrough rather than the single-turn
+    // arrival `item_tracking.rs`'s own case covers: the script revisits the Garbage-Choked
+    // Alley repeatedly (`southeast` appears 16 times in anchorhead.txt), so this is a much
+    // longer-running exercise of the same `gvm::objects::ParseNames::is_scenery_or_door`
+    // filter. None of the alley's own reported pure-scenery/backdrop nouns should ever have
+    // entered the registry.
+    let reported_scenery = [
+        "alley entrance doors",
+        "buildings",
+        "cardboard boxes",
+        "garbage can",
+        "ground",
+        "metal ladder",
+        "rain",
+        "sky",
+        "wooden fence",
+    ];
+    for noun in reported_scenery {
+        assert!(
+            !items.iter().any(|(_, r)| r.name.contains(noun)),
+            "{noun:?} is pure scenery/backdrop (SQ-1640) and must never enter the item registry: {:?}",
+            items.iter().map(|(_, r)| r.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    let vanished = items
+        .iter()
+        .filter(|(_, r)| matches!(r.last_seen, mapper::graph::ItemLocation::Vanished { .. }))
+        .count();
+    assert!(
+        vanished * 10 < items.len() * 9,
+        "{vanished} of {} tracked items ended Vanished — that's suspiciously close to \"everything\", \
+         the shape a regression that vanishes on every sweep would produce (empirically this specimen sees \
+         ~47%, the highest of any walkthrough lane — Anchorhead's inventory churns heavily: keys get used, \
+         clothes get changed, tools get consumed)",
+        items.len()
+    );
+    for (key, rec) in &items {
+        if let mapper::graph::ItemLocation::Vanished { room, .. } = rec.last_seen {
+            assert!(
+                outcome.mapper.graph.rooms().any(|r| r.id == room),
+                "item {key} ({:?}) is marked Vanished from room {room}, which the graph never actually mapped",
+                rec.name
+            );
+        }
+    }
 }
 
 #[test]

@@ -81,7 +81,9 @@ use app::ifid::compute_ifid;
 use app::interpreter::InterpreterProfile;
 use app::machine_boot::MachineBoot;
 use app::native_font::FaceSet;
-use app::session::{apply_turn, restore_screen, DeathWatch, GameSession, InputKind, PendingIo, TurnResult};
+use app::session::{
+    apply_item_observations, apply_turn, restore_screen, DeathWatch, GameSession, InputKind, PendingIo, TurnResult,
+};
 use mapper::mapper::Mapper;
 
 fn stories_dir() -> PathBuf {
@@ -434,6 +436,7 @@ fn play_full_script(mut session: GameSession, commands: &[String]) -> PlayOutcom
         transcript.push_str(&result.transcript);
         transcript.push('\n');
         apply_turn(&mut mapper, cmd, &result, &mut death);
+        apply_item_observations(&mut mapper, (i + 1) as u32, &result);
 
         if i + 1 == CHECKPOINT_AFTER_COMMAND {
             mid_script_persistence_checks(&mut session);
@@ -480,6 +483,42 @@ fn zork0_walkthrough_reaches_the_double_fanucci_table_with_no_fault_and_a_popula
 
     check_restart_reboots();
     check_hints_machinery_agrees(&path, &bytes);
+
+    // ---- SQ-1647: item-tracking sanity (deliberately no exact item list/count pinning —
+    // see the quest; this repo's own `synonym_groups.tsv` precedent is that pinned lines
+    // break on unrelated changes) ----
+    //
+    // Empirically (SQ-1647): the full 1266-command partial playthrough tracks 111 distinct
+    // items. A generous floor well under that, not the exact figure, so an unrelated future
+    // script edit doesn't need to touch this assertion — the point is only that item
+    // detection didn't quietly stop working across a v6/graphical game's much bigger object
+    // tree.
+    let items: Vec<_> = outcome.mapper.graph.items().collect();
+    assert!(
+        items.len() > 50,
+        "Zork Zero is a huge, v6 Inform/ZIL-shaped game with plenty of scenery/inventory objects; \
+         a full partial playthrough across most of the castle should track well over 50, got {}",
+        items.len()
+    );
+    let vanished = items
+        .iter()
+        .filter(|(_, r)| matches!(r.last_seen, mapper::graph::ItemLocation::Vanished { .. }))
+        .count();
+    assert!(
+        vanished * 10 < items.len() * 9,
+        "{vanished} of {} tracked items ended Vanished — that's suspiciously close to \"everything\", \
+         the shape a regression that vanishes on every sweep would produce (empirically this specimen sees ~31%)",
+        items.len()
+    );
+    for (key, rec) in &items {
+        if let mapper::graph::ItemLocation::Vanished { room, .. } = rec.last_seen {
+            assert!(
+                outcome.mapper.graph.rooms().any(|r| r.id == room),
+                "item {key} ({:?}) is marked Vanished from room {room}, which the graph never actually mapped",
+                rec.name
+            );
+        }
+    }
 }
 
 #[test]

@@ -69,7 +69,7 @@ use app::host::hints::{available, open, HintAvailability};
 use app::config::Config;
 use app::ifid::compute_ifid;
 use app::scott_session::ScottSession;
-use app::session::{apply_turn, DeathWatch, InputKind, TurnResult};
+use app::session::{apply_item_observations, apply_turn, DeathWatch, InputKind, TurnResult};
 use mapper::mapper::Mapper;
 
 use crate::fixture_paths::fixture_path;
@@ -240,6 +240,7 @@ fn play_full_script(mut session: ScottSession, commands: &[String]) -> PlayOutco
         transcript.push_str(&result.transcript);
         transcript.push('\n');
         apply_turn(&mut mapper, cmd, &result, &mut death);
+        apply_item_observations(&mut mapper, (i + 1) as u32, &result);
 
         if i + 1 == CHECKPOINT_AFTER_COMMAND {
             mid_script_persistence_checks(&mut session);
@@ -293,6 +294,43 @@ fn adventureland_reaches_its_ending_with_no_fault_and_a_sane_mapper_and_hints_st
     );
 
     check_hints_machinery_agrees(&story_path, &bytes);
+
+    // ---- SQ-1647: item-tracking sanity (deliberately no exact item list/count pinning --
+    // see the quest; this repo's own `synonym_groups.tsv` precedent is that pinned lines
+    // break on unrelated changes) ----
+    //
+    // Empirically (SQ-1647): the full ~150-command playthrough tracks 27 distinct items --
+    // Adventureland is a small, sparse Scott Adams database, so the bar here is
+    // deliberately lower than the Z-machine/Glulx specimens'. No scenery-filter check here
+    // (unlike Anchorhead's, below): `is_scenery_or_door` is `gvm`-specific (SQ-1640), and
+    // `crates/scott` has no analogous filter to exercise -- see this quest's report for that
+    // as a possible follow-up, not built here (would be new production scope).
+    let items: Vec<_> = outcome.mapper.graph.items().collect();
+    assert!(
+        items.len() > 10,
+        "Adventureland gives the mapper an item observation every turn; a walkthrough covering \
+         this much of the game should have tracked well over a dozen distinct items, got {}",
+        items.len()
+    );
+    let vanished = items
+        .iter()
+        .filter(|(_, r)| matches!(r.last_seen, mapper::graph::ItemLocation::Vanished { .. }))
+        .count();
+    assert!(
+        vanished * 10 < items.len() * 9,
+        "{vanished} of {} tracked items ended Vanished -- that's suspiciously close to \"everything\", \
+         the shape a regression that vanishes on every sweep would produce (empirically this specimen sees ~19%)",
+        items.len()
+    );
+    for (key, rec) in &items {
+        if let mapper::graph::ItemLocation::Vanished { room, .. } = rec.last_seen {
+            assert!(
+                outcome.mapper.graph.rooms().any(|r| r.id == room),
+                "item {key} ({:?}) is marked Vanished from room {room}, which the graph never actually mapped",
+                rec.name
+            );
+        }
+    }
 }
 
 #[test]

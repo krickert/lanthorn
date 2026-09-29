@@ -33,7 +33,7 @@ use app::engine::Engine;
 use app::hints;
 use app::host::hints::{available, open, HintAvailability};
 use app::ifid::compute_ifid;
-use app::session::{apply_turn, DeathWatch, GameSession, InputKind, PendingIo, TurnResult};
+use app::session::{apply_item_observations, apply_turn, DeathWatch, GameSession, InputKind, PendingIo, TurnResult};
 use mapper::mapper::Mapper;
 
 use crate::fixture_paths::fixture_path;
@@ -316,6 +316,7 @@ fn play_full_script(mut session: GameSession, commands: &[String]) -> PlayOutcom
         transcript.push_str(&result.transcript);
         transcript.push('\n');
         apply_turn(&mut mapper, cmd, &result, &mut death);
+        apply_item_observations(&mut mapper, (i + 1) as u32, &result);
 
         if i + 1 == CHECKPOINT_AFTER_COMMAND {
             mid_script_persistence_checks(&mut session);
@@ -363,6 +364,23 @@ fn photopia_reaches_its_ending_with_no_fault_and_a_sane_mapper_and_hints_state()
 
     check_restart_reboots(&bytes);
     check_hints_machinery_agrees(&story_path, &bytes);
+
+    // ---- SQ-1647: item-tracking sanity (see the module's own quest for why this
+    // deliberately does NOT pin an exact item list/count — this repo's own
+    // `synonym_groups.tsv` precedent is that pinned lines break on unrelated changes) ----
+    //
+    // Photopia gives the mapper no location signal at all (the room-count assertion
+    // above), so `apply_item_observations` never has a room to attach a RoomDirect/
+    // RoomNested sighting to — and this narrative work's minimal object tree gives it no
+    // conventional player-object inventory for a Carried sighting either (checked
+    // empirically, SQ-1647). An empty item registry is therefore the expected, correct
+    // shape here, not a bug, exactly like the empty room graph above.
+    assert_eq!(
+        outcome.mapper.graph.items().count(),
+        0,
+        "Photopia gives the mapper no item signal at all — an empty item registry is the expected shape \
+         here, not a bug; if this ever becomes nonzero, something upstream started detecting items for it"
+    );
 }
 
 #[test]

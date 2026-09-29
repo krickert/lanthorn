@@ -35,7 +35,10 @@ use app::engine::{Engine, StatusField, StatusModel};
 use app::hints;
 use app::host::hints::{available, open, HintAvailability};
 use app::ifid::compute_ifid;
-use app::session::{apply_turn, status_model_from_machine, DeathWatch, GameSession, InputKind, PendingIo, TurnResult};
+use app::session::{
+    apply_item_observations, apply_turn, status_model_from_machine, DeathWatch, GameSession, InputKind, PendingIo,
+    TurnResult,
+};
 use mapper::mapper::Mapper;
 
 use crate::fixture_paths::fixture_path;
@@ -343,6 +346,7 @@ fn play_full_script(mut session: GameSession, commands: &[String]) -> PlayOutcom
         transcript.push_str(&result.transcript);
         transcript.push('\n');
         apply_turn(&mut mapper, cmd, &result, &mut death);
+        apply_item_observations(&mut mapper, (i + 1) as u32, &result);
 
         if i + 1 == CHECKPOINT_AFTER_COMMAND {
             mid_script_persistence_checks(&mut session);
@@ -397,6 +401,41 @@ fn hhgg_reaches_its_ending_with_no_fault_and_a_sane_mapper_and_hints_state() {
 
     check_restart_reboots(&bytes);
     check_hints_machinery_agrees(&story_path, &bytes);
+
+    // ---- SQ-1647: item-tracking sanity (deliberately no exact item list/count pinning —
+    // see the quest; this repo's own `synonym_groups.tsv` precedent is that pinned lines
+    // break on unrelated changes) ----
+    //
+    // Empirically (SQ-1647): the full 600+-command playthrough tracks 106 distinct items.
+    // A generous floor well under that, not the exact figure, so an unrelated future script
+    // edit doesn't need to touch this assertion — the point is only that item detection
+    // didn't quietly stop working.
+    let items: Vec<_> = outcome.mapper.graph.items().collect();
+    assert!(
+        items.len() > 50,
+        "Hitchhiker's is a real Inform-shaped game with plenty of scenery/inventory objects; \
+         a full playthrough should track well over a few dozen, got {}",
+        items.len()
+    );
+    let vanished = items
+        .iter()
+        .filter(|(_, r)| matches!(r.last_seen, mapper::graph::ItemLocation::Vanished { .. }))
+        .count();
+    assert!(
+        vanished * 10 < items.len() * 9,
+        "{vanished} of {} tracked items ended Vanished — that's suspiciously close to \"everything\", \
+         the shape a regression that vanishes on every sweep would produce (empirically this specimen sees ~18%)",
+        items.len()
+    );
+    for (key, rec) in &items {
+        if let mapper::graph::ItemLocation::Vanished { room, .. } = rec.last_seen {
+            assert!(
+                outcome.mapper.graph.rooms().any(|r| r.id == room),
+                "item {key} ({:?}) is marked Vanished from room {room}, which the graph never actually mapped",
+                rec.name
+            );
+        }
+    }
 }
 
 #[test]
