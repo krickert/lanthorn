@@ -13,7 +13,7 @@
 
 use crate::fixture_paths::fixture_path;
 
-use app::engine::{Engine, KeyInput};
+use app::engine::{Engine, Introspect, KeyInput};
 use app::glulx_session::GlulxSession;
 use app::session::GameSession;
 
@@ -43,6 +43,25 @@ fn glulx_image(name: &str) -> Option<Vec<u8>> {
         Ok((blorb::ExecKind::Glulx, data)) => Some(data.to_vec()),
         _ => None,
     }
+}
+
+/// Cragne Manor (various authors, Inform 7 6M62), past its two-step content-warning
+/// gate and its "[press any key to begin]" splash, to the first command prompt at
+/// the Railway Platform.
+fn boot_cragne() -> Option<GlulxSession> {
+    let image = glulx_image("cragne.gblorb")?;
+    let mut s = GlulxSession::new(image, 80, 24, true, false, false, (1.0, 1.0), None, &[]).ok()?;
+    for _ in 0..6 {
+        if s.pending_input() != app::session::InputKind::Char {
+            break;
+        }
+        s.submit_key(KeyInput::Enter);
+    }
+    for cmd in ["yes", "yes"] {
+        s.submit(cmd);
+    }
+    s.submit_key(KeyInput::Enter);
+    Some(s)
 }
 
 /// Counterfeit Monkey (Inform 7 6M62, IF Archive release 10 / SQ-1454) past its "Can you hear
@@ -406,4 +425,206 @@ fn glulx_item_observations_prefers_the_set_player_hint_over_the_unidentifiable_r
         "the excluded object was really among the previously-listed ones, not a coincidental \
          absence: before {without_hint:?}, after {after:?}"
     );
+}
+
+// ── Cragne Manor and King of Shreds and Patches (SQ-1639) ────────────────────
+//
+// Broadened Glulx real-game coverage beyond Counterfeit Monkey — two games with
+// meaningfully different world models: a many-author patchwork built on Inform 7's
+// ordinary containment library (Cragne Manor), and an older Inform 6.31-library
+// game whose room global takes many turns of movement for `glulx_roomlock` to
+// disambiguate from the other RAM words that also change every turn (King of
+// Shreds and Patches).
+//
+// Between them: origin room/turn recorded correctly and current location tracked
+// across take/drop (King of Shreds and Patches — Cragne's own avatar turns out to
+// be unidentifiable, the same shape CM's already-pinned refusal is, so its own
+// case below pins THAT instead of fabricating tracking that cannot happen); and
+// the container-vs-vanished distinction, at its most extreme version (Cragne's
+// vending machine) — a Glulx item nested inside a container is never observed at
+// all while it stays there (see `GlulxSession::glulx_item_observations`'s own doc:
+// "this format has no way to tell an OPEN container from a closed one at all"),
+// which is what makes it structurally impossible for such an item to ever misread
+// as Vanished: `note_items_absent` only ever retires a record that was ONCE
+// directly sighted, and this one never was until it is taken.
+
+/// Cragne Manor: **another unidentifiable-avatar refusal** (SQ-1639 finding,
+/// same shape `glulx_inventory.rs`'s `counterfeit_monkey_refuses_an_avatar_it_cannot_identify`
+/// already pins for CM) — `Introspect::player_object()` answers `None` here too
+/// (checked directly before writing this test), so `glulx_item_observations`'s
+/// `Carried` loop never runs at all: while the watch is actually held, the
+/// tracker reports it as nothing at all rather than fabricating a false
+/// `Carried`. Dropping it back in the open room the watch is genuinely
+/// relocated INTO (Inform moves a held object to be the room's own direct
+/// child, not back onto the bench it came from), so it becomes visible again
+/// on its own merits — a real `RoomDirect` sighting, with no avatar handle
+/// involved at all, not a guess.
+#[test]
+fn cragne_wristwatch_take_and_drop_are_silently_untracked_with_an_unidentifiable_avatar() {
+    let Some(mut s) = boot_cragne() else {
+        eprintln!("SKIP: gitignored stories/cragne.gblorb missing");
+        return;
+    };
+    assert!(
+        s.introspect().expect("Cragne's object list reads perfectly").player_object().is_none(),
+        "premise: Cragne's avatar is not identifiable from the image, same shape as CM"
+    );
+
+    let taken = s.submit("take wristwatch");
+    assert!(taken.transcript.contains("Taken"), "the real success text: {:?}", taken.transcript);
+    assert!(
+        !taken.items.iter().any(|i| i.location == app::session::ObservedItemLocation::Carried),
+        "no avatar handle to read contents() from, so nothing is ever reported Carried: {:?}",
+        taken.items
+    );
+
+    // Dropped back in the SAME room, the watch becomes a genuine ROOM child —
+    // Inform relocates it to the room directly, not back onto the bench it came
+    // from — so it now reaches `room_objects_excluding` on its own merits, with
+    // no avatar involved at all: this is `RoomDirect`, never a fabricated
+    // `Carried` the tracker had no way to see.
+    let dropped = s.submit("drop wristwatch");
+    assert!(dropped.transcript.contains("Dropped"), "the real success text: {:?}", dropped.transcript);
+    let watch = dropped
+        .items
+        .iter()
+        .find(|i| i.name.contains("wristwatc"))
+        .expect("dropped in the open, the watch is now a real, visible room object");
+    assert_eq!(
+        watch.location,
+        app::session::ObservedItemLocation::RoomDirect,
+        "a genuine room sighting, not a guessed Carried: {:?}",
+        dropped.items
+    );
+}
+
+/// Cragne Manor: the plastic bubble inside the (locked, unopenable-by-the-player-
+/// at-this-point) vending machine is never a candidate for Vanished, because it is
+/// never observed in the first place — confirmed against the real game first
+/// (`take bubble` refuses with "The vending machine isn't open", and the bubble
+/// never appears in `result.items` on any turn up to and including that refusal).
+/// `note_items_absent` can only retire a record it has already created from a
+/// direct sighting, so an item Glulx's containment walk never reaches cannot be
+/// misclassified as vanished — it is simply never in the registry to begin with.
+#[test]
+fn cragne_nested_bubble_is_never_tracked_and_therefore_never_reads_as_vanished() {
+    let Some(mut s) = boot_cragne() else {
+        eprintln!("SKIP: gitignored stories/cragne.gblorb missing");
+        return;
+    };
+    let mut mapper = mapper::mapper::Mapper::default();
+    let mut turn = 0u32;
+    let mut drive = |s: &mut GlulxSession, mapper: &mut mapper::mapper::Mapper, cmd: &str| {
+        let r = s.submit(cmd);
+        turn += 1;
+        app::session::apply_turn(mapper, cmd, &r, &mut Default::default());
+        app::session::apply_item_observations(mapper, turn, &r);
+        r
+    };
+
+    let examined = drive(&mut s, &mut mapper, "examine vending machine");
+    assert!(examined.transcript.contains("plastic bubble"), "premise: the game names it in prose: {:?}", examined.transcript);
+    assert!(
+        !examined.items.iter().any(|i| i.name.contains("bubble")),
+        "the bubble never reaches result.items while nested in the closed machine: {:?}",
+        examined.items
+    );
+
+    let refused = drive(&mut s, &mut mapper, "take bubble");
+    assert!(refused.transcript.contains("isn't open"), "the real refusal text: {:?}", refused.transcript);
+    assert!(
+        !refused.items.iter().any(|i| i.name.contains("bubble")),
+        "still never observed after the refused take: {:?}",
+        refused.items
+    );
+
+    // Never entered the registry at all — not merely absent from the CURRENT
+    // turn's observations, but never created as a record in the first place.
+    let names: Vec<String> = mapper.graph.items().map(|(_, rec)| rec.name.to_lowercase()).collect();
+    assert!(!names.iter().any(|n| n.contains("bubble")), "no Vanished record either, because no record at all: {names:?}");
+}
+
+/// King of Shreds and Patches (Jimmy Maher, Inform 7 6M62/6.31): a meaningfully
+/// OLDER Inform library than Counterfeit Monkey's, and one whose room global
+/// `glulx_roomlock` needs several round trips through a door to disambiguate from
+/// the other RAM words that also change every turn — confirmed empirically
+/// (`room_objects_excluding` answers empty until then) before writing this test,
+/// which drives exactly that many turns before checking anything. The title menu
+/// wants `S` (start without the tutorial), not a bare keypress.
+#[test]
+fn kosap_walking_stick_origin_and_current_location_track_across_take_and_drop() {
+    let path = fixture_path("King_of_Shreds_and_Patches.gblorb");
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("SKIP: gitignored stories/King_of_Shreds_and_Patches.gblorb missing at {}", path.display());
+        return;
+    };
+    let Ok(b) = blorb::Blorb::parse(bytes) else {
+        eprintln!("SKIP: King_of_Shreds_and_Patches.gblorb did not parse as a Blorb");
+        return;
+    };
+    let Ok((blorb::ExecKind::Glulx, image)) = b.executable() else {
+        eprintln!("SKIP: King_of_Shreds_and_Patches.gblorb carries no Glulx executable");
+        return;
+    };
+    let mut s = GlulxSession::new(image.to_vec(), 80, 24, true, false, false, (1.0, 1.0), None, &[])
+        .expect("GlulxSession::new");
+    s.submit_key(KeyInput::Char('s')).expect("'s' starts the story without the tutorial");
+
+    let mut mapper = mapper::mapper::Mapper::default();
+    let mut turn = 0u32;
+    let mut drive = |s: &mut GlulxSession, mapper: &mut mapper::mapper::Mapper, cmd: &str| {
+        let r = s.submit(cmd);
+        turn += 1;
+        app::session::apply_turn(mapper, cmd, &r, &mut Default::default());
+        app::session::apply_item_observations(mapper, turn, &r);
+        r
+    };
+
+    // Walk out the door and back several times, purely to give the room-lock
+    // learner enough distinct movement to resolve the `location` global — no
+    // assertion depends on what happens on any of these turns.
+    let mut last = None;
+    for _ in 0..8 {
+        drive(&mut s, &mut mapper, "north");
+        last = Some(drive(&mut s, &mut mapper, "south"));
+    }
+    let home = last.unwrap();
+    assert_eq!(
+        home.location.as_ref().map(|l| l.name.as_str()),
+        Some("Fletcher's Printworks"),
+        "premise: back home after the walk"
+    );
+
+    let taken = drive(&mut s, &mut mapper, "take walking stick");
+    assert!(taken.transcript.contains("Taken"), "the real success text: {:?}", taken.transcript);
+    let printworks_room = taken.location.as_ref().expect("still at the printworks").number;
+    let stick_key = taken
+        .items
+        .iter()
+        .find(|o| o.name.contains("walking") && o.name.contains("stick"))
+        .expect("the walking stick is observed the moment it is carried")
+        .key;
+    let rec = mapper.graph.item(stick_key).unwrap();
+    assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Carried);
+    assert_eq!(rec.origin_room, printworks_room, "origin is Fletcher's Printworks, where it was first observed");
+    let pick_up_turn = rec.carried_since_turn.expect("just picked up");
+
+    let dropped = drive(&mut s, &mut mapper, "drop walking stick");
+    assert!(dropped.transcript.contains("Dropped"), "the real success text: {:?}", dropped.transcript);
+    let rec = mapper.graph.item(stick_key).unwrap();
+    assert_eq!(rec.origin_room, printworks_room, "origin never moves");
+    assert_eq!(
+        rec.last_seen,
+        mapper::graph::ItemLocation::Room { room: printworks_room, direct: true, container: None },
+        "dropped back in the same room — a direct sighting again"
+    );
+    assert_eq!(rec.carried_since_turn, None, "dropping it clears the pick-up turn");
+
+    // Taking it right back up re-confirms Carried with a FRESH pick-up turn, not
+    // the stale one from before the drop.
+    let retaken = drive(&mut s, &mut mapper, "take walking stick");
+    assert!(retaken.transcript.contains("Taken"), "the real success text: {:?}", retaken.transcript);
+    let rec = mapper.graph.item(stick_key).unwrap();
+    assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Carried);
+    assert_ne!(rec.carried_since_turn, Some(pick_up_turn), "a fresh pick-up turn, not the one from before the drop");
 }

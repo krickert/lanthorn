@@ -1959,6 +1959,10 @@ impl GlulxSession {
         let display = self.appglk().display_snapshot();
         let kept_diagnostics = self.machine.take_diagnostics();
         self.drop_world_caches();
+        // SQ-1639: this "look" is exactly the same shape as a real command line —
+        // see `AppGlk::begin_command_line`'s own doc for why the read prompt this
+        // turn ended on would otherwise sink the heading it is here to find.
+        self.appglk().begin_command_line();
         self.machine.supply_line("look");
         let stopped = drive_auto(&mut self.machine, &self.store, self.turn_budget);
         self.machine.flush();
@@ -2527,6 +2531,10 @@ impl Engine for GlulxSession {
                 let code = key_to_glk(key).expect("Char and Enter always map to a Glk code");
                 self.machine.supply_char(code);
             } else {
+                // SQ-1639: see `AppGlk::begin_command_line`'s own doc — a real
+                // command line is about to run, and the bare ">" the last turn
+                // ended on left every scan thinking it is still mid-line.
+                self.appglk().begin_command_line();
                 self.machine.supply_line(command);
             }
             self.drive_turn();

@@ -833,6 +833,36 @@ impl AppGlk {
         self.primary_scan().is_some_and(|s| s.ends_at_read_prompt())
     }
 
+    /// Mark every window as though a fresh display line has just begun — called
+    /// once, right before a player's typed COMMAND (a line of input) reaches the
+    /// story (SQ-1639).
+    ///
+    /// The read prompt a turn ends on is a bare `">"`, never followed by the
+    /// story's own newline — so `StoryScan::at_line_start` is left `false` when
+    /// that turn's drain settles, and stays `false` into the next one. A real
+    /// terminal always shows the player's own line and their Enter key as a
+    /// newline right there, even though neither ever reaches `put_text`; without
+    /// this, a story whose next room print does not ALSO lead with its own blank
+    /// line — Anchorhead reprints "Outside the Real Estate Office" on a bare
+    /// `look` with no leading `\n` at all, unlike the Inform 7 library's own
+    /// room-name rule — has that very heading's `Subheader` run graded as
+    /// beginning MID-LINE, the same test that correctly ignores an inline
+    /// hyperlink (`capture_heading`'s own doc). `heading_acc` never opens,
+    /// `last_heading` never gets set, and every LOOK after the first loses both
+    /// the heading and the SQ-1625 body paired with it — not merely one game's
+    /// quirk: any story that omits that leading blank line hits this the moment
+    /// a second command reprints its heading.
+    ///
+    /// Not called for a bare keypress (`submit_key`/char-input turns): those
+    /// deliberately keep whatever a banner/cutscene page left behind
+    /// (SQ-0732/SQ-0733's own detached-tail handling already covers that
+    /// boundary), and forcing it here too is no part of what this fix is for.
+    pub fn begin_command_line(&mut self) {
+        for scan in self.scans.values_mut() {
+            scan.at_line_start = true;
+        }
+    }
+
     /// Return and clear the last `Subheader` room heading the STORY window
     /// captured since the previous call, applying the banner test below to it.
     /// Drained once per turn, alongside `take_transcript`.
