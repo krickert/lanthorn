@@ -45,6 +45,9 @@ while any such tag, or this Unreleased section, still exists.*
   elsewhere in the game — where it was last seen, and whether it's fixed in
   place — under what you're currently carrying, and both lists can be
   searched with a new `filter-items` command.
+- Tracked items with no formal in-game name now show a real word from the
+  story's own text — spelled out in full, not cut off mid-word — instead of
+  a run-on string listing every word the parser would have accepted for them.
 
 ## v0.8.1 — 2026-09-29
 

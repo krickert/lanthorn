@@ -725,11 +725,13 @@ pub struct TurnResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemObservation {
     pub key: mapper::graph::ItemKey,
-    /// What to SHOW the player for this item — [`grammar_model::ObjectWords::display_name`],
-    /// never the possibly-empty raw printed name alone (SQ-1631 Fix 1): an Inform 7 object
-    /// routinely has no hardware short name at all, only the parse words a `display_name` falls
-    /// back to, and a filter on the bare printed name drops every one of them (SQ-1042, the exact
-    /// bug this mirrors — see [`crate::render::room_info::list_room_objects_excluding`]'s own doc).
+    /// What to SHOW the player for this item — [`item_tracker_display_name`] (SQ-1648), never the
+    /// possibly-empty raw printed name alone (SQ-1631 Fix 1): an Inform 7 object routinely has no
+    /// hardware short name at all, only the parse words that function falls back to, and a filter
+    /// on the bare printed name drops every one of them (SQ-1042, the exact bug this mirrors — see
+    /// [`crate::render::room_info::list_room_objects_excluding`]'s own doc). Deliberately NOT
+    /// [`grammar_model::ObjectWords::display_name`] directly — see [`item_tracker_display_name`]'s
+    /// own doc for why a tracker needs a single word, not that method's whole joined list.
     pub name: String,
     pub location: ObservedItemLocation,
     /// The SAME [`grammar_model::ObjectWords`] this observation's `name`/`key` were read off of
@@ -2100,8 +2102,9 @@ impl GameSession {
         let description = zvm_room_description(&self.machine, &transcript, location.as_ref());
         // SQ-1627: unlike `description`, this is a direct object-tree query, not a transcript
         // heuristic — it works the same for a v6 game as any other version (see the helper's own
-        // doc for why no gate is needed here).
-        let items = self.zvm_item_observations(location.as_ref());
+        // doc for why no gate is needed here). SQ-1648: this turn's own `transcript` is passed
+        // through as the tier-1 evidence `item_tracker_display_name` prefers.
+        let items = self.zvm_item_observations(location.as_ref(), &transcript);
 
         let diagnostics = self.machine.take_diagnostics();
         let fault = self.machine.take_fault_trace().map(|t| t.to_lines());
@@ -4702,6 +4705,62 @@ fn take_command_target(cmd: &str, vocab: Option<&crate::vocab::StoryVocabulary>)
     None
 }
 
+/// What to call an item with no printed name, for [`ItemObservation::name`] ONLY (SQ-1648) —
+/// never a substitute for [`grammar_model::ObjectWords::display_name`] itself, whose other callers
+/// (autocomplete, room-object listings) genuinely need every parser-acceptable word and must keep
+/// calling that method directly.
+///
+/// `display_name` joins every known word into one run-on string when there is no printed name
+/// ("proprieto men old portly shopkeepe man himself person" for Anchorhead's shopkeeper) — correct
+/// for a caller composing what the parser will accept, unusable as one item's name in a tracker
+/// panel, and it also leaves a Glulx dictionary word exactly as truncated (`proprieto`,
+/// `shopkeepe`), never spelled out.
+///
+/// Two tiers, in the object's own word order (`ow.words`), which the tier-2 fallback below also
+/// prefers first — solving both problems at once with the same underlying idea `vocab.rs`'s
+/// `spell_out`/`spell` (SQ-1553) already established: **what the player has just read wins**.
+///
+/// 1. The first of `ow.words` this turn's own printed text (`prose`) has actually used — matched
+///    with the same truncation comparison [`grammar_model::ObjectWords::refers_to`] applies (a
+///    prose word doesn't need to spell a stored dictionary key exactly, it needs to TRUNCATE to
+///    it), so the untruncated prose spelling is returned and the truncation problem is solved for
+///    free: `prose` containing "proprietor" resolves Anchorhead's shopkeeper to `"proprietor"`,
+///    not the stored `"proprieto"`.
+/// 2. No word in `prose` matches (rare — an item observed some other way before any prose named
+///    it): the FIRST of `ow.words`, unspelled. Checked against Anchorhead's own registry before
+///    picking first-over-last: every sampled case had its real name as the FIRST stored word
+///    (Inform 7 compiles an object's own declared name before any `understand ... as name`
+///    synonyms) — `"universit rooftops things …"` is Miskatonic University, `"trenchcoa player's
+///    holdalls …"` is the trenchcoat, never the last word in either list.
+pub(crate) fn item_tracker_display_name(
+    ow: &grammar_model::ObjectWords,
+    prose: &str,
+) -> Option<String> {
+    if !ow.printed_name.is_empty() {
+        return Some(ow.printed_name.clone());
+    }
+    if ow.words.is_empty() {
+        return None;
+    }
+    let prose_words: Vec<String> = prose
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|w| w.to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for stored in &ow.words {
+        // Mirrors `ObjectWords::truncate` (private to `grammar_model`): a stored word is already
+        // cut to `truncated_at` characters, so a prose word names it when IT truncates to match.
+        let found = prose_words.iter().find(|w| match ow.truncated_at {
+            Some(n) => w.chars().take(n).collect::<String>() == *stored,
+            None => *w == stored,
+        });
+        if let Some(w) = found {
+            return Some(w.clone());
+        }
+    }
+    Some(ow.words[0].clone())
+}
+
 /// Whether `noun` (already lower-cased by [`take_command_target`]) names `words` (SQ-1631 Fix 2):
 /// every word of `noun`, minus an article, must be one [`grammar_model::ObjectWords::refers_to`]
 /// — the parser's own matching rule for this exact object — answers `true` for. Replaces a
@@ -5873,7 +5932,7 @@ impl Engine for GameSession {
         let transcript = if transcript_elems.is_empty() { self.take_transcript() } else { String::new() };
         let location = self.current_location();
         let description = zvm_room_description(&self.machine, &transcript, location.as_ref());
-        let items = self.zvm_item_observations(location.as_ref());
+        let items = self.zvm_item_observations(location.as_ref(), &transcript);
         TurnResult {
             transcript,
             transcript_elems,
@@ -6419,7 +6478,7 @@ impl GameSession {
     /// what moved between rooms, and bypassing that hint both under-populates carried items for such a
     /// story and risks leaving the player's own object unexcluded from "what's directly in this room"
     /// (the SQ-0667 hazard, reintroduced).
-    fn zvm_item_observations(&self, location: Option<&LocationInfo>) -> Vec<ItemObservation> {
+    fn zvm_item_observations(&self, location: Option<&LocationInfo>, prose: &str) -> Vec<ItemObservation> {
         let mut out = Vec::new();
         let names = self.parse_names();
         let player_obj = self
@@ -6435,10 +6494,11 @@ impl GameSession {
                     .collect::<Vec<_>>();
                 let direct_ids: std::collections::BTreeSet<u32> = direct.iter().map(|o| o.id).collect();
                 for o in &direct {
-                    // SQ-1631 Fix 1: `display_name`, not the raw printed name alone — see
+                    // SQ-1631 Fix 1: a display name, not the raw printed name alone — see
                     // `list_room_objects_excluding`'s own doc for why filtering on the bare printed
-                    // name drops every Inform 7 object.
-                    let Some(name) = o.display_name() else {
+                    // name drops every Inform 7 object. SQ-1648: `item_tracker_display_name`, not
+                    // `display_name` directly — see that function's own doc for why.
+                    let Some(name) = item_tracker_display_name(o, prose) else {
                         continue; // nothing a panel could show, nothing a player could type
                     };
                     out.push(ItemObservation {
@@ -6461,7 +6521,7 @@ impl GameSession {
                     if direct_ids.contains(&o.id) {
                         continue;
                     }
-                    let Some(name) = o.display_name() else {
+                    let Some(name) = item_tracker_display_name(&o, prose) else {
                         continue;
                     };
                     // SQ-1632 Fix 5: a "nested" sighting the visibility walk reached is not
@@ -6484,7 +6544,7 @@ impl GameSession {
         }
         if let Some(p) = player_obj {
             for o in crate::inventory::list_inventory(&self.machine.mem, names, p) {
-                let Some(name) = o.display_name() else {
+                let Some(name) = item_tracker_display_name(&o, prose) else {
                     continue;
                 };
                 out.push(ItemObservation { key: o.id, name, location: ObservedItemLocation::Carried, words: o });
@@ -11539,5 +11599,86 @@ mod item_observation_tests {
             "resolves to the real sword (object 10) by its own parser words, never object 11 whose \
              printed name merely contains the word"
         );
+    }
+
+    // ── item_tracker_display_name (SQ-1648) ─────────────────────────────────────
+
+    /// A no-printed-name object with `truncated_at` set, mirroring a real Glulx dictionary entry —
+    /// e.g. Anchorhead's shopkeeper, stored `"proprieto"` among its other words.
+    fn no_name_object(words: &[&str], truncated_at: Option<usize>) -> grammar_model::ObjectWords {
+        grammar_model::ObjectWords::new(
+            1,
+            String::new(),
+            words.iter().map(|w| w.to_string()).collect(),
+            None,
+            truncated_at,
+        )
+    }
+
+    #[test]
+    fn item_tracker_display_name_prefers_the_printed_name_when_there_is_one() {
+        let ow = grammar_model::ObjectWords::new(1, "brass lantern".to_string(), vec!["lantern".to_string()], None, None);
+        assert_eq!(item_tracker_display_name(&ow, "You are in a dark room."), Some("brass lantern".to_string()));
+    }
+
+    #[test]
+    fn item_tracker_display_name_none_when_the_story_holds_no_text_at_all() {
+        let ow = grammar_model::ObjectWords::new(1, String::new(), Vec::new(), None, None);
+        assert_eq!(item_tracker_display_name(&ow, "anything"), None);
+    }
+
+    /// Tier 1's core case: several known words, none a printed name, and the turn's own prose has
+    /// used one of them — that word wins, not the joined list `display_name` would have produced.
+    #[test]
+    fn item_tracker_display_name_picks_the_word_the_turns_prose_actually_used() {
+        let ow = no_name_object(&["old", "portly", "man", "person"], None);
+        let prose = "An old, portly man stands behind the counter, eyeing you suspiciously.";
+        assert_eq!(
+            item_tracker_display_name(&ow, prose),
+            Some("old".to_string()),
+            "the first of ow.words with a match, not the whole joined list"
+        );
+    }
+
+    /// Truncation resolved for free: the stored word is Glulx's own 9-character-truncated
+    /// `"proprieto"`, and the turn's prose spells the whole word `"proprietor"` — the truncated
+    /// comparison recognises the match and returns the FULL prose spelling, not the stored key.
+    #[test]
+    fn item_tracker_display_name_spells_out_a_truncated_word_from_this_turns_prose() {
+        let ow = no_name_object(&["proprieto", "men", "old", "portly", "shopkeepe", "man"], Some(9));
+        let prose = "The proprietor eyes you with open suspicion.";
+        assert_eq!(item_tracker_display_name(&ow, prose), Some("proprietor".to_string()));
+    }
+
+    /// The FIRST of `ow.words` with a prose match wins, in the object's own stored order, not
+    /// merely the first prose occurrence of any known word.
+    #[test]
+    fn item_tracker_display_name_prefers_the_earliest_stored_word_with_a_match() {
+        let ow = no_name_object(&["shopkeeper", "man", "person"], None);
+        // "man" appears in the prose before "shopkeeper" does, but "shopkeeper" is earlier in
+        // ow.words, so it wins.
+        let prose = "A man stands behind the counter. The shopkeeper glares.";
+        assert_eq!(item_tracker_display_name(&ow, prose), Some("shopkeeper".to_string()));
+    }
+
+    /// Tier 2: nothing in this turn's prose matches any known word — falls back to the FIRST of
+    /// `ow.words`, unspelled, never the whole joined list.
+    #[test]
+    fn item_tracker_display_name_falls_back_to_the_first_stored_word_with_no_prose_match() {
+        let ow = no_name_object(&["universit", "rooftops", "things", "rooftop", "roof"], Some(9));
+        assert_eq!(
+            item_tracker_display_name(&ow, "You are standing in a quiet street."),
+            Some("universit".to_string()),
+            "no textual evidence this turn: the first stored word, not the whole list"
+        );
+    }
+
+    /// Case-insensitivity: the prose capitalises a sentence-initial word, the stored dictionary
+    /// key is lower-case — the match still fires (and the returned spelling is lower-cased, same
+    /// as every other stored word this tracker shows).
+    #[test]
+    fn item_tracker_display_name_matches_case_insensitively() {
+        let ow = no_name_object(&["trenchcoat", "coat"], None);
+        assert_eq!(item_tracker_display_name(&ow, "Trenchcoat pockets bulge with odds and ends."), Some("trenchcoat".to_string()));
     }
 }

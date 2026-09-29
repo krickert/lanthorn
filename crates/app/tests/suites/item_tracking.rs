@@ -507,8 +507,18 @@ fn cragne_wristwatch_take_and_drop_are_silently_untracked_with_an_unidentifiable
     let watch = dropped
         .items
         .iter()
-        .find(|i| i.name.contains("wristwatc"))
+        .find(|i| i.words.refers_to("wristwatch"))
         .expect("dropped in the open, the watch is now a real, visible room object");
+    // SQ-1648: the bare "Dropped." transcript gives tier 1 no textual evidence, so this falls to
+    // tier 2's first-stored-word fallback — `ow.words` here is `["nah-watch", "things", "watch",
+    // "gold", "wristwatc"]`, and `"nah-watch"` (Cragne Manor's own internal per-object kind tag,
+    // a collaborative-authorship-jam artifact this game apparently compiles into `name` ahead of
+    // any human-facing word — Anchorhead carries no such prefix, and every word sampled there had
+    // its real name first) is what tier 2 picks. Uglier than the old whole-list join would have
+    // shown by luck (its `.contains("wristwatc")` still matched because `"wristwatc"` was buried
+    // in the list too), but still a single real, typeable parser word — not the eight-word
+    // run-on string, and never a guess.
+    assert_eq!(watch.name, "nah-watch");
     assert_eq!(
         watch.location,
         app::session::ObservedItemLocation::RoomDirect,
@@ -616,13 +626,17 @@ fn kosap_walking_stick_origin_and_current_location_track_across_take_and_drop() 
 
     let taken = drive(&mut s, &mut mapper, "take walking stick");
     assert!(taken.transcript.contains("Taken"), "the real success text: {:?}", taken.transcript);
-    let printworks_room = taken.location.as_ref().expect("still at the printworks").number;
-    let stick_key = taken
+    let stick = taken
         .items
         .iter()
-        .find(|o| o.name.contains("walking") && o.name.contains("stick"))
-        .expect("the walking stick is observed the moment it is carried")
-        .key;
+        .find(|o| o.words.refers_to("stick"))
+        .expect("the walking stick is observed the moment it is carried");
+    // SQ-1648: the bare "Taken." transcript gives tier 1 no textual evidence, so this falls to
+    // tier 2's first-stored-word fallback — `ow.words` is `["walking", "stick", "cane"]`, and
+    // "walking" wins. A single real, typeable parser word, not the old three-word join.
+    assert_eq!(stick.name, "walking");
+    let printworks_room = taken.location.as_ref().expect("still at the printworks").number;
+    let stick_key = stick.key;
     let rec = mapper.graph.item(stick_key).unwrap();
     assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Carried);
     assert_eq!(rec.origin_room, printworks_room, "origin is Fletcher's Printworks, where it was first observed");
@@ -693,6 +707,114 @@ fn anchorhead_garbage_choked_alley_excludes_its_own_pure_scenery_nouns() {
     }
 }
 
+// ── SQ-1648: a no-printed-name item's display name prefers a word the turn's own prose used ──
+//
+// The reported defect: an object with no hardware short name (the ordinary Inform 7 case) showed
+// up in `result.items` either as every one of its parser words joined into one run-on string
+// (`ObjectWords::display_name()`'s designed behaviour for its OTHER callers, wrong for a
+// tracker's single-item display) or, worse, as Glulx's own 9-character-truncated dictionary
+// fragment verbatim (`"proprieto"` for "proprietor"). Confirmed against the real
+// `stories/Anchorhead.gblorb` (Illustrated Edition) before writing the fix, and again here:
+// replaying the committed walkthrough script (`anchorhead.txt`) up to its own "south" into the
+// Curiosity Shop (turn 210), the proprietor arrives as `ObjectWords { printed_name: "", words:
+// ["proprieto", "men", "old", "portly", "shopkeepe", "man", "himself", "person"], .. }` — and the
+// room's own arrival prose says "The proprietor watches you quietly from behind the display
+// case," which is exactly the textual evidence tier 1 of `item_tracker_display_name` uses.
+
+/// The committed walkthrough script, trimmed the same way `walkthrough_glulx_graphics_sound.rs`'s
+/// own `read_script` does.
+fn anchorhead_script() -> Vec<String> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest.join("tests/fixtures/walkthroughs/anchorhead.txt");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("committed walkthrough script must be readable at {}: {e}", path.display()))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Replay the script through `through` commands (1-based, inclusive), mirroring
+/// `walkthrough_glulx_graphics_sound.rs`'s `submit_command`: a pending `Event` resumes with an
+/// empty submit rather than the literal script text.
+fn replay_anchorhead(s: &mut GlulxSession, through: usize) -> app::session::TurnResult {
+    let script = anchorhead_script();
+    let mut last = app::session::TurnResult::default();
+    for cmd in script.iter().take(through) {
+        last = match s.pending_input() {
+            app::session::InputKind::Event => s.submit(""),
+            _ => s.submit(cmd),
+        };
+    }
+    last
+}
+
+/// Turn 210 (`south`, into the Curiosity Shop): the proprietor is a fresh `RoomDirect` sighting
+/// with no printed name, and the arrival prose itself says "The proprietor watches you quietly
+/// from behind the display case" — tier 1's textual evidence.
+#[test]
+fn anchorhead_proprietor_resolves_to_the_prose_spelled_word_not_a_joined_list_or_truncated_fragment() {
+    let Some(mut s) = boot_anchorhead() else {
+        eprintln!("SKIP: gitignored stories/Anchorhead.gblorb missing");
+        return;
+    };
+    let r = replay_anchorhead(&mut s, 210);
+    assert_eq!(
+        r.location.as_ref().map(|l| l.name.as_str()),
+        Some("Curiosity Shop"),
+        "premise: this walks to the specimen room: {:?}",
+        r.location
+    );
+    assert!(
+        r.transcript.contains("The proprietor watches you quietly"),
+        "premise: the arrival prose itself names him this turn: {:?}",
+        r.transcript
+    );
+    let proprietor = r
+        .items
+        .iter()
+        .find(|i| i.words.words.contains(&"proprieto".to_string()))
+        .expect("the proprietor is a fresh RoomDirect sighting this turn");
+    assert_eq!(
+        proprietor.name, "proprietor",
+        "resolved from this turn's own prose, correctly spelled — not the truncated \
+         dictionary fragment (\"proprieto\") and not every known word joined into one \
+         run-on string: {:?}",
+        proprietor
+    );
+    assert_eq!(proprietor.location, app::session::ObservedItemLocation::RoomDirect);
+}
+
+/// Tier 2's fallback, in the SAME room: a later turn ("examine display case") whose own prose
+/// never re-mentions the proprietor still names him, as a single word (the FIRST of his stored
+/// words) — never the whole eight-word joined list `display_name()` would have produced, even
+/// though this turn's prose gives tier 1 nothing to match.
+#[test]
+fn anchorhead_proprietor_falls_back_to_a_single_stored_word_when_a_later_turns_prose_omits_him() {
+    let Some(mut s) = boot_anchorhead() else {
+        eprintln!("SKIP: gitignored stories/Anchorhead.gblorb missing");
+        return;
+    };
+    let r = replay_anchorhead(&mut s, 211); // "examine display case", one turn after arrival
+    assert!(
+        !r.transcript.to_lowercase().contains("proprietor"),
+        "premise: this turn's own prose gives tier 1 no textual evidence: {:?}",
+        r.transcript
+    );
+    let proprietor = r
+        .items
+        .iter()
+        .find(|i| i.words.words.contains(&"proprieto".to_string()))
+        .expect("still a RoomDirect sighting this turn, just with no fresh textual evidence");
+    assert_eq!(
+        proprietor.name, "proprieto",
+        "no match in THIS turn's prose: the first stored word, unspelled — never the whole \
+         joined list: {:?}",
+        proprietor
+    );
+}
+
 /// Regression guard against over-filtering: a genuine portable item in the same game — Cragne
 /// Manor's half-full styrofoam coffee cup, one `south` of the starting Railway Platform, an
 /// ordinary Inform-7-style object (no hardware short name, real parse words) that is neither
@@ -713,8 +835,14 @@ fn a_genuine_portable_item_is_still_tracked_after_the_scenery_filter() {
     let cup = r
         .items
         .iter()
-        .find(|i| i.name.contains("coffee cup"))
+        .find(|i| i.words.refers_to("cup"))
         .expect("the coffee cup is a genuine portable item, not scenery, and must still be tracked");
+    // SQ-1648: this object has no printed name, so its display name is now resolved through
+    // `item_tracker_display_name` rather than `ObjectWords::display_name`'s old whole-list join
+    // ("half-full styrofoam coffee cup things clouds swirls") — a single word, "styrofoam", the
+    // first of `ow.words` this turn's own arrival prose used ("A styrofoam coffee cup sits on the
+    // floor…"; "half-full" precedes it in `ow.words` but this turn's prose never says it).
+    assert_eq!(cup.name, "styrofoam", "resolved from this turn's own arrival prose: {:?}", cup);
     assert_eq!(cup.location, app::session::ObservedItemLocation::RoomDirect);
 
     let taken = s.submit("take cup");

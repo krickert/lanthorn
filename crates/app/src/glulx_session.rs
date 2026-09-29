@@ -31,7 +31,7 @@ use gvm::{GError, Machine, Memory, StepResult};
 
 use crate::engine::{Engine, EngineError, EngineSave, Introspect, KeyInput, LocationInfo, ScreenModel, StatusModel, WinNode};
 use crate::glk_backend::AppGlk;
-use crate::session::{clamp_runs, strip_read_prompt_for, trim_elems_to_len, FilenameReq, InputKind, PendingIo, TranscriptElem, TurnResult};
+use crate::session::{clamp_runs, item_tracker_display_name, strip_read_prompt_for, trim_elems_to_len, FilenameReq, InputKind, PendingIo, TranscriptElem, TurnResult};
 use zvm::location::LocationMethod;
 
 /// The engine tag recorded in an `EngineSave` produced by the Glulx adapter.
@@ -1475,7 +1475,9 @@ impl GlulxSession {
         // SQ-1627: a direct `Introspect` query, not a transcript heuristic — no v6-style gate
         // needed. See the helper's own doc for why Glulx needs only one room query (unlike the
         // Z-machine): this format has no way to tell an OPEN container from a closed one at all.
-        let items = self.glulx_item_observations(location.as_ref());
+        // SQ-1648: this turn's own `transcript` is passed through as the tier-1 evidence
+        // `item_tracker_display_name` prefers.
+        let items = self.glulx_item_observations(location.as_ref(), &transcript);
         TurnResult {
             transcript,
             transcript_runs,
@@ -1526,7 +1528,7 @@ impl GlulxSession {
     /// image's identifier-names table cannot resolve one or both attribute numbers at all
     /// (`$OMIT_SYMBOL_TABLE`, or a library that spells neither), `is_scenery_or_door` fails open —
     /// never hides a real item because the check was inconclusive.
-    fn glulx_item_observations(&self, location: Option<&LocationInfo>) -> Vec<crate::session::ItemObservation> {
+    fn glulx_item_observations(&self, location: Option<&LocationInfo>, prose: &str) -> Vec<crate::session::ItemObservation> {
         use crate::session::{ItemObservation, ObservedItemLocation};
         let mut out = Vec::new();
         let player = self.player_hint.or_else(|| Introspect::player_object(self));
@@ -1539,11 +1541,13 @@ impl GlulxSession {
                 if is_scenery_or_door(ow.id) {
                     continue;
                 }
-                // SQ-1631 Fix 1: `display_name`, not the raw printed name alone — Inform 7's
+                // SQ-1631 Fix 1: a display name, not the raw printed name alone — Inform 7's
                 // objects routinely have no hardware short name at all, only parse words, and a
                 // filter on the bare printed name drops every one of them (the exact SQ-1042 bug
                 // this mirrors; see `render::room_info::list_room_objects_excluding`'s own doc).
-                let Some(name) = ow.display_name() else {
+                // SQ-1648: `item_tracker_display_name`, not `display_name` directly — see that
+                // function's own doc for why.
+                let Some(name) = item_tracker_display_name(&ow, prose) else {
                     continue;
                 };
                 out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::RoomDirect, words: ow });
@@ -1554,7 +1558,7 @@ impl GlulxSession {
                 if is_scenery_or_door(ow.id) {
                     continue;
                 }
-                let Some(name) = ow.display_name() else {
+                let Some(name) = item_tracker_display_name(&ow, prose) else {
                     continue;
                 };
                 out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::Carried, words: ow });
@@ -2626,7 +2630,7 @@ impl Engine for GlulxSession {
         let transcript = if transcript_elems.is_empty() { self.take_transcript() } else { String::new() };
         let location = self.current_location();
         let description = self.boot_description.take();
-        let items = self.glulx_item_observations(location.as_ref());
+        let items = self.glulx_item_observations(location.as_ref(), &transcript);
         TurnResult {
             transcript,
             transcript_elems,
@@ -5057,7 +5061,7 @@ mod tests {
         let handle = s.handle_for(room_addr).expect("that room resolves to a real handle");
         let loc = LocationInfo { number: handle.into(), parent: 0, name: String::new() };
 
-        let items = s.glulx_item_observations(Some(&loc));
+        let items = s.glulx_item_observations(Some(&loc), "");
         let chair = items
             .iter()
             .find(|i| i.key == MP_CHAIR)
