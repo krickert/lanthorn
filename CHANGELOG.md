@@ -33,6 +33,8 @@ while any such tag, or this Unreleased section, still exists.*
   the one you typed, as a last resort, when the story's own grammar shows it
   accepts the same sentence shape you already wrote — helpful in a story that
   only implements an unfamiliar verb for a common action.
+- Linux ARM64 (Raspberry Pi 64-bit and other ARM Linux) builds now ship
+  alongside x86_64, macOS and Windows.
 
 ## v0.8.0 — 2026-09-28
 

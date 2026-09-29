@@ -6,10 +6,10 @@ For anyone installing lanthorn for the first time and opening their first story.
 
 Grab the archive for your platform from the
 [latest release](https://github.com/sharkusk/lanthorn/releases) — Linux
-(x86_64), macOS (universal) and Windows (x86_64) all ship with every release.
-Each archive holds four binaries: `lanthorn` itself, plus the no-map CLI
-players `zvm-cli`, `gvm-cli` and `scott-cli`. Extract it and run `lanthorn`
-from a terminal.
+(x86_64), Linux (aarch64, e.g. Raspberry Pi OS 64-bit), macOS (universal) and
+Windows (x86_64) all ship with every release. Each archive holds four
+binaries: `lanthorn` itself, plus the no-map CLI players `zvm-cli`,
+`gvm-cli` and `scott-cli`. Extract it and run `lanthorn` from a terminal.
 
 On Windows, two things are worth knowing up front. Closing the console
 window (rather than quitting from inside lanthorn) kills the process before

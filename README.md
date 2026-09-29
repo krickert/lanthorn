@@ -128,7 +128,9 @@ Grab the archive for your platform from the
 [**latest release**](https://github.com/sharkusk/lanthorn/releases) — Linux
 (x86_64), macOS (universal), and Windows (x86_64) builds ship with every
 release, four binaries in each: `lanthorn` itself plus the no-map CLI players
-(`zvm-cli` / `gvm-cli` / `scott-cli`). Extract it and run:
+(`zvm-cli` / `gvm-cli` / `scott-cli`). *Next release:* a Linux (aarch64) build
+ships too, covering Raspberry Pi OS (64-bit) and other 64-bit ARM Linux.
+Extract it and run:
 
 ```bash
 lanthorn ~/if-games/        # a directory — opens the story picker. The usual way in.

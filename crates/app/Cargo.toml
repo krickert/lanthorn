@@ -40,17 +40,21 @@ path = "src/bin/lanthorn_mapgen.rs"
 # `cargo binstall lanthorn` (SQ-1250) fetches a prebuilt release archive
 # instead of compiling. `release.yml` names archives
 # "lanthorn-{version}-{name}.{tar.gz|zip}" where {name} is NOT a Rust target
-# triple — "linux-x86_64" / "macos-universal2" / "windows-x86_64" — with one
-# macOS archive already universal across both Apple triples, so there is no
-# single templated `pkg-url` that covers all three; each shipped triple is an
-# explicit override instead, and a triple release.yml does not build (e.g.
-# aarch64-unknown-linux-gnu) has none, so binstall falls back to a source
+# triple — "linux-x86_64" / "linux-aarch64" / "macos-universal2" /
+# "windows-x86_64" — with one macOS archive already universal across both
+# Apple triples, so there is no single templated `pkg-url` that covers all
+# four; each shipped triple is an explicit override instead, and a triple
+# release.yml does not build has none, so binstall falls back to a source
 # build for it rather than guessing a URL. Every archive holds the bin at its
 # top level (`dist/<name>/lanthorn`, alongside README.md and LICENSE), no
 # nested dir.
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/lanthorn-{ version }-linux-x86_64.tar.gz"
 bin-dir = "lanthorn-{ version }-linux-x86_64/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/lanthorn-{ version }-linux-aarch64.tar.gz"
+bin-dir = "lanthorn-{ version }-linux-aarch64/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
 pkg-url = "{ repo }/releases/download/v{ version }/lanthorn-{ version }-macos-universal2.tar.gz"
