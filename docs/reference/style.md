@@ -127,6 +127,7 @@ Every themeable `style.toml` selector: which role or selector it derives from, a
 | `room_panel.header` | Elements | Style | `heading` |  | |
 | `room_panel.header:pinned` | Elements | Style | `accent` | `reversed` | |
 | `room_panel.aliases` | Elements | Style | `muted` |  | |
+| `room_panel.description` | Elements | Style | `muted` | `italic` | |
 | `story_info_title` | Elements | Style | `heading` |  | |
 | `terminal_dump_heading` | Elements | Style | `heading` | `bold` | |
 | `terminal_dump_assumed` | Elements | Style | `alert` |  | |
