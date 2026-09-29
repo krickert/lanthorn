@@ -38,6 +38,9 @@ while any such tag, or this Unreleased section, still exists.*
   running-together word, like "pickup" for "pick up", when the story's own
   grammar confirms that verb really does use that exact word — again only
   once confirmed, for the same reason.
+- The room inspector now shows a room's own description, when lanthorn has
+  captured one — the game's own last-seen text for that room, above your
+  own notes on it.
 
 ## v0.8.1 — 2026-09-29
 

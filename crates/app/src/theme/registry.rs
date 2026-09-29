@@ -500,6 +500,10 @@ pub static REGISTRY: std::sync::LazyLock<Vec<RegRow>> = std::sync::LazyLock::new
     // `map.loc_indicator`: it is background information about the room, not something to draw
     // the eye to the way the header or the exit card does.
     row("room_panel.aliases", Section::Elements, Kind::Style, Some("muted"), Delta::EMPTY),
+    // The room's captured description (SQ-1628): the game's own quoted text, not lanthorn UI
+    // chrome, so it gets the same "muted + italic" treatment `story_info_blurb` gives the
+    // story file's own blurb — a role already established for "this text came from the game".
+    row("room_panel.description", Section::Elements, Kind::Style, Some("muted"), mods(false, true, false, false)),
     row("story_info_title", Section::Elements, Kind::Style, Some("heading"), Delta::EMPTY),
     // ── `/dump-terminal` (SQ-0994). Its whole point is telling a MEASURED value
     // from an ASSUMED one, so the two get different looks: a heading to find the
@@ -811,6 +815,7 @@ mod tests {
         "room_panel.header",
         "room_panel.header:pinned",
         "room_panel.aliases",
+        "room_panel.description",
         "story_info_title",
         "terminal_dump_heading",
         "terminal_dump_assumed",
