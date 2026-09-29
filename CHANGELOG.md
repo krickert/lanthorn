@@ -19,6 +19,21 @@ Absolute URLs or no link.
 
 ---
 
+## Unreleased
+
+*This section is drained when a version is cut. README.md describes the
+RELEASED build; prose for a feature that is in `main` but not yet released
+goes into the README in place, at its normal destination, marked with the
+visible tag `*Next release:*`. `release.yml` refuses to cut a release
+while any such tag, or this Unreleased section, still exists.*
+
+### Added
+
+- lanthorn's Guiding Light can now suggest a completely different verb than
+  the one you typed, as a last resort, when the story's own grammar shows it
+  accepts the same sentence shape you already wrote — helpful in a story that
+  only implements an unfamiliar verb for a common action.
+
 ## v0.8.0 — 2026-09-28
 
 ### Added

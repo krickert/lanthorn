@@ -88,6 +88,21 @@ impl Play {
         Some(Play { state, session: Box::new(s) })
     }
 
+    /// *Spider and Web*, release 4 / serial 980226 — SQ-1642's fixture for the
+    /// grammar-shape source. Opens straight to a line prompt, no keypress gate.
+    fn tangle() -> Option<Play> {
+        let bytes = story("Tangle.z5")?;
+        let mut s = app::session::GameSession::new_with_trace(
+            bytes.clone(), true, false, None, false, Vec::new(), None, None, Some((25, 80)),
+        )
+        .expect("Tangle.z5 boots without a ZError");
+        s.set_strip_prompt(false);
+        let mut state = AppState::default();
+        state.assist_preamble_shown = true;
+        state.probe.arm(recipe(&bytes));
+        Some(Play { state, session: Box::new(s) })
+    }
+
     /// SQ-1206's own fixture for the `hasten north` false positive, and one of
     /// the two the research noted vets normally (SQ-1232).
     fn savoir_faire() -> Option<Play> {
@@ -132,6 +147,21 @@ impl Play {
         state.assist_preamble_shown = true;
         state.probe.arm(recipe(&bytes));
         Some(Play { state, session: Box::new(s) })
+    }
+
+    /// Dismiss every "[Hit any key.]" gate currently pending, one keypress at
+    /// a time, before the next real command is sent. `GameSession::submit`
+    /// dispatches on `pending_input()` itself, so a plain LINE command sent
+    /// while a gate is still open only consumes its first character as the
+    /// keystroke and silently drops the rest — this is what a caller reaches
+    /// for instead of hand-placing a fixed number of keypresses at a fixed
+    /// position in a command list (SQ-1642: *Spider and Web*'s own
+    /// interrogator interrupt fires on the player's genuine trial and error,
+    /// not on a turn count, so no fixed position is reliable).
+    fn drain_char_gate(&mut self) {
+        while self.session.pending_input() == app::session::InputKind::Char {
+            self.turn(" ");
+        }
     }
 
     fn turn(&mut self, cmd: &str) {
@@ -1167,4 +1197,130 @@ fn a_disambiguation_echo_does_not_survive_vetting_in_the_entrance_hall() {
             "an offer the direction control pair should have vetted survived: {line:?}"
         );
     }
+}
+
+// ── SQ-1642: the grammar-shape source, last resort ──────────────────────────
+
+/// The futile attempts at the black plate and the door, played out in full at
+/// the "End of Alley" flashback: this is what makes the interrogator give up
+/// the lockpick, confirmed live against the story (`i` answers "You are
+/// carrying nothing worthy of attention, except a lockpick" only after this
+/// exact sequence). Nothing shorter reproduces it — the game gates the reveal
+/// on the player having genuinely tried and failed, not on a fixed turn count.
+const TANGLE_FUTILE_ATTEMPTS: &[&str] = &[
+    "push plate",
+    "press plate",
+    "tap plate",
+    "knock on plate",
+    "hit plate",
+    "kick plate",
+    "scan plate",
+    "put hand on plate",
+    "rub plate",
+    "lick plate",
+    "smell plate",
+    "listen to plate",
+    "turn plate",
+    "pull plate",
+    "move plate",
+    "open door",
+    "unlock door",
+    "pick door",
+    "kick door",
+    "push door",
+    "pull door",
+    "knock on door",
+    "search wall",
+    "search bricks",
+    "x bricks",
+];
+
+/// Walk *Spider and Web* from its very opening into the flashback where the
+/// lockpick is in hand and the black plate is in scope, the state the real
+/// puzzle solution (`touch lockpick on plate`, confirmed live) needs to be
+/// vettable at all.
+fn tangle_to_the_lockpick(p: &mut Play) {
+    p.turn("south"); // End of Alley -> Mouth of Alley
+    p.turn("south"); // -> "-- glaring light..." [Hit any key.]
+    p.drain_char_gate(); // -> Interrogation Chamber
+    p.turn("yes"); // -> "...glaring light --" [Hit any key.]
+    p.drain_char_gate(); // -> back in the alley, the flashback replaying
+    for cmd in TANGLE_FUTILE_ATTEMPTS {
+        // The interrogator interrupts with the rod SOMEWHERE in this list —
+        // on the player's genuine trial and error, not a fixed turn count —
+        // and hands it over; draining before every command (not just once at
+        // the end) is what makes this robust to exactly where that lands.
+        p.drain_char_gate();
+        p.turn(cmd);
+    }
+    p.drain_char_gate();
+}
+
+/// **SQ-1642, the case the source exists for.** *Spider and Web* never heard
+/// of `use` (`use lockpick on plate` prints `That's not a verb I recognize.`,
+/// confirmed live), and no near miss, stem or meaning table connects `use` to
+/// anything this story implements — `touch` (dictionary entry `feel`,
+/// synonyms `fondle`, `grope`, `touch`) solves it only because its own
+/// grammar (`feel noun to / on noun`) happens to accept the exact shape `use
+/// lockpick on plate` already has. That is a coincidence of THIS story's verb
+/// table, not a meaning relationship, which is exactly what `by_grammar_shape`
+/// is for.
+///
+/// The assertion is deliberately NOT pinned to the word `feel` (or `touch`):
+/// the point is that the MECHANISM works — a real, vetted, functioning verb
+/// is surfaced for a shape-only match — not which verb the story's grammar
+/// and the ranking tie-break happen to put first. A vetted `try instead` pick
+/// is the strong claim (`crate::probe` actually watched it do something from
+/// exactly here); the unvetted `this story knows` fallback would mean the
+/// probe never confirmed anything and is not enough to pass this test.
+///
+/// `attach lockpick to plate` also solves this puzzle in the real game, but
+/// is not expected to appear here: it pairs with the literal word `to`, not
+/// `on`, so it is not even a raw candidate for the shape `use lockpick on
+/// plate` already has — a different, unrelated preposition is not the same
+/// shape, and `by_grammar_shape` never claims otherwise.
+///
+/// Falsify by turning the grammar-shape source off (temporarily hard-code
+/// `by_grammar_shape` to return immediately): the offer vanishes and this
+/// test fails with no `try instead` line at all, the original reported gap.
+#[test]
+fn a_shape_only_match_is_vetted_and_surfaced_on_a_real_story() {
+    let Some(mut p) = Play::tangle() else { return };
+    tangle_to_the_lockpick(&mut p);
+    p.turn("i"); // "You are carrying nothing worthy of attention, except a lockpick."
+    assert!(
+        p.state.transcript.iter().any(|l| l.contains("lockpick")),
+        "the fixture is the walk: the lockpick must be in hand before the case below \
+         means anything:\n{}",
+        p.screen()
+    );
+
+    p.turn("use lockpick on plate");
+    eprintln!("--- Tangle.z5 (Spider and Web r4), `use lockpick on plate` ---\n{}\n", p.screen());
+
+    let offer = p.state.assist_offer.clone().expect("an offer was pushed for `use`");
+    assert_eq!(
+        offer.kind,
+        app::assist::OfferKind::VettedOffer,
+        "a bare `this story knows` fallback means the probe never confirmed the verb \
+         actually does anything here, which is not what this source claims"
+    );
+    assert_eq!(offer.word.as_deref(), Some("use"));
+    assert!(!offer.picks.is_empty(), "at least one vetted pick must have survived");
+
+    let assists = p.assists();
+    assert!(
+        assists.iter().any(|l| l.starts_with("try instead — ")),
+        "a vetted recommendation must be on screen: {assists:?}"
+    );
+
+    // Bonus, not load-bearing: on this exact walk the story's own grammar
+    // table order ranks other shape-only matches (`put`, `empty`, `discard`
+    // — none more related to `use` than `touch` is, all reached the same
+    // coincidental way) ahead of `touch`'s own dictionary entry (`feel`,
+    // synonyms `fondle`, `grope`, `touch`), so `feel` itself is not always
+    // among the three shown — which is exactly the ranking-is-not-pinned
+    // point this test's own doc comment makes. Logged for visibility, not
+    // asserted on.
+    eprintln!("(vetted picks surfaced here: {assists:?})");
 }
