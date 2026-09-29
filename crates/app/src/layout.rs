@@ -246,15 +246,18 @@ pub fn dock_pct_for_rows(frame_height: u16, rows: u16) -> u16 {
     (pct as u16).clamp(MIN_INV_DOCK_PCT, MAX_INV_DOCK_PCT)
 }
 
-/// Compute this frame's pane geometry. `inv_item_count` is passed in (rather
-/// than computed here) so this stays free of `engine.introspect()`/rendering
+/// Compute this frame's pane geometry. `inv_line_count` — the inventory
+/// dock's content-row count (SQ-1630: headers plus every "Carrying"/
+/// "Elsewhere" line, `render::inventory_dock::build_inventory_dock_rows`'s
+/// result length, not a bare item count) — is passed in (rather than
+/// computed here) so this stays free of `engine.introspect()`/rendering
 /// dependencies.
-pub fn compute_pane_layout(area: Rect, state: &AppState, inv_item_count: usize) -> PaneLayout {
+pub fn compute_pane_layout(area: Rect, state: &AppState, inv_line_count: usize) -> PaneLayout {
     // ── Inventory dock: reserve a bottom band (above the help row) that
-    // slides up when toggled, sized from the item list + slide fraction.
+    // slides up when toggled, sized from the content-row list + slide fraction.
     let inv_visible = state.show_inventory || state.inv_dock.active();
     let inv_target_h = if inv_visible {
-        inventory_dock_target_height(inv_item_count, area.height, state.pane_sizes.inv_dock_pct)
+        inventory_dock_target_height(inv_line_count, area.height, state.pane_sizes.inv_dock_pct)
     } else {
         0
     };

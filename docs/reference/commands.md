@@ -42,6 +42,7 @@ Every slash command, grouped the way `/help` groups them. Type any of these afte
 | View | `toggle-map` | show or hide the map panel; persisted per-game |
 | View | `toggle-focus` | switch focus between panes |
 | View | `toggle-inventory-panel` | open or close the inventory panel; remembered per story |
+| View | `filter-items [query]` | filter the inventory panel (both Carrying and Elsewhere) to items matching query; no query clears the filter |
 | View | `toggle-status-bar` | toggle the status/score bar |
 | View | `resize-panes` | enter interactive pane-resize mode |
 | View | `reset-pane-size` | reset all pane sizes to their defaults |

@@ -254,10 +254,10 @@ fn counterfeit_monkey_refuses_an_avatar_it_cannot_identify() {
 
 use app::render::command_band::{default_quick, default_verbs, refresh_objects, COL_CARRIED};
 use app::render::inventory_dock::{
-    draw_inventory_dock, inventory_dock_target_height, refresh_inventory_click_words,
-    InventoryDockHits,
+    build_inventory_dock_rows, draw_inventory_dock, inventory_dock_target_height,
+    refresh_inventory_click_words, InventoryDockHits,
 };
-use app::render::transcript::inventory_click_words;
+use app::render::transcript::{inventory_click_words, inventory_items_with_keys};
 use app::state::{AppState, CommandBandState};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -315,14 +315,24 @@ fn panels(s: &GlulxSession) -> (Vec<String>, String, Vec<String>) {
     refresh_inventory_click_words(&mut state, s);
     refresh_objects(&mut state, s);
 
-    // …and the rows really reach the screen, not just the list.
-    let area = Rect::new(0, 0, 40, inventory_dock_target_height(rows.len(), 40, 100));
+    // …and the rows really reach the screen, not just the list — through the
+    // SAME `inventory_items_with_keys` + `build_inventory_dock_rows` pair
+    // `main.rs` calls (SQ-1630). No mapper registry here (an empty
+    // `MapGraph`), so every carried item takes the "no registry record"
+    // fallback and shows by name alone — exactly what the plain `rows` list
+    // above already asserts against.
+    let carried_with_keys =
+        inventory_items_with_keys(state.player_obj, &state.inventory_fallback, s.introspect());
+    let empty_graph = mapper::graph::MapGraph::new();
+    let dock_rows = build_inventory_dock_rows(&carried_with_keys, &empty_graph, None);
+    let area = Rect::new(0, 0, 40, inventory_dock_target_height(dock_rows.len(), 40, 100));
     let mut buf = Buffer::empty(area);
     draw_inventory_dock(
-        &rows,
+        &dock_rows,
         area,
         &state.colors,
         false,
+        0,
         &mut buf,
         &mut InventoryDockHits::default(),
     );

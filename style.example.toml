@@ -58,6 +58,7 @@ version = 1   # style schema version — do not remove; lets lanthorn flag an ou
 # tidy_progress = { parent = "accent" }
 # meta_marker = { parent = "muted" }
 # inventory_panel = { parent = "accent" }
+# "inventory_panel.header" = { parent = "heading" }
 # room_panel = { parent = "text" }
 # "room_panel.header" = { parent = "heading" }
 # "room_panel.header:pinned" = { parent = "accent", reversed = true }

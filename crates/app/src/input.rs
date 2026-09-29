@@ -339,6 +339,17 @@ pub enum Action {
     /// mutually exclusive, `SidePanel`), so there is no `CommandBandState` to
     /// pick FROM — a typed verb stays and the item is simply appended.
     InventoryClickRow(usize),
+    /// A mouse-wheel notch over the inventory dock (SQ-1630): scroll its
+    /// `AppState::inv_dock_scroll` by `delta` rows. The dock's own analogue
+    /// of `RoomDockScroll` — same reasoning: no keyboard focus, so the wheel
+    /// is the only way to move it, and it keeps its own viewport
+    /// (`AppState::inv_dock_body_viewport`) rather than sharing
+    /// `modal_list_viewport`.
+    InventoryDockScroll(i32),
+    /// Set (`Some`) or clear (`None`) the inventory dock's `filter-items`
+    /// query (SQ-1630). Resets the dock's scroll to the top — the content a
+    /// scrolled offset was into no longer exists once the filter changes.
+    SetInventoryFilter(Option<String>),
     /// Esc, one level per press: disarm the quick highlight → close the band
     /// (SQ-0676 — the filter rung retired with type-to-filter, and the phrase
     /// rung with it: the phrase is the prompt's text now, and Esc must never
@@ -3302,6 +3313,21 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             if let Some(word) = state.inventory_click_words.get(idx).cloned() {
                 compose_word_onto_prompt(state, &word);
             }
+        }
+
+        // SQ-1630: the wheel scrolls the dock's one body. `len()` re-records the
+        // viewport the last render measured (`inv_dock_body_viewport`, synced the
+        // same way `room_dock_body_viewport` is) before `scroll_by` clamps
+        // against it — the same two-step `RoomDockScroll` takes.
+        Action::InventoryDockScroll(delta) => {
+            let vp = state.inv_dock_body_viewport as usize;
+            let anim = state.config.animation.clone();
+            state.inv_dock_scroll.scroll_by(delta as isize, vp, &anim);
+        }
+
+        Action::SetInventoryFilter(query) => {
+            state.inv_dock_filter = query;
+            state.inv_dock_scroll = crate::list_scroll::ListScroll::new();
         }
 
         Action::BandEscape => {

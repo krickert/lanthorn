@@ -487,6 +487,10 @@ pub static REGISTRY: std::sync::LazyLock<Vec<RegRow>> = std::sync::LazyLock::new
     row("tidy_progress", Section::Elements, Kind::Style, Some("accent"), Delta::EMPTY),
     row("meta_marker", Section::Elements, Kind::Style, Some("muted"), Delta::EMPTY),
     row("inventory_panel", Section::Elements, Kind::Style, Some("accent"), Delta::EMPTY),
+    // The inventory panel's "Carrying:"/"Elsewhere:" section headers (SQ-1630) —
+    // same heading role room_panel.header uses, so the two docks' headers read
+    // alike.
+    row("inventory_panel.header", Section::Elements, Kind::Style, Some("heading"), Delta::EMPTY),
     // ── The Room Panel (SQ-0692): the panel describing one room, docked at the
     // bottom of the map pane. `room_panel` is its body text; the header line
     // naming the room, its layer and the follow/pin regime gets its own
@@ -811,6 +815,7 @@ mod tests {
         "tidy_progress",
         "meta_marker",
         "inventory_panel",
+        "inventory_panel.header",
         "room_panel",
         "room_panel.header",
         "room_panel.header:pinned",

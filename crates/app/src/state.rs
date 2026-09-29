@@ -3544,6 +3544,21 @@ pub struct AppState {
     /// by `render::inventory_dock::refresh_inventory_click_words` (SQ-1244).
     /// Empty whenever the panel is neither shown nor sliding.
     pub inventory_click_words: Vec<String>,
+    /// An active `filter-items` query (SQ-1630), or `None` to show every
+    /// tracked item. Applied by `render::inventory_dock::build_inventory_dock_rows`
+    /// to both the "Carrying" and "Elsewhere" sections independently.
+    pub inv_dock_filter: Option<String>,
+    /// The inventory dock's own [`crate::list_scroll::ListScroll`] (SQ-1630) —
+    /// the dock's counterpart to [`Self::room_dock_info_scroll`]. One scroll,
+    /// not two, since the dock has a single body (unlike the room dock's two
+    /// tabs); `selected`/keyboard nav are never driven (the dock has no
+    /// keyboard focus), only [`crate::list_scroll::ListScroll::scroll_by`],
+    /// from the wheel.
+    pub inv_dock_scroll: crate::list_scroll::ListScroll,
+    /// The dock's viewport height (rows) as of the last render, so a wheel
+    /// action between frames has something to clamp `scroll_by` against —
+    /// the dock's own analogue of [`Self::room_dock_body_viewport`].
+    pub inv_dock_body_viewport: u16,
     /// The player's previous room (global 0 value from the previous turn).
     pub prev_location: Option<mapper::graph::RoomId>,
     /// Objects whose parent was prev_location at the end of the previous turn.
@@ -3981,6 +3996,9 @@ impl Default for AppState {
             player_obj: None,
             inventory_fallback: Vec::new(),
             inventory_click_words: Vec::new(),
+            inv_dock_filter: None,
+            inv_dock_scroll: crate::list_scroll::ListScroll::new(),
+            inv_dock_body_viewport: 0,
             prev_location: None,
             prev_objects_here: std::collections::BTreeSet::new(),
             pending_resume: None,

@@ -1743,6 +1743,33 @@ pub fn inventory_items(
     }
 }
 
+/// Like [`inventory_items`], but keeps each entry's engine id — the Z-machine
+/// object number / Glulx address / Scott Adams item index, exactly
+/// [`mapper::graph::ItemKey`]'s identity space (SQ-1630) — alongside its
+/// display name, so `render::inventory_dock` can cross-reference each carried
+/// item against the mapper's whole-game item registry
+/// (`mapper::graph::MapGraph::item`). `None` in the inventory-fallback path
+/// (no live object tree to ask) — the parsed inventory line has no id to give,
+/// and the dock falls back to showing the name alone.
+///
+/// Same order and same filter as [`inventory_items`] and
+/// [`inventory_click_words`] (both walk the identical `intro.contents(obj)`
+/// list), so an index into this list is always the same item as the same
+/// index into either of those.
+pub fn inventory_items_with_keys(
+    player_obj: Option<u16>,
+    inventory_fallback: &[String],
+    introspect: Option<&dyn Introspect>,
+) -> Vec<(Option<u32>, String)> {
+    let player = player_obj.or_else(|| introspect.and_then(|i| i.player_object()));
+    match (player, introspect) {
+        (Some(obj), Some(intro)) => {
+            intro.contents(obj).iter().filter_map(|o| o.display_name().map(|name| (Some(o.id), name))).collect()
+        }
+        _ => inventory_fallback.iter().cloned().map(|s| (None, s)).collect(),
+    }
+}
+
 /// The word a click on each [`inventory_items`] row composes into the
 /// prompt, in the SAME order and over the SAME filter (SQ-1244) — so the two
 /// lists always line up index-for-index and a click can never grab the wrong
@@ -6560,6 +6587,18 @@ mod tests {
         assert_eq!(inventory_items(None, &items, None), items);
         assert_eq!(inventory_items(Some(7), &items, None), items);
         assert!(inventory_items(None, &[], None).is_empty());
+    }
+
+    /// SQ-1630: the fallback path (no live object tree) has no ids to give —
+    /// every entry comes back `None` — but still carries every fallback name,
+    /// so `inventory_dock` still has something to show even when it cannot
+    /// cross-reference the registry.
+    #[test]
+    fn inventory_items_with_keys_fallback_has_no_ids() {
+        let items = vec!["brass lamp".to_string(), "rusty key".to_string()];
+        let got = inventory_items_with_keys(None, &items, None);
+        assert_eq!(got, vec![(None, "brass lamp".to_string()), (None, "rusty key".to_string())]);
+        assert!(inventory_items_with_keys(None, &[], None).is_empty());
     }
 
     /// SQ-1244: with no introspection, `inventory_click_words` falls back to

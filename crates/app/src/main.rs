@@ -749,14 +749,22 @@ fn draw_frame(
         };
 
         // ── Inventory dock: reserve a bottom band (above the help row) that
-        // slides up when toggled, sized from the item list + slide fraction.
+        // slides up when toggled, sized from the content-row list + slide
+        // fraction (SQ-1630: "Carrying" cross-referenced against the mapper's
+        // whole-game item registry, plus "Elsewhere" for everything else it
+        // has ever tracked — see `render::inventory_dock`'s own doc).
         let inv_visible = state.show_inventory || state.inv_dock.active();
-        let inv_items: Vec<String> = if inv_visible {
-            app::render::transcript::inventory_items(state.player_obj, &state.inventory_fallback, engine.introspect())
+        let inv_rows: Vec<app::render::inventory_dock::ItemDockRow> = if inv_visible {
+            let carried = app::render::transcript::inventory_items_with_keys(
+                state.player_obj,
+                &state.inventory_fallback,
+                engine.introspect(),
+            );
+            app::render::inventory_dock::build_inventory_dock_rows(&carried, &mapper.graph, state.inv_dock_filter.as_deref())
         } else {
             Vec::new()
         };
-        let pane_layout = app::layout::compute_pane_layout(full, state, inv_items.len());
+        let pane_layout = app::layout::compute_pane_layout(full, state, inv_rows.len());
         pane_layout_out = pane_layout;
 
         // While any background map job is in flight — a tidy relayout or the
@@ -1083,7 +1091,16 @@ fn draw_frame(
         if pane_layout.inv_dock.height > 0 {
             let inv_resize_hl = (state.resize_mode && state.resize_target == app::state::ResizeTarget::InvDock)
                 || state.boundary_active(app::layout::Boundary::InvDockTop);
-            app::render::inventory_dock::draw_inventory_dock(&inv_items, pane_layout.inv_dock, &state.colors, inv_resize_hl, buf, &mut inv_hits);
+            let inv_scroll_offset = state.inv_dock_scroll.display_offset() as u16;
+            app::render::inventory_dock::draw_inventory_dock(
+                &inv_rows,
+                pane_layout.inv_dock,
+                &state.colors,
+                inv_resize_hl,
+                inv_scroll_offset,
+                buf,
+                &mut inv_hits,
+            );
         }
 
         // ── Command band ───────────────────────────────────────────────────────
@@ -1382,8 +1399,14 @@ fn inventory_mouse_action(
             // as a click on empty band real estate.
             Some(Action::None)
         }
-        // Drag/Up inside the dock must not start a story-pane text selection.
-        _ => Some(Action::None),
+        // A wheel notch anywhere inside the dock scrolls its body (SQ-1630),
+        // honouring `mouse_wheel_invert` the same way every other wheel
+        // handler resolves it — via `wheel_delta`.
+        _ => match app::input::wheel_delta(m.kind, state.config.mouse_wheel_invert) {
+            Some(d) => Some(Action::InventoryDockScroll(d as i32)),
+            // Drag/Up inside the dock must not start a story-pane text selection.
+            None => Some(Action::None),
+        },
     }
 }
 
@@ -2165,6 +2188,18 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     *dock_scroll = app::list_scroll::ListScroll::new();
                 } else {
                     dock_scroll.len(panes.room_dock_body_total as usize);
+                }
+                // Inventory dock body scroll (SQ-1630): the same sync `RoomDockScroll`
+                // gets above, against `InventoryDockHits::body_total`/`body_viewport`
+                // rather than a `PaneRects` field — the dock has one body, not two, so
+                // there is no per-view scroll to pick between and no "displayed room"
+                // to reset against; a filter change resets it directly instead
+                // (`Action::SetInventoryFilter`).
+                state.inv_dock_body_viewport = panes.inventory_dock.body_viewport;
+                if panes.inventory_dock.body_total as usize <= panes.inventory_dock.body_viewport as usize {
+                    state.inv_dock_scroll = app::list_scroll::ListScroll::new();
+                } else {
+                    state.inv_dock_scroll.len(panes.inventory_dock.body_total as usize);
                 }
                 // Replay's idx is the source of truth; keep its (animated) list
                 // scroll following it. Skip while a scroll is easing so the tween

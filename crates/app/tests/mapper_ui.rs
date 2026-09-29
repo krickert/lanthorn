@@ -36,6 +36,8 @@ mod declared_exit;
 mod room_description;
 #[path = "suites/item_tracking.rs"]
 mod item_tracking;
+#[path = "suites/inventory_dock_registry.rs"]
+mod inventory_dock_registry;
 #[path = "suites/matrix_path_highlight.rs"]
 mod matrix_path_highlight;
 #[path = "suites/matrix_view.rs"]

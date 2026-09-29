@@ -490,6 +490,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "toggle-inventory-panel", category: Category::View, context: Context::Global,
         usage: "toggle-inventory-panel", description: "open or close the inventory panel; remembered per story",
         dispatch: |_| SlashOutcome::Action(crate::input::Action::ToggleInventory) },
+    CommandSpec { name: "filter-items", category: Category::View, context: Context::Global,
+        usage: "filter-items [query]", description: "filter the inventory panel (both Carrying and Elsewhere) to items matching query; no query clears the filter",
+        dispatch: |a| SlashOutcome::Action(crate::input::Action::SetInventoryFilter(
+            if a.is_empty() { None } else { Some(a.join(" ")) }
+        )) },
     CommandSpec { name: "toggle-status-bar", category: Category::View, context: Context::Global,
         usage: "toggle-status-bar", description: "toggle the status/score bar",
         dispatch: |_| SlashOutcome::Action(crate::input::Action::ToggleStatusBar) },
@@ -1123,7 +1128,7 @@ mod tests {
         assert_eq!(by("save-state").category, Category::Game);
         assert_eq!(by("zoom-map").category, Category::Map);
         assert_eq!(by("anim-step").context, Context::Anim);
-        // Total count matches the spec table (Game 12, Map 21, View 6,
+        // Total count matches the spec table (Game 12, Map 21, View 7,
         // Transcript 3, Style 10, Export 3, Animation 4, Help 3). `open-saves`
         // was removed — `restore-state` (bare) opens the saves dialog instead.
         // `debug` (SQ-0169) opens the Z-machine debug inspector. `open-gallery`
@@ -1170,7 +1175,9 @@ mod tests {
         // SQ-1420 added `set-transcript`: the STORY's own transcript (Z-machine
         // output stream 2, ZMSD §7.1.1), for the many games that ship no SCRIPT
         // verb to turn it on with.
-        assert_eq!(COMMANDS.len(), 92, "registry must match the spec's Full command table");
+        // SQ-1630 added `filter-items`: search the inventory panel's two
+        // sections (Carrying/Elsewhere) by name substring.
+        assert_eq!(COMMANDS.len(), 93, "registry must match the spec's Full command table");
     }
 
     /// SQ-1237 unified the panel vocabulary — `command band` became `command

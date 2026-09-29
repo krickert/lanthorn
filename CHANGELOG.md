@@ -41,6 +41,10 @@ while any such tag, or this Unreleased section, still exists.*
 - The room inspector now shows a room's own description, when lanthorn has
   captured one — the game's own last-seen text for that room, above your
   own notes on it.
+- The inventory panel now also lists every item lanthorn has tracked
+  elsewhere in the game — where it was last seen, and whether it's fixed in
+  place — under what you're currently carrying, and both lists can be
+  searched with a new `filter-items` command.
 
 ## v0.8.1 — 2026-09-29
 
