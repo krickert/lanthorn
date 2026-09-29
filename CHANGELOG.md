@@ -6,7 +6,7 @@ All notable changes to lanthorn are recorded here.
 [`.github/workflows/release.yml`](.github/workflows/release.yml)). A tag whose
 name contains a hyphen — `v0.1.0-beta.1`, `v0.2.0-rc.1` — is published as a
 **pre-release**; a bare `vMAJOR.MINOR.PATCH` is a full release. The workspace
-version in `Cargo.toml` (currently `0.8.0`) versions every crate and every
+version in `Cargo.toml` (currently `0.8.1`) versions every crate and every
 binary's `--version` at once, and carries any pre-release suffix so a build
 identifies itself without reading its git hash.
 
@@ -19,22 +19,16 @@ Absolute URLs or no link.
 
 ---
 
-## Unreleased
-
-*This section is drained when a version is cut. README.md describes the
-RELEASED build; prose for a feature that is in `main` but not yet released
-goes into the README in place, at its normal destination, marked with the
-visible tag `*Next release:*`. `release.yml` refuses to cut a release
-while any such tag, or this Unreleased section, still exists.*
+## v0.8.1 — 2026-09-29
 
 ### Added
 
+- **Linux ARM64 (Raspberry Pi 64-bit and other ARM Linux) builds now ship**
+  alongside x86_64, macOS and Windows.
 - lanthorn's Guiding Light can now suggest a completely different verb than
   the one you typed, as a last resort, when the story's own grammar shows it
   accepts the same sentence shape you already wrote — helpful in a story that
   only implements an unfamiliar verb for a common action.
-- Linux ARM64 (Raspberry Pi 64-bit and other ARM Linux) builds now ship
-  alongside x86_64, macOS and Windows.
 
 ## v0.8.0 — 2026-09-28
 
