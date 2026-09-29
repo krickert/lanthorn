@@ -19,6 +19,22 @@ Absolute URLs or no link.
 
 ---
 
+## Unreleased
+
+*This section is drained when a version is cut. README.md describes the
+RELEASED build; prose for a feature that is in `main` but not yet released
+goes into the README in place, at its normal destination, marked with the
+visible tag `*Next release:*`. `release.yml` refuses to cut a release
+while any such tag, or this Unreleased section, still exists.*
+
+### Added
+
+- lanthorn's Guiding Light can now also suggest a verb for a command with no
+  preposition at all — a plain "verb noun", like a one-word "pickup" instead
+  of "get" — but only once it has actually confirmed the suggestion works
+  here, since a bare command shape like that is too common to guess about
+  otherwise.
+
 ## v0.8.1 — 2026-09-29
 
 ### Added

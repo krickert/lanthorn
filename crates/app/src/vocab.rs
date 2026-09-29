@@ -64,13 +64,26 @@
 //!    typed. `use lockpick on plate` has no meaning in common with `touch
 //!    lockpick on plate` at all; `touch`'s grammar simply happens to accept
 //!    the shape (SQ-1642).
+//! 6. **The same coincidence, UNPREPOSITIONED — and only ever shown once
+//!    vetted.** `pickup toolcase` reaches none of the first five: it is not a
+//!    near miss or stem of `get`, and the synonym table's key is the
+//!    two-word `pick up`, a different string from the one-word `pickup`
+//!    typed. [`StoryVocabulary::by_bare_grammar_shape`] asks the fifth
+//!    source's question again, but for a bare `VERB noun` shape with no
+//!    literal preposition at all — deliberately excluded from source 5,
+//!    because it is the single commonest shape in the medium and an
+//!    UNVETTED claim built on it alone is worthless noise (SQ-1644). So a
+//!    candidate from this source is marked vetting-mandatory
+//!    ([`Pick::requires_vetting`]) and [`offer_vocabulary`] never shows one
+//!    through the unvetted "this story knows" fallback — only through a
+//!    vetted "try instead", or not at all.
 //!
 //! The first two and the fourth are answerable from the story file alone; the
 //! third is the only one that needs an outside corpus, and it needed no seam
 //! of its own to arrive — which is why the sources are a concatenation and
-//! not a chain. The fifth needs nothing but the story file either, and is
-//! held back until the other four have nothing to say, because unlike them it
-//! is not evidence about the word at all.
+//! not a chain. The fifth and sixth need nothing but the story file either,
+//! and are held back until the sources above them have nothing to say,
+//! because unlike those they are not evidence about the word at all.
 //!
 //! Whatever proposes a candidate, [`StoryVocabulary::offer`] intersects it with
 //! this story's dictionary before anything is shown. **The player must never be
@@ -619,16 +632,21 @@ struct Candidate {
     /// 2 for another spelling the story gives whatever either of those found,
     /// 3 for a verb reached only because it happens to accept the same
     /// sentence shape the player typed
-    /// ([`by_grammar_shape`](StoryVocabulary::by_grammar_shape)) — no claim
-    /// about the word at all, the weakest of the four and why it sorts last.
+    /// ([`by_grammar_shape`](StoryVocabulary::by_grammar_shape)), 4 for the
+    /// same coincidence with no literal preposition at all
+    /// ([`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)) —
+    /// no claim about the word at all, the weakest of the five and why it
+    /// sorts last; tier 4 additionally may never be shown unvetted (see
+    /// [`Pick::requires_vetting`]).
     ///
-    /// Four ranks and not two, because `order` is an index into whichever table
+    /// Five ranks and not two, because `order` is an index into whichever table
     /// a source read and says nothing across sources: `doff` reaches `remove`
     /// first in the synonym table and `carry` first in Zork's own verb entry,
     /// both at 0, and the tie was settled alphabetically in favour of the aside.
     /// The evidence is what separates them — the form itself, then the meaning,
     /// then what the story calls the answer as well, then bare grammatical
-    /// coincidence when nothing else answered at all.
+    /// coincidence when nothing else answered at all, then that same
+    /// coincidence stripped of even its one literal anchor.
     tier: usize,
     /// How far from what was typed — the edit distance, or 0 for a stem.
     distance: usize,
@@ -684,6 +702,18 @@ pub struct Pick {
     /// own, and the two cannot be told apart downstream once the line is a list
     /// of strings (SQ-1145).
     pub proposed: bool,
+    /// True for a candidate reached only by
+    /// [`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)
+    /// (tier 4) — a bare-noun grammatical coincidence with no literal
+    /// preposition anchoring it at all, the single commonest shape in the
+    /// medium and worthless as unvetted evidence (SQ-1644, and see that
+    /// source's own doc for why tier 3's preposition-anchored cousin is
+    /// exempt from this).
+    ///
+    /// A pick with this set must never reach the player through the unvetted
+    /// "this story knows" fallback — only through a vetted "try instead", or
+    /// not at all. [`offer_vocabulary`] is where that rule is enforced.
+    pub requires_vetting: bool,
 }
 
 /// The most an offer may name. Three, and it is a limit rather than a target:
@@ -729,6 +759,11 @@ const MIN_LEN: usize = 4;
 /// noun` is not a rare shape). `MAX_OFFERED` still applies after ranking, as
 /// it does to every source; this cap keeps the pool itself small before that
 /// ranking ever runs.
+///
+/// Shared with [`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)
+/// (tier 4, SQ-1644) rather than given a cap of its own: the two ask the same
+/// question of the same pool for the same reason, and never contribute in the
+/// same call (`by_bare_grammar_shape` only runs when tier 3 added nothing).
 const MAX_SHAPE_CANDIDATES: usize = 8;
 
 /// Words the parser ignores and a shape count must ignore with it.
@@ -777,6 +812,7 @@ impl StoryVocabulary {
         }
         self.by_story_synonym(position, &mut out);
         self.by_grammar_shape(position, nouns, preps, &mut out);
+        self.by_bare_grammar_shape(position, nouns, preps, &mut out);
         out
     }
 
@@ -1012,6 +1048,75 @@ impl StoryVocabulary {
         }
     }
 
+    /// [`by_grammar_shape`](Self::by_grammar_shape)'s own question, asked again
+    /// for the shape that source deliberately declines: a bare `VERB noun`
+    /// line, with no literal preposition anywhere in the command typed.
+    ///
+    /// `pickup toolcase` is the motivating case (SQ-1644): the player typed one
+    /// word, not two, so the synonym table's `pick up` key — a different
+    /// string — never matches, and `pickup` is no near miss or stem of `get`
+    /// either. Every source above this one, tier 3 included, answers nothing.
+    /// Yet `get toolcase` (or whichever verb this story spells that action) is
+    /// real, and its grammar's bare-noun line accepts exactly the shape typed.
+    ///
+    /// This is gated exactly like tier 3, with two differences:
+    ///
+    /// * **`preps` must be EMPTY, not non-empty.** This is tier 3's shape with
+    ///   the anchor removed — asked only when tier 3's own gate declined the
+    ///   command for lacking a literal preposition, never as a stronger
+    ///   alternative to it.
+    /// * **`self.prepositions` must not be empty.** Not the command typed —
+    ///   the STORY's whole grammar, which must spell a literal word
+    ///   *somewhere*, even though this command doesn't. A Scott Adams
+    ///   database's grammar is always `VERB` or `VERB noun` and never spells a
+    ///   literal word at all (`Verb::prepositions()` is empty for every verb
+    ///   that format can produce — see `by_grammar_shape`'s own doc), so
+    ///   `self.prepositions` is always empty there and this source never runs
+    ///   on that format at all. That is deliberate, not incidental: a bare
+    ///   `VERB noun` shape is EVERY line in that grammar, so the "commonest
+    ///   shape" problem tier 3's own gate protects against is at its worst
+    ///   there, and probing every candidate would cost the most for the least.
+    ///
+    /// Everything reached here is marked [`Candidate::tier`] 4, which
+    /// [`offer_picks`](Self::offer_picks) carries into
+    /// [`Pick::requires_vetting`]: unlike tier 3, a tier 4 candidate may never
+    /// be shown through the unvetted "this story knows" fallback — see that
+    /// field's own doc, and [`offer_vocabulary`] for where the rule is kept.
+    /// The bare shape this source trades on is the single commonest one in the
+    /// medium (nearly every verb accepts *some* object with no preposition at
+    /// all), which is exactly why [`by_grammar_shape`] excludes it from its
+    /// own UNVETTED claim; requiring vetting here is what makes surfacing it
+    /// safe rather than the noise the original gate was written to prevent.
+    fn by_bare_grammar_shape(
+        &self,
+        position: Position,
+        nouns: usize,
+        preps: &[&str],
+        out: &mut Vec<Candidate>,
+    ) {
+        if position != Position::Opening
+            || !out.is_empty()
+            || !preps.is_empty()
+            || self.prepositions.is_empty()
+        {
+            return;
+        }
+        for (order, verb) in self.verbs().iter().enumerate() {
+            if out.len() >= MAX_SHAPE_CANDIDATES {
+                break;
+            }
+            let Some(word) = verb.word() else { continue };
+            if !verb.accepts(nouns, preps) {
+                continue;
+            }
+            let word = word.to_string();
+            if out.iter().any(|c| c.word == word) {
+                continue;
+            }
+            out.push(Candidate { word, tier: 4, distance: 0, order, whole: true, exact_meaning: false });
+        }
+    }
+
     /// Can this dictionary word stand where the unknown one stood? The opening
     /// word of a command is the action, so only a verb belongs there; anywhere
     /// else it is part of a noun phrase, and a verb is not.
@@ -1115,7 +1220,7 @@ impl StoryVocabulary {
                 }
             };
             if seen.insert(word.clone()) {
-                picks.push(Pick { word, proposed: c.tier == 1 });
+                picks.push(Pick { word, proposed: c.tier == 1, requires_vetting: c.tier == 4 });
             }
             if picks.len() == MAX_OFFERED {
                 break;
@@ -1963,7 +2068,17 @@ pub fn offer_vocabulary(state: &mut AppState, engine: &dyn Engine, cmd: &str, pr
         }
         let position = if at == 0 { Position::Opening } else { Position::Inside };
         let rest: Vec<&str> = words[at + 1..].iter().map(String::as_str).collect();
-        let picks = config.spoken_offer(v.offer_picks(word, position, &rest, prose));
+        let raw_picks = v.offer_picks(word, position, &rest, prose);
+        // Computed on the RAW picks, before `spoken_offer` collapses them to
+        // `Vec<String>` and the provenance is gone (SQ-1644). Every raw pick
+        // here shares one tier — `by_bare_grammar_shape` (tier 4) only ever
+        // runs when nothing else contributed anything at all, so a call never
+        // mixes a tier-4 candidate with one from an earlier tier — but `all`
+        // is what the claim actually is ("nothing here may be shown unvetted"),
+        // so that is what is checked rather than relying on the mix never
+        // happening.
+        let must_vet = !raw_picks.is_empty() && raw_picks.iter().all(|p| p.requires_vetting);
+        let picks = config.spoken_offer(raw_picks);
         // Empty because nothing was confident enough, or because everything that
         // was got filtered — one answer either way, and it is silence. The word
         // is NOT recorded as answered: nothing was said, so nothing was spent.
@@ -1992,15 +2107,22 @@ pub fn offer_vocabulary(state: &mut AppState, engine: &dyn Engine, cmd: &str, pr
                     at,
                 })
             });
-        Some(match asked {
-            Some(pending) => Outcome::Asked(pending),
+        match asked {
+            Some(pending) => Some(Outcome::Asked(pending)),
+            // Every surviving pick came from a source that must never be shown
+            // unvetted (SQ-1644) and no probe answered — probing off, the seam
+            // unarmed, or `vetting_plan` couldn't build one. That is exactly
+            // "nothing survived" and gets the same answer: silence, with the
+            // word not recorded as answered, rather than the unvetted "this
+            // story knows" fallback below.
+            None if must_vet => None,
             None => {
                 vocab.mark_offered(word);
                 let offer =
                     build_offer(crate::assist::OfferKind::VocabularyOffer, word, &words, at, &picks);
-                Outcome::Now(format!("{LEAD_DICTIONARY}{}", picks.join(" · ")), offer)
+                Some(Outcome::Now(format!("{LEAD_DICTIONARY}{}", picks.join(" · ")), offer))
             }
-        })
+        }
     })();
     state.vocab = vocab;
     state.probe = probe;
@@ -2270,10 +2392,27 @@ mod tests {
     }
 
     /// Nothing confident, nothing said — the common answer, and the important one.
+    ///
+    /// **`xyzzy lamp` (one noun) stopped being silent under SQ-1644.** Every
+    /// verb `pocket_zork` holds accepts a bare, noun-only line, so once the
+    /// bare-noun grammar-shape source (tier 4) exists, `xyzzy lamp` is
+    /// exactly its motivating shape and a coincidental candidate is correctly
+    /// proposed — see `a_bare_shape_only_match_answers_when_nothing_else_can`
+    /// for that source's own test. What did NOT change is that such a
+    /// candidate is marked [`Pick::requires_vetting`] and so can never reach
+    /// the player through the unvetted fallback (`offer_vocabulary`), which
+    /// is the sense in which "nothing confident, nothing SAID" still holds.
+    /// This test's own assertion moves to zero nouns, a shape none of this
+    /// story's verbs answer at all, so it stays a case where even
+    /// `candidates()` proposes nothing whatsoever.
     #[test]
     fn silence_is_the_common_answer() {
         let v = pocket_zork();
-        assert!(v.offer("xyzzy", Position::Opening, &["lamp"], &[]).is_empty());
+        assert!(
+            v.offer("xyzzy", Position::Opening, &[], &[]).is_empty(),
+            "no verb here has a bare, noun-LESS line either, so even the weakest \
+             grammar-coincidence source has nothing to propose"
+        );
         assert!(
             v.offer("cas", Position::Inside, &[], &[]).is_empty(),
             "three letters is no evidence of a DISTANCE — `cas` is one keystroke from `case`, \
@@ -2982,5 +3121,159 @@ mod tests {
             "ten verbs share this shape; the raw pool must stop at the cap"
         );
         assert!(raw.iter().all(|c| c.tier == 3));
+    }
+
+    // ── SQ-1644: the bare-noun grammar-shape source, tier 4 ─────────────────
+
+    /// `touch` accepts a bare noun with no preposition at all; `put ON` is
+    /// here only to give the STORY's whole grammar a preposition somewhere —
+    /// required by `by_bare_grammar_shape`'s own gate, and unrelated to the
+    /// command under test, which has no preposition of its own.
+    fn a_story_with_a_bare_shape_only_match() -> StoryVocabulary {
+        let verbs = vec![
+            Verb::new(200, 0, vec!["touch".into()], vec![SyntaxLine::new(1, false, vec![noun()])]),
+            Verb::new(
+                199,
+                0,
+                vec!["put".into()],
+                vec![SyntaxLine::new(2, false, vec![noun(), word("on"), noun()])],
+            ),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["touch", "put"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        for w in ["lamp", "shelf"] {
+            words.insert(w.to_string(), roles(false, true));
+        }
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        StoryVocabulary::new(verbs, words, preps, 0)
+    }
+
+    /// **The headline case, unprepositioned.** `use lamp` has no literal word
+    /// at all — the shape [`by_grammar_shape`] (tier 3) declines — yet
+    /// `touch`'s bare-noun line accepts exactly it, and this story's grammar
+    /// has a preposition SOMEWHERE (`put ON`), so `by_bare_grammar_shape`'s
+    /// gate opens. Every candidate it contributes is tier 4 and marked
+    /// [`Pick::requires_vetting`] — unlike tier 3, this source is not
+    /// evidence enough to show unvetted (see `offer_vocabulary`, SQ-1644).
+    ///
+    /// Falsify by removing `by_bare_grammar_shape` from `candidates`: the
+    /// offer vanishes exactly as `by_grammar_shape`'s own headline case does
+    /// without it.
+    #[test]
+    fn a_bare_shape_only_match_answers_when_nothing_else_can() {
+        let v = a_story_with_a_bare_shape_only_match();
+        assert!(!v.knows("use"), "this story never heard of `use` at all");
+        let raw = v.candidates("use", Position::Opening, 1, &[]);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].word, "touch");
+        assert_eq!(raw[0].tier, 4);
+        assert_eq!(v.offer("use", Position::Opening, &["lamp"], &[]), vec!["touch"]);
+
+        let picks = v.offer_picks("use", Position::Opening, &["lamp"], &[]);
+        assert_eq!(picks.len(), 1);
+        assert!(
+            picks[0].requires_vetting,
+            "a tier-4 pick must be marked vetting-mandatory, unlike tier 3's own \
+             `a_prepositioned_shape_match_does_not_require_vetting` below"
+        );
+    }
+
+    /// The tier-3 counterpart to the assertion above: a preposition-anchored
+    /// shape match is NOT vetting-mandatory, exactly as it was before this
+    /// quest — it may still be shown through the unvetted "this story knows"
+    /// fallback, which is the behaviour SQ-1642 shipped and this quest must
+    /// not disturb.
+    #[test]
+    fn a_prepositioned_shape_match_does_not_require_vetting() {
+        let v = a_story_with_a_shape_only_match();
+        let picks = v.offer_picks("use", Position::Opening, &["lockpick", "on", "plate"], &[]);
+        assert_eq!(picks.len(), 1);
+        assert!(!picks[0].requires_vetting);
+    }
+
+    /// **The empty gate, unprepositioned.** A real candidate reached by FORM
+    /// must not be crowded out by a bare grammatical coincidence here either —
+    /// mirrors `a_shape_match_never_crowds_out_a_real_candidate` for the
+    /// source added in this quest.
+    #[test]
+    fn a_bare_shape_match_never_crowds_out_a_real_candidate() {
+        let verbs = vec![
+            Verb::new(201, 0, vec!["look".into()], vec![SyntaxLine::new(2, false, vec![])]),
+            Verb::new(200, 0, vec!["touch".into()], vec![SyntaxLine::new(1, false, vec![noun()])]),
+            Verb::new(
+                199,
+                0,
+                vec!["put".into()],
+                vec![SyntaxLine::new(3, false, vec![noun(), word("on"), noun()])],
+            ),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["look", "touch", "put"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        for w in ["lamp", "shelf"] {
+            words.insert(w.to_string(), roles(false, true));
+        }
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        let raw = v.candidates("lookx", Position::Opening, 1, &[]);
+        assert_eq!(
+            raw.len(),
+            1,
+            "the bare-shape source must add nothing once form already found something"
+        );
+        assert_eq!(raw[0].word, "look");
+        assert_eq!(v.offer("lookx", Position::Opening, &["lamp"], &[]), vec!["look"]);
+    }
+
+    /// A verb belongs only at the opening word — mirrors
+    /// `a_shape_match_never_fires_inside_a_noun_phrase` for the source added
+    /// here.
+    #[test]
+    fn a_bare_shape_match_never_fires_inside_a_noun_phrase() {
+        let v = a_story_with_a_bare_shape_only_match();
+        assert!(v.candidates("whatever", Position::Inside, 1, &[]).is_empty());
+        assert!(v.offer("use", Position::Inside, &["lamp"], &[]).is_empty());
+    }
+
+    /// **The Scott Adams exemption, in isolation.** A grammar whose every
+    /// `SyntaxLine` spells no literal word at all — exactly a Scott Adams
+    /// database's shape, `VERB` or `VERB noun` and never `VERB word noun`
+    /// (see `by_grammar_shape`'s own doc) — has `prepositions` empty even
+    /// though `touch` genuinely accepts the bare shape `use lamp` has: the
+    /// ONLY thing standing between this fixture and an offer is
+    /// `by_bare_grammar_shape`'s own `!self.prepositions.is_empty()` half of
+    /// its gate.
+    ///
+    /// The real-fixture regression guards for this
+    /// (`a_scott_story_does_not_credit_a_phrasal_synonym_through_truncation`,
+    /// `adv03_credits_no_phrasal_member_because_scott_adams_has_no_prepositions`
+    /// in `vocabulary_offer.rs`) exercise the same gate on real Scott Adams
+    /// dictionaries, where other conditions (near misses, meaning groups) are
+    /// also in play; this fixture isolates the ONE condition this quest adds.
+    ///
+    /// Falsify by dropping `!self.prepositions.is_empty()` from
+    /// `by_bare_grammar_shape`'s gate: `raw` fills with `touch` and this test
+    /// fails.
+    #[test]
+    fn a_grammar_with_no_prepositions_anywhere_never_offers_a_bare_shape_match() {
+        let verbs = vec![
+            Verb::new(200, 0, vec!["touch".into()], vec![SyntaxLine::new(1, false, vec![noun()])]),
+        ];
+        let mut words = BTreeMap::new();
+        words.insert("touch".to_string(), roles(true, false));
+        words.insert("lamp".to_string(), roles(false, true));
+        let v = StoryVocabulary::new(verbs, words, BTreeSet::new(), 0);
+
+        assert!(
+            v.candidates("use", Position::Opening, 1, &[]).is_empty(),
+            "a Scott-Adams-shaped grammar has no preposition anywhere, which must \
+             exclude the bare-shape source entirely, even though `touch` itself \
+             accepts the exact shape typed"
+        );
+        assert!(v.offer("use", Position::Opening, &["lamp"], &[]).is_empty());
     }
 }

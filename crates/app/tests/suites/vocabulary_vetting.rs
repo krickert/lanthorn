@@ -1324,3 +1324,83 @@ fn a_shape_only_match_is_vetted_and_surfaced_on_a_real_story() {
     // asserted on.
     eprintln!("(vetted picks surfaced here: {assists:?})");
 }
+
+// ── SQ-1644: the bare-noun grammar-shape source, tier 4 ─────────────────────
+
+/// **SQ-1644, the case the source exists for.** A real report: `pickup
+/// toolcase` (one word, no preposition) reaches none of the five sources
+/// SQ-1642 shipped — it is no near miss or stem of `get`, the synonym
+/// table's key is the two-word `pick up`, a different string from the one
+/// word typed, and tier 3 (`by_grammar_shape`) declines outright because the
+/// command has no literal preposition at all. Tier 4
+/// (`by_bare_grammar_shape`) asks tier 3's own question again for the bare
+/// shape tier 3 excludes, and — unlike tier 3 — may only ever reach the
+/// player once vetted.
+///
+/// Reproduced here against Zork I with a made-up verb (`glorpex`) that this
+/// story's dictionary, and every table the first five sources read, have
+/// never heard of: `glorpex mailbox` at West of House, where the mailbox is
+/// genuinely in scope and several bare-noun verbs (`open`, `take`, `examine`,
+/// …) do something real with it. The assertion is deliberately NOT pinned to
+/// a specific verb, mirroring SQ-1642's own Tangle test: the point is that
+/// the MECHANISM works — a real, vetted, functioning verb is surfaced for a
+/// bare-noun coincidence — not which verb the story's grammar and the
+/// ranking tie-break happen to put first. A vetted `try instead` pick is the
+/// strong claim; the unvetted `this story knows` fallback would mean the
+/// probe never confirmed anything and is not enough to pass this test.
+///
+/// Falsify by turning the bare-noun grammar-shape source off (temporarily
+/// hard-code `by_bare_grammar_shape` to return immediately): the offer
+/// vanishes and this test fails with no `try instead` line at all.
+#[test]
+fn a_bare_shape_only_match_is_vetted_and_surfaced_on_a_real_story() {
+    let Some(mut p) = Play::zork1() else { return };
+    p.turn("glorpex mailbox");
+    eprintln!("--- Zork I r88, turn 1, West of House ---\n{}\n", p.screen());
+
+    let offer = p.state.assist_offer.clone().expect("an offer was pushed for `glorpex`");
+    assert_eq!(
+        offer.kind,
+        app::assist::OfferKind::VettedOffer,
+        "a bare `this story knows` fallback means the probe never confirmed the verb \
+         actually does anything here, which tier 4 must never show at all (SQ-1644)"
+    );
+    assert_eq!(offer.word.as_deref(), Some("glorpex"));
+    assert!(!offer.picks.is_empty(), "at least one vetted pick must have survived");
+
+    let assists = p.assists();
+    assert!(
+        assists.iter().any(|l| l.starts_with("try instead — ")),
+        "a vetted recommendation must be on screen: {assists:?}"
+    );
+    eprintln!("(vetted picks surfaced here: {assists:?})");
+}
+
+/// **The other half of SQ-1644 — and the test that would have failed before
+/// `offer_vocabulary`'s `must_vet` check existed.** With `guidance_probe`
+/// off, no vetting can happen at all — exactly
+/// `without_the_probe_the_line_makes_the_weaker_claim` above, except every
+/// pick here comes from tier 4 alone (`glorpex mailbox` has nothing else to
+/// fall back to: no near miss, no meaning, no story synonym, and tier 3
+/// itself declines for lacking a literal preposition). Tier 0-3 fall back to
+/// the unvetted "this story knows" line in that situation; tier 4 must fall
+/// silent instead, because an unvetted claim built on the single commonest
+/// shape in the medium is exactly the noise tier 3's own preposition gate
+/// was written to keep out (see `by_bare_grammar_shape`'s own doc) — and
+/// this source has no preposition to anchor it at all.
+///
+/// Falsify by dropping the `None if must_vet => None` arm from
+/// `offer_vocabulary`: this test then fails with the bare-noun coincidence
+/// named unvetted, e.g. `this story knows — open`.
+#[test]
+fn without_a_probe_a_bare_shape_match_is_silent_not_unvetted() {
+    let Some(mut p) = Play::zork1() else { return };
+    p.state.config.guidance_probe = false;
+    p.turn("glorpex mailbox");
+    eprintln!("--- Zork I r88, turn 1, West of House, no probe ---\n{}\n", p.screen());
+    assert_eq!(
+        p.assists(),
+        Vec::<String>::new(),
+        "a tier-4-only offer must never fall back to the unvetted claim"
+    );
+}
