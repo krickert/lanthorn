@@ -34,6 +34,10 @@ while any such tag, or this Unreleased section, still exists.*
   of "get" — but only once it has actually confirmed the suggestion works
   here, since a bare command shape like that is too common to guess about
   otherwise.
+- The Guiding Light can now also spot a two-word command typed as one
+  running-together word, like "pickup" for "pick up", when the story's own
+  grammar confirms that verb really does use that exact word — again only
+  once confirmed, for the same reason.
 
 ## v0.8.1 — 2026-09-29
 

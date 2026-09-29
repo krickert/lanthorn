@@ -77,13 +77,28 @@
 //!    ([`Pick::requires_vetting`]) and [`offer_vocabulary`] never shows one
 //!    through the unvetted "this story knows" fallback — only through a
 //!    vetted "try instead", or not at all.
+//! 7. **A running-together of two of the story's own words — and only ever
+//!    shown once vetted, same as source 6.** Every source above answers
+//!    `pickup toolcase` with nothing at all, source 6 included: source 6
+//!    still needs SOME verb to accept the exact shape typed, and no verb of
+//!    this story is spelled `pickup`, one word. But this story's own `pick`
+//!    genuinely takes a literal `up` somewhere in its grammar
+//!    ([`grammar_model::Verb::prepositions`]) — `pickup` is `pick` and `up`
+//!    run together with no space. [`StoryVocabulary::by_word_split`] tries
+//!    every way of cutting the typed word into a leading and a trailing
+//!    piece and asks, of each cut, whether the LEADING piece names a verb
+//!    this story holds and the TRAILING piece is a literal word that very
+//!    verb's own grammar spells — a WORD-SEGMENTATION coincidence, never a
+//!    sentence-shape one, and the one gap sources 5 and 6 cannot reach
+//!    because neither of them ever looks at the typed word's characters at
+//!    all (SQ-1645).
 //!
 //! The first two and the fourth are answerable from the story file alone; the
 //! third is the only one that needs an outside corpus, and it needed no seam
 //! of its own to arrive — which is why the sources are a concatenation and
-//! not a chain. The fifth and sixth need nothing but the story file either,
-//! and are held back until the sources above them have nothing to say,
-//! because unlike those they are not evidence about the word at all.
+//! not a chain. The fifth, sixth and seventh need nothing but the story file
+//! either, and are held back until the sources above them have nothing to
+//! say, because unlike those they are not evidence about the word at all.
 //!
 //! Whatever proposes a candidate, [`StoryVocabulary::offer`] intersects it with
 //! this story's dictionary before anything is shown. **The player must never be
@@ -634,19 +649,22 @@ struct Candidate {
     /// sentence shape the player typed
     /// ([`by_grammar_shape`](StoryVocabulary::by_grammar_shape)), 4 for the
     /// same coincidence with no literal preposition at all
-    /// ([`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)) —
-    /// no claim about the word at all, the weakest of the five and why it
-    /// sorts last; tier 4 additionally may never be shown unvetted (see
+    /// ([`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)),
+    /// 5 for two of the story's own words found run together with no space
+    /// between them ([`by_word_split`](StoryVocabulary::by_word_split)) — no
+    /// claim about the word at all, the weakest ranks and why they sort
+    /// last; tiers 4 and 5 additionally may never be shown unvetted (see
     /// [`Pick::requires_vetting`]).
     ///
-    /// Five ranks and not two, because `order` is an index into whichever table
+    /// Six ranks and not two, because `order` is an index into whichever table
     /// a source read and says nothing across sources: `doff` reaches `remove`
     /// first in the synonym table and `carry` first in Zork's own verb entry,
     /// both at 0, and the tie was settled alphabetically in favour of the aside.
     /// The evidence is what separates them — the form itself, then the meaning,
     /// then what the story calls the answer as well, then bare grammatical
     /// coincidence when nothing else answered at all, then that same
-    /// coincidence stripped of even its one literal anchor.
+    /// coincidence stripped of even its one literal anchor, then a coincidence
+    /// of SEGMENTATION rather than of shape at all.
     tier: usize,
     /// How far from what was typed — the edit distance, or 0 for a stem.
     distance: usize,
@@ -704,11 +722,14 @@ pub struct Pick {
     pub proposed: bool,
     /// True for a candidate reached only by
     /// [`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)
-    /// (tier 4) — a bare-noun grammatical coincidence with no literal
-    /// preposition anchoring it at all, the single commonest shape in the
-    /// medium and worthless as unvetted evidence (SQ-1644, and see that
-    /// source's own doc for why tier 3's preposition-anchored cousin is
-    /// exempt from this).
+    /// (tier 4) or [`by_word_split`](StoryVocabulary::by_word_split) (tier
+    /// 5) — a bare-noun grammatical coincidence with no literal preposition
+    /// anchoring it at all, or a word-segmentation coincidence with no
+    /// claim about meaning at all; the single commonest shape in the medium
+    /// (tier 4) and a claim naming a phrase the player never typed at all
+    /// (tier 5), and worthless as unvetted evidence either way (SQ-1644,
+    /// SQ-1645; see each source's own doc for why tier 3's
+    /// preposition-anchored cousin is exempt from this).
     ///
     /// A pick with this set must never reach the player through the unvetted
     /// "this story knows" fallback — only through a vetted "try instead", or
@@ -766,6 +787,33 @@ const MIN_LEN: usize = 4;
 /// same call (`by_bare_grammar_shape` only runs when tier 3 added nothing).
 const MAX_SHAPE_CANDIDATES: usize = 8;
 
+/// The shortest a piece on either side of a
+/// [`by_word_split`](StoryVocabulary::by_word_split) cut may be.
+///
+/// A one-character piece is not a verb or a particle in any story this
+/// interpreter runs, and admitting it would mean every typed word starting or
+/// ending in a letter that also happens to be a one-letter verb abbreviation
+/// (`x`, `z`, `g`, `i`, `l`, `q` are common Infocom and Scott Adams shortcuts)
+/// produces a "split" on almost nothing. Two is the floor real English still
+/// clears — `log` + `in`, `pick` + `up`, `sit` + `on` all have a two-character
+/// side — and is deliberately not longer: a literal is very often a short
+/// preposition (`on`, `up`, `in`, `at`), and requiring three would silently
+/// drop the shortest and commonest ones.
+const MIN_SPLIT_LEN: usize = 2;
+
+/// The most raw candidates [`by_word_split`](StoryVocabulary::by_word_split)
+/// may put into the pool, mirroring [`MAX_SHAPE_CANDIDATES`]'s own reasoning
+/// but not its cap: that one bounds a walk over every verb in the story's
+/// WHOLE GRAMMAR, which can run to hundreds; this one bounds a walk over the
+/// cut points of one TYPED WORD, which is at most its length minus
+/// `2 * MIN_SPLIT_LEN` — for any word actually worth offering back to a
+/// player, already a handful. The cap exists anyway, and separately, because
+/// nothing here stops a player pasting something absurdly long into the
+/// input line, and a pool that size should still be bounded before
+/// [`offer_picks`](Self::offer_picks) ever ranks or trims it down to
+/// [`MAX_OFFERED`].
+const MAX_SPLIT_CANDIDATES: usize = 8;
+
 /// Words the parser ignores and a shape count must ignore with it.
 const ARTICLES: &[&str] = &["the", "a", "an", "some", "my", "his", "her", "its", "their"];
 
@@ -813,6 +861,7 @@ impl StoryVocabulary {
         self.by_story_synonym(position, &mut out);
         self.by_grammar_shape(position, nouns, preps, &mut out);
         self.by_bare_grammar_shape(position, nouns, preps, &mut out);
+        self.by_word_split(typed, position, &mut out);
         out
     }
 
@@ -1117,6 +1166,100 @@ impl StoryVocabulary {
         }
     }
 
+    /// LAST RESORT, beyond even tier 4: is the typed word simply TWO of the
+    /// story's own words, run together with no space? (SQ-1645, the reported
+    /// case: `pickup toolcase` in a story that implements `get toolcase` and
+    /// spells the action `pick up` as a verb plus a literal, not as a single
+    /// verb `pickup`.)
+    ///
+    /// This is not evidence about the word's FORM — `pickup` is not a near
+    /// miss or a stem of `get` at all, six keystrokes and no shared suffix.
+    /// It is not evidence about its MEANING either — the synonym table's key
+    /// is the two-word `pick up`, a different string from the one-word
+    /// `pickup` actually typed, so `by_meaning`'s exact lookup never reaches
+    /// it. And it is not the sentence-SHAPE coincidence tiers 3 and 4 look
+    /// for either — those never read the characters of `typed` at all, only
+    /// the number of noun phrases and literal words around it. This is a
+    /// fourth, genuinely different kind of gap: a coincidence of
+    /// SEGMENTATION, where the player's one typed token is this story's own
+    /// two tokens with the space missing.
+    ///
+    /// For every way of cutting `typed` into a leading piece and a trailing
+    /// piece, each at least [`MIN_SPLIT_LEN`] characters: does the leading
+    /// piece name a verb this story's dictionary holds
+    /// ([`Self::verb_named`]), and does that VERB's own grammar spell the
+    /// trailing piece literally somewhere
+    /// ([`grammar_model::Verb::prepositions`])? If both hold, this is not a
+    /// guess at a coincidence — it is a GRAMMAR FACT about this story's own
+    /// tables: `pick` is a real verb here, and its own syntax line genuinely
+    /// uses the literal `up`, so `pick up` is proposed, spelled the way the
+    /// verb and its literal are actually stored rather than the way the
+    /// player happened to type them (a truncated dictionary or a differently
+    /// cased literal would otherwise leak through).
+    ///
+    /// Gated exactly like tiers 3 and 4: the opening word only — a verb
+    /// belongs nowhere else — and only once every source above, tiers 0
+    /// through 4, has found NOTHING WHATSOEVER (`out.is_empty()` on entry).
+    /// A segmentation coincidence must not crowd out even a weak proposal
+    /// that is genuine evidence about the word, any more than a shape
+    /// coincidence may.
+    ///
+    /// **No separate Scott Adams exemption is needed, and none is added.**
+    /// Tier 4 needs its own `!self.prepositions.is_empty()` half-gate
+    /// because `Verb::accepts` does not care whether a verb's OWN table
+    /// carries a literal at all — a Scott Adams verb with no literals
+    /// anywhere still "accepts" a bare noun. This source asks a different
+    /// question: whether the leading piece's *own* [`Verb::prepositions`]
+    /// contains the trailing piece. A Scott Adams verb's `prepositions()` is
+    /// always empty (SQ-1240/SQ-1644 — that dialect's grammar is `VERB` or
+    /// `VERB noun`, never `VERB word noun`), so that check can never
+    /// succeed for one, and this source is silent on that format by
+    /// construction rather than by an added condition —
+    /// `a_grammar_with_no_prepositions_anywhere_never_offers_a_word_split_match`
+    /// below confirms it empirically rather than trusting the argument alone.
+    ///
+    /// **Marked vetting-mandatory** ([`Pick::requires_vetting`]), the same
+    /// treatment as tier 4 and for a related reason. A tier-5 match is a
+    /// stronger, more specific coincidence than tier 4's — it needs an EXACT
+    /// substring match on a real verb spelling and an EXACT literal the
+    /// verb's own grammar spells, not merely "some verb accepts this generic
+    /// shape" — but [`MIN_SPLIT_LEN`] admits pieces as short as two
+    /// characters on either side, and this medium is thick with two- and
+    /// three-letter verb abbreviations (`go`, `in`, `on` all plausibly name
+    /// a verb somewhere) that could coincide with an unrelated typo's
+    /// leading or trailing pair of characters. This source has not been
+    /// proven against a corpus the way tier 4's bare-shape gate was refined
+    /// against real fixtures before shipping (SQ-1644's own doc); requiring
+    /// vetting is the conservative default until it has been.
+    fn by_word_split(&self, typed: &str, position: Position, out: &mut Vec<Candidate>) {
+        if position != Position::Opening || !out.is_empty() {
+            return;
+        }
+        let chars: Vec<char> = typed.chars().collect();
+        if chars.len() < MIN_SPLIT_LEN * 2 {
+            return;
+        }
+        for i in MIN_SPLIT_LEN..=(chars.len() - MIN_SPLIT_LEN) {
+            if out.len() >= MAX_SPLIT_CANDIDATES {
+                break;
+            }
+            let w1: String = chars[..i].iter().collect();
+            let w2: String = chars[i..].iter().collect();
+            let Some(verb) = self.verb_named(&w1) else { continue };
+            let Some(canonical) = verb.word() else { continue };
+            let Some(literal) =
+                verb.prepositions().into_iter().find(|p| p.eq_ignore_ascii_case(&w2))
+            else {
+                continue;
+            };
+            let word = format!("{canonical} {literal}");
+            if out.iter().any(|c| c.word == word) {
+                continue;
+            }
+            out.push(Candidate { word, tier: 5, distance: 0, order: i, whole: true, exact_meaning: false });
+        }
+    }
+
     /// Can this dictionary word stand where the unknown one stood? The opening
     /// word of a command is the action, so only a verb belongs there; anywhere
     /// else it is part of a noun phrase, and a verb is not.
@@ -1220,7 +1363,11 @@ impl StoryVocabulary {
                 }
             };
             if seen.insert(word.clone()) {
-                picks.push(Pick { word, proposed: c.tier == 1, requires_vetting: c.tier == 4 });
+                picks.push(Pick {
+                    word,
+                    proposed: c.tier == 1,
+                    requires_vetting: matches!(c.tier, 4 | 5),
+                });
             }
             if picks.len() == MAX_OFFERED {
                 break;
@@ -3275,5 +3422,156 @@ mod tests {
              accepts the exact shape typed"
         );
         assert!(v.offer("use", Position::Opening, &["lamp"], &[]).is_empty());
+    }
+
+    // ── SQ-1645: the word-split source, tier 5 ───────────────────────────────
+
+    /// `pick` accepts a literal `up` after its noun; `toolcase`/`shelf` are the
+    /// nouns the fixture's story understands. The story never spells `pickup`
+    /// as one word at all, which is the whole gap this source closes.
+    fn a_story_with_a_squished_verb_and_literal() -> StoryVocabulary {
+        let verbs = vec![Verb::new(
+            200,
+            0,
+            vec!["pick".into()],
+            vec![SyntaxLine::new(1, false, vec![word("up"), noun()])],
+        )];
+        let mut words = BTreeMap::new();
+        words.insert("pick".to_string(), roles(true, false));
+        words.insert("toolcase".to_string(), roles(false, true));
+        let preps: BTreeSet<String> = ["up"].iter().map(|s| s.to_string()).collect();
+        StoryVocabulary::new(verbs, words, preps, 0)
+    }
+
+    /// **The headline case** (SQ-1645's own motivating report): `pickup
+    /// toolcase` reaches none of the first six sources — `pickup` is not a
+    /// near miss or stem of anything this pocket story holds, and it spells
+    /// no verb `pickup` at all. But this story's own `pick` genuinely takes
+    /// the literal `up`, so `pick` + `up` run together with no space is
+    /// exactly `pickup`, and the split finds it.
+    ///
+    /// Falsify by removing `by_word_split` from `candidates`: the offer
+    /// vanishes exactly as every other last-resort source's own headline case
+    /// does without it.
+    #[test]
+    fn a_word_split_proposes_a_verb_and_its_own_literal_run_together() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        assert!(v.knows("pick"), "the fixture's own setup");
+        assert!(!v.knows("pickup"), "this story never heard of `pickup` as one word");
+        let raw = v.candidates("pickup", Position::Opening, 1, &[]);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].word, "pick up");
+        assert_eq!(raw[0].tier, 5);
+        assert_eq!(v.offer("pickup", Position::Opening, &["toolcase"], &[]), vec!["pick up"]);
+    }
+
+    /// **The empty gate.** A real candidate reached by an earlier tier must
+    /// not be crowded out by a segmentation coincidence — mirrors
+    /// `a_bare_shape_match_never_crowds_out_a_real_candidate` for the source
+    /// added in this quest. `pickup` is one edit from the fixture's OTHER
+    /// verb `pickups` (an inserted `s`), so tier 0 finds that first, and the
+    /// split — which would otherwise also fire on this exact typed word, per
+    /// the test above — must add nothing once it has.
+    #[test]
+    fn a_word_split_never_crowds_out_a_real_candidate() {
+        let verbs = vec![
+            Verb::new(
+                200,
+                0,
+                vec!["pick".into()],
+                vec![SyntaxLine::new(1, false, vec![word("up"), noun()])],
+            ),
+            Verb::new(199, 0, vec!["pickups".into()], vec![SyntaxLine::new(2, false, vec![noun()])]),
+        ];
+        let mut words = BTreeMap::new();
+        words.insert("pick".to_string(), roles(true, false));
+        words.insert("pickups".to_string(), roles(true, false));
+        words.insert("toolcase".to_string(), roles(false, true));
+        let preps: BTreeSet<String> = ["up"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        let raw = v.candidates("pickup", Position::Opening, 1, &[]);
+        assert_eq!(
+            raw.len(),
+            1,
+            "the word-split source must add nothing once an earlier tier already found something"
+        );
+        assert_eq!(raw[0].word, "pickups");
+        assert_eq!(v.offer("pickup", Position::Opening, &["toolcase"], &[]), vec!["pickups"]);
+    }
+
+    /// A verb belongs only at the opening word — mirrors
+    /// `a_bare_shape_match_never_fires_inside_a_noun_phrase` for the source
+    /// added here.
+    #[test]
+    fn a_word_split_never_fires_inside_a_noun_phrase() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        assert!(v.candidates("pickup", Position::Inside, 1, &[]).is_empty());
+        assert!(v.offer("pickup", Position::Inside, &[], &[]).is_empty());
+    }
+
+    /// **A near miss on the MECHANISM, not just the headline case.** `pickme`
+    /// splits into a real verb (`pick`) plus a trailing piece (`me`) — but
+    /// `me` is not among `pick`'s own literal words, only `up` is, so nothing
+    /// may be proposed. Finding a real verb is not enough on its own; the
+    /// trailing piece has to be that exact verb's own literal.
+    #[test]
+    fn a_word_split_requires_the_trailing_piece_to_be_that_verbs_own_literal() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        assert!(!v.knows("pickme"), "the fixture's own setup");
+        let raw = v.candidates("pickme", Position::Opening, 1, &[]);
+        assert!(raw.is_empty(), "`me` is not among `pick`'s own literal words");
+        assert!(v.offer("pickme", Position::Opening, &["toolcase"], &[]).is_empty());
+    }
+
+    /// **Vetting is mandatory here, same treatment as tier 4.** A word-split
+    /// match is a coincidence of SEGMENTATION, not of meaning, and
+    /// [`MIN_SPLIT_LEN`] admits pieces as short as two characters — short
+    /// enough that this medium's own two- and three-letter verb
+    /// abbreviations could coincide with an unrelated typo. See
+    /// `by_word_split`'s own doc for the full reasoning, including why this
+    /// is the CONSERVATIVE default rather than the only defensible one.
+    #[test]
+    fn a_word_split_match_requires_vetting() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        let picks = v.offer_picks("pickup", Position::Opening, &["toolcase"], &[]);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].word, "pick up");
+        assert!(
+            picks[0].requires_vetting,
+            "a tier-5 pick must be marked vetting-mandatory, same treatment as tier 4's own \
+             `a_bare_shape_only_match_answers_when_nothing_else_can` companion assertion"
+        );
+    }
+
+    /// **The Scott Adams exemption, confirmed rather than assumed.** A
+    /// Scott-Adams-shaped grammar (`VERB` or `VERB noun`, never a literal
+    /// word anywhere — see `by_grammar_shape`'s own doc) means `pick`'s own
+    /// [`grammar_model::Verb::prepositions`] is empty even though `pick`
+    /// genuinely resolves as a verb and `up` is the exact trailing piece the
+    /// split under test produces. `by_word_split` needs no added condition to
+    /// stay silent here, unlike tier 4's own `!self.prepositions.is_empty()`
+    /// half-gate — the check this source already makes (does THIS verb's own
+    /// literal list contain the trailing piece) can never succeed against an
+    /// empty list, by construction.
+    ///
+    /// Falsify by imagining `by_word_split` used [`Self::prepositions`]
+    /// (the story-wide set) instead of `verb.prepositions()`: this fixture
+    /// would then need its own added gate to stay silent, the way tier 4
+    /// does, and does not.
+    #[test]
+    fn a_grammar_with_no_prepositions_anywhere_never_offers_a_word_split_match() {
+        let verbs =
+            vec![Verb::new(200, 0, vec!["pick".into()], vec![SyntaxLine::new(1, false, vec![noun()])])];
+        let mut words = BTreeMap::new();
+        words.insert("pick".to_string(), roles(true, false));
+        words.insert("toolcase".to_string(), roles(false, true));
+        let v = StoryVocabulary::new(verbs, words, BTreeSet::new(), 0);
+
+        assert!(
+            v.candidates("pickup", Position::Opening, 1, &[]).is_empty(),
+            "`pick`'s own grammar spells no literal word at all, so no split may name one"
+        );
+        assert!(v.offer("pickup", Position::Opening, &["toolcase"], &[]).is_empty());
     }
 }
