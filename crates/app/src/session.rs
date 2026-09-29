@@ -4716,6 +4716,12 @@ fn take_command_target(cmd: &str, vocab: Option<&crate::vocab::StoryVocabulary>)
 /// panel, and it also leaves a Glulx dictionary word exactly as truncated (`proprieto`,
 /// `shopkeepe`), never spelled out.
 ///
+/// A non-empty printed name is not automatically trusted either (SQ-1649): [`printed_name_is_a_non_name`]
+/// catches the cases where a story's own `printed_name` is real per-object text but never something
+/// a player could act on — a bare pronoun a ZIL game gave a background object's header name, or an
+/// Inform compiler-synthesised internal identifier standing in for one — and routes those through
+/// the same word-list tiers below as an absent printed name.
+///
 /// Two tiers, in the object's own word order (`ow.words`), which the tier-2 fallback below also
 /// prefers first — solving both problems at once with the same underlying idea `vocab.rs`'s
 /// `spell_out`/`spell` (SQ-1553) already established: **what the player has just read wins**.
@@ -4736,7 +4742,7 @@ pub(crate) fn item_tracker_display_name(
     ow: &grammar_model::ObjectWords,
     prose: &str,
 ) -> Option<String> {
-    if !ow.printed_name.is_empty() {
+    if !ow.printed_name.is_empty() && !printed_name_is_a_non_name(&ow.printed_name) {
         return Some(ow.printed_name.clone());
     }
     if ow.words.is_empty() {
@@ -4759,6 +4765,46 @@ pub(crate) fn item_tracker_display_name(
         }
     }
     Some(ow.words[0].clone())
+}
+
+/// A handful of bare pronouns/generics some ZIL games give a background-scenery object's own
+/// header short name (SQ-1649): HHGG's rose bed, wash-basin, wallpaper/chair and birdcage
+/// objects each store the literal two-character string `"it"` as their §12.4 header name —
+/// verified not a decoding bug (neighbouring objects at adjacent addresses decode sane text, and
+/// the same objects' own `words` carry their real vocabulary: `"basin"`/`"washba"`/`"sink"` for
+/// the wash-basin). A player is never shown a bare pronoun for anything else in this codebase, so
+/// there is nothing to lose by treating it the same as an absent printed name here.
+const BARE_NON_NAMES: [&str; 5] = ["it", "them", "this", "that", "thing"];
+
+/// True when `name` is not text an author wrote for a player to read at all, so
+/// [`item_tracker_display_name`] should treat it exactly like an absent printed name and fall
+/// through to the word-list tiers below (SQ-1649):
+///
+/// - A [`BARE_NON_NAMES`] pronoun (case-insensitive), or
+/// - An Inform 6/7 compiler-synthesised internal identifier standing in for the header name:
+///   parenthesised (Lost Pig's `"(missingOutside)"`, `"(whistle)"`, `"(missingBR)"`, `"(key)"` —
+///   [`zvm::objects::printed_name`]'s own doc names the identical convention for Inform's
+///   `MazeRoom` clones, `"(Alike_Maze_1)"`), or an identifier-cloning suffix (Lost Pig's six
+///   auto-multiplied brick instances, `"Brick_1"` .. `"Brick_6"`). Verified not a decoding bug on
+///   Lost Pig specifically: `zvm::objects::printed_name` — the SQ-1372-aware reader that checks
+///   the Inform `short_name` PROPERTY before falling back to the header — returns the exact same
+///   text, so these objects genuinely provide no player-facing name at all; the header identifier
+///   is all there is.
+fn printed_name_is_a_non_name(name: &str) -> bool {
+    if BARE_NON_NAMES.contains(&name.to_lowercase().as_str()) {
+        return true;
+    }
+    if name.starts_with('(') && name.ends_with(')') {
+        return true;
+    }
+    match name.rsplit_once('_') {
+        Some((head, tail)) => {
+            !tail.is_empty()
+                && tail.bytes().all(|b| b.is_ascii_digit())
+                && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
 }
 
 /// Whether `noun` (already lower-cased by [`take_command_target`]) names `words` (SQ-1631 Fix 2):
@@ -11680,5 +11726,103 @@ mod item_observation_tests {
     fn item_tracker_display_name_matches_case_insensitively() {
         let ow = no_name_object(&["trenchcoat", "coat"], None);
         assert_eq!(item_tracker_display_name(&ow, "Trenchcoat pockets bulge with odds and ends."), Some("trenchcoat".to_string()));
+    }
+
+    // ── printed_name_is_a_non_name / bare-pronoun & internal-identifier filtering (SQ-1649) ────
+
+    #[test]
+    fn printed_name_is_a_non_name_catches_every_bare_pronoun_case_insensitively() {
+        for w in BARE_NON_NAMES {
+            assert!(printed_name_is_a_non_name(w), "{w:?} should be caught");
+            assert!(printed_name_is_a_non_name(&w.to_uppercase()), "{w:?} uppercased should still be caught");
+        }
+    }
+
+    #[test]
+    fn printed_name_is_a_non_name_catches_lost_pigs_actual_specimens() {
+        // The exact strings SQ-1649 found in Lost Pig's own compiled object table.
+        for w in ["(missingOutside)", "(whistle)", "(missingBR)", "(key)"] {
+            assert!(printed_name_is_a_non_name(w), "{w:?} (Inform's own no-name-given convention) should be caught");
+        }
+        for n in 1..=6 {
+            let w = format!("Brick_{n}");
+            assert!(printed_name_is_a_non_name(&w), "{w:?} (a cloned instance's synthesized name) should be caught");
+        }
+    }
+
+    #[test]
+    fn printed_name_is_a_non_name_never_catches_a_real_printed_name() {
+        for w in [
+            "brass lantern",
+            "Mr. Prosser",
+            "Ford Prefect",
+            "your gown",
+            "thing your aunt gave you which you don't know what it is",
+        ] {
+            assert!(!printed_name_is_a_non_name(w), "{w:?} is real author-written text, must not be filtered");
+        }
+    }
+
+    #[test]
+    fn printed_name_is_a_non_name_requires_a_closing_paren_and_a_digit_only_suffix() {
+        // An unterminated paren isn't the Inform convention this guards against.
+        assert!(!printed_name_is_a_non_name("(a note, unfinished"));
+        // An underscore whose tail isn't purely digits is an ordinary compound word, not a clone
+        // suffix — must not be swept up by the same rule that catches "Brick_1".
+        assert!(!printed_name_is_a_non_name("Number_Six"));
+        assert!(!printed_name_is_a_non_name("under_construction"));
+    }
+
+    #[test]
+    fn item_tracker_display_name_skips_a_bare_pronoun_printed_name_and_falls_back_to_the_word_list() {
+        // HHGG's own wash-basin (SQ-1649): a real ZIL object whose header short name is
+        // literally "it", whose real vocabulary is its word list.
+        let ow = grammar_model::ObjectWords::new(
+            153,
+            "it".to_string(),
+            vec!["basin".to_string(), "washba".to_string(), "sink".to_string()],
+            Some(31),
+            Some(6),
+        );
+        assert_eq!(
+            item_tracker_display_name(&ow, "You are in a small bedroom."),
+            Some("basin".to_string()),
+            "a bare pronoun printed name must fall through to the word-list tiers, not show \"it\""
+        );
+    }
+
+    #[test]
+    fn item_tracker_display_name_skips_a_parenthesised_internal_identifier() {
+        // Lost Pig's own metal whistle (SQ-1649), given no explicit name by its author.
+        let ow = grammar_model::ObjectWords::new(
+            104,
+            "(whistle)".to_string(),
+            vec!["thing".to_string(), "whistle".to_string(), "tube".to_string(), "metal".to_string()],
+            Some(1),
+            Some(9),
+        );
+        assert_eq!(
+            item_tracker_display_name(&ow, "You take the metal whistle."),
+            Some("whistle".to_string()),
+            "an Inform internal identifier must fall through to the word-list tiers, never show the parenthesised form"
+        );
+    }
+
+    #[test]
+    fn item_tracker_display_name_skips_a_cloned_instances_synthesized_suffix() {
+        // Lost Pig's own bricks (SQ-1649): six auto-multiplied instances, each printing its
+        // compiler-synthesized clone name ("Brick_1" .. "Brick_6") with no prose match available.
+        let ow = grammar_model::ObjectWords::new(
+            47,
+            "Brick_1".to_string(),
+            vec!["whole".to_string(), "brick".to_string(), "brown".to_string()],
+            Some(1),
+            Some(9),
+        );
+        assert_eq!(
+            item_tracker_display_name(&ow, "Nothing here names it."),
+            Some("whole".to_string()),
+            "a cloned instance's synthesized name must fall through to the word-list tiers"
+        );
     }
 }

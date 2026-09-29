@@ -436,6 +436,30 @@ fn hhgg_reaches_its_ending_with_no_fault_and_a_sane_mapper_and_hints_state() {
             );
         }
     }
+
+    // ---- SQ-1649: no bare pronoun/generic ever reaches the tracker as an item's display name,
+    // and the player's own avatar object is never tracked as if it were an item of itself ----
+    //
+    // HHGG's own avatar object (#31) prints the header short name "it" and its only parse word is
+    // "protag" ("PROTAGONIST" truncated to 6 chars) — before `zvm::location`'s `PLAYER_WORDS`
+    // recognised that word, this object was never identified as the player, so it followed the
+    // player into every room as a persistent fake "it" item, AND — the bigger half of the same
+    // gap — the story's carried inventory was never tracked at all (no `player_obj` to walk),
+    // empirically 0 of 3,319 item observations `Carried` in the full walkthrough.
+    for (key, rec) in &items {
+        let lower = rec.name.to_lowercase();
+        assert!(
+            !["it", "them", "this", "that", "thing"].contains(&lower.as_str()),
+            "item {key} tracked under the bare pronoun {:?} — item_tracker_display_name should have \
+             fallen through to a real word from the object's own vocabulary instead",
+            rec.name
+        );
+    }
+    assert!(
+        items.iter().any(|(_, r)| matches!(r.last_seen, mapper::graph::ItemLocation::Carried)),
+        "HHGG's avatar (\"protag\") must now be recognised as the player, so the playthrough's own \
+         inventory (screwdriver, towel, satchel, …) should show up as Carried at least once"
+    );
 }
 
 #[test]

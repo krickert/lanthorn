@@ -409,6 +409,33 @@ fn lostpig_reaches_its_best_ending_with_no_fault_and_a_sane_mapper_and_hints_sta
             );
         }
     }
+
+    // ---- SQ-1649: no compiler-internal Inform identifier ever reaches the tracker as an item's
+    // display name ----
+    //
+    // Lost Pig gives several objects no explicit name at all: a parenthesised placeholder
+    // ("(missingOutside)", "(whistle)", "(missingBR)", "(key)" -- Inform's own convention for an
+    // object the author never gave a printed name, verified via `zvm::objects::printed_name`'s
+    // own doc for the identical `MazeRoom` shape) and six auto-multiplied brick instances
+    // ("Brick_1" .. "Brick_6"). `item_tracker_display_name` must fall through to a real word from
+    // each object's own vocabulary instead of showing the raw identifier.
+    for (key, rec) in &items {
+        let looks_like_an_identifier = (rec.name.starts_with('(') && rec.name.ends_with(')'))
+            || rec
+                .name
+                .rsplit_once('_')
+                .is_some_and(|(head, tail)| {
+                    !tail.is_empty()
+                        && tail.bytes().all(|b| b.is_ascii_digit())
+                        && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                });
+        assert!(
+            !looks_like_an_identifier,
+            "item {key} tracked under the compiler-internal identifier {:?} -- item_tracker_display_name \
+             should have fallen through to a real word from the object's own vocabulary instead",
+            rec.name
+        );
+    }
 }
 
 #[test]

@@ -48,6 +48,15 @@ while any such tag, or this Unreleased section, still exists.*
 - Tracked items with no formal in-game name now show a real word from the
   story's own text — spelled out in full, not cut off mid-word — instead of
   a run-on string listing every word the parser would have accepted for them.
+- Tracked items no longer show up under a bare "it" or "thing", or under a raw
+  internal placeholder name like "Brick_1" — a handful of games give an
+  object one of those instead of a real name, and the tracker now shows a
+  proper word from the story's own vocabulary there too.
+- Fixed a bug where a game could fail to recognize your own character as the
+  player, which showed your character up as a bogus tracked item that
+  followed you into every room, and meant nothing you carried ever showed up
+  in the tracked-items list at all (*The Hitchhiker's Guide to the Galaxy* was
+  affected this way for its whole length).
 
 ## v0.8.1 — 2026-09-29
 
