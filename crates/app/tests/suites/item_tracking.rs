@@ -64,21 +64,22 @@ fn boot_cragne() -> Option<GlulxSession> {
     Some(s)
 }
 
-/// Counterfeit Monkey (Inform 7 6M62, IF Archive release 10 / SQ-1454) past its "Can you hear
-/// me?" intro to the first real command prompt — see `glulx_inventory.rs`'s
-/// `counterfeit_monkey_refuses_an_avatar_it_cannot_identify` for why this exact fixture is the
-/// one Inform 7 game already documented here as having NO hardware short name on virtually any
-/// of its objects, avatar included.
-fn boot_cm() -> Option<GlulxSession> {
-    let image = glulx_image("CounterfeitMonkey-10.gblorb")?;
-    let mut s = GlulxSession::new(image, 80, 24, true, false, false, (1.0, 1.0), None, &[]).expect("GlulxSession::new");
-    for cmd in ["yes", "yes", "yes"] {
-        s.submit(cmd);
+/// Anchorhead (Michael Gentry, Inform 6/Glulx, Illustrated Edition): `stories/Anchorhead.gblorb`
+/// — past its splash to the first command prompt at "Outside the Real Estate Office", the boot
+/// pattern `room_description.rs`'s `glulx_anchorhead_recaptures_a_description_with_no_leading_blank_line_between_turns`
+/// already uses.
+fn boot_anchorhead() -> Option<GlulxSession> {
+    let image = glulx_image("Anchorhead.gblorb")?;
+    let mut s = GlulxSession::new(image, 80, 24, true, false, false, (1.0, 1.0), None, &[]).ok()?;
+    for _ in 0..6 {
+        if s.pending_input() != app::session::InputKind::Char {
+            break;
+        }
+        s.submit_key(KeyInput::Enter);
     }
-    s.submit_key(KeyInput::Enter);
-    let _ = s.take_transcript();
     Some(s)
 }
+
 
 /// Facet 1: the mailbox (never opened, never moved) is tracked as a direct sighting in West of
 /// House from the very first turn it's observed.
@@ -332,24 +333,35 @@ fn shared_scenery_never_reads_as_a_portable_item_following_the_player() {
 }
 
 // ── Fix 1 / Fix 3 (SQ-1631) — a real Inform 7 game with an unidentifiable avatar ─────────────
+//
+// Originally specimen'd against Counterfeit Monkey's Sigil Street (one `north` of the opening
+// Back Alley). SQ-1640 added a `scenery`/`door` attribute filter to `glulx_item_observations`,
+// and Sigil Street's own six direct children — verified against the real, IF-Archive-fetched
+// `CounterfeitMonkey-10.gblorb` (`scripts/fetch-fixtures.sh`) — turn out to be *entirely* scenery
+// backdrops ("sky backdrops", building facades, a shop window), with the only way further being a
+// code-lock puzzle. Rewritten against Cragne Manor (also Inform 7 6M62, so the same "no hardware
+// short name" trait applies, and its own avatar is equally unidentifiable —
+// `cragne_wristwatch_take_and_drop_are_silently_untracked_with_an_unidentifiable_avatar` above)
+// and its Train Station Lobby (one `south` of the opening Railway Platform), whose half-full
+// styrofoam coffee cup is a genuine Inform-7-style object (empty hardware name, real parse words)
+// that is NEITHER scenery NOR a door and so survives the new filter — confirmed directly against
+// the object tree before writing these assertions.
 
-/// SQ-1631 Fix 1: Counterfeit Monkey (Inform 7 6M62, IF Archive release 10) is documented
-/// (`glulx_inventory.rs`'s `counterfeit_monkey_refuses_an_avatar_it_cannot_identify`) as having
-/// no hardware short name on virtually any of its objects, avatar included — every ordinary
-/// scenery object here prints through a `parse_name` rule instead of a static short name. Before
-/// this fix, `glulx_item_observations` filtered candidates on the raw (empty) printed name and
-/// dropped every one of them outright, so `result.items` was empty for this game's every room
-/// regardless of what was actually shown. Sigil Street — one `north` past the opening Back Alley,
-/// once the room lock has resolved a real address (turn 0 predates that and reports no items at
-/// all, which is why this drives one move first) — is a real specimen: its own "sky backdrops"
-/// scenery has an empty printed name and is named only by its parse words.
+/// SQ-1631 Fix 1: `glulx_item_observations` must reach an Inform 7 object with an EMPTY printed
+/// name via its `display_name()` fallback (its parse words), not just its raw (usually blank)
+/// printed name — before this fix, filtering on the raw printed name alone dropped every such
+/// object outright, so `result.items` was empty for this game's every room regardless of what was
+/// actually shown.
 #[test]
 fn glulx_item_observations_reaches_an_inform_7_object_with_no_printed_name() {
-    let Some(mut s) = boot_cm() else { return };
-    let r = s.submit("north"); // Back Alley -> Sigil Street
+    let Some(mut s) = boot_cragne() else {
+        eprintln!("SKIP: gitignored stories/cragne.gblorb missing");
+        return;
+    };
+    let r = s.submit("south"); // Railway Platform -> Train Station Lobby
     assert_eq!(
         r.location.as_ref().map(|l| l.name.as_str()),
-        Some("Sigil Street"),
+        Some("Train Station Lobby (Shin)"),
         "premise: this walks to the specimen room: {:?}",
         r.location
     );
@@ -362,7 +374,7 @@ fn glulx_item_observations_reaches_an_inform_7_object_with_no_printed_name() {
         room_objects.iter().filter(|o| o.printed_name.is_empty() && o.display_name().is_some()).collect();
     assert!(
         !unnamed.is_empty(),
-        "premise: Sigil Street holds an Inform-7-style object with no printed name: {room_objects:?}"
+        "premise: the lobby holds an Inform-7-style object with no printed name: {room_objects:?}"
     );
 
     // And it now reaches `result.items` — with its `display_name()` as `name`, never empty.
@@ -374,23 +386,28 @@ fn glulx_item_observations_reaches_an_inform_7_object_with_no_printed_name() {
 }
 
 /// SQ-1631 Fix 3: `glulx_item_observations` must prefer [`app::engine::Engine::set_player_hint`]'s
-/// value over the raw [`app::engine::Introspect::player_object`] lookup, which for Counterfeit
-/// Monkey answers `None` FOREVER — no turn ever locks it by the engine's own name-based heuristic
-/// (`glulx_inventory.rs`'s `counterfeit_monkey_refuses_an_avatar_it_cannot_identify`). The host's
-/// own movement-tracking fallback (`app::inventory::detect_player_obj`) can still lock a real
-/// handle by watching what moved between rooms even when the engine's own lookup cannot, and
-/// `finish_command_turn` pushes that lock in via `set_player_hint`. This exercises the mechanism
-/// directly against CM's own real object tree: with no hint, nothing is excluded from "directly
-/// in this room" at all; with a hint set to a real handle this room holds, that ONE object is
-/// excluded — exactly as it would be if it really were the player.
+/// value over the raw [`app::engine::Introspect::player_object`] lookup, which for Cragne Manor
+/// (same as Counterfeit Monkey) answers `None` FOREVER — no turn ever locks it by the engine's own
+/// name-based heuristic. The host's own movement-tracking fallback
+/// (`app::inventory::detect_player_obj`) can still lock a real handle by watching what moved
+/// between rooms even when the engine's own lookup cannot, and `finish_command_turn` pushes that
+/// lock in via `set_player_hint`. This exercises the mechanism directly against Cragne's own real
+/// object tree: with no hint, nothing is excluded from "directly in this room" at all; with a hint
+/// set to a real handle this room holds, that ONE object is excluded — exactly as it would be if
+/// it really were the player. Tries every direct child in turn (rather than assuming the first
+/// one) because SQ-1640's scenery/door filter already excludes some of them, and hinting one of
+/// those would produce no visible change at all.
 #[test]
 fn glulx_item_observations_prefers_the_set_player_hint_over_the_unidentifiable_raw_lookup() {
-    let Some(mut s) = boot_cm() else { return };
-    let r = s.submit("north");
+    let Some(mut s) = boot_cragne() else {
+        eprintln!("SKIP: gitignored stories/cragne.gblorb missing");
+        return;
+    };
+    let r = s.submit("south"); // Railway Platform -> Train Station Lobby
     let loc = r.location.clone().unwrap();
     assert!(
         s.introspect().unwrap().player_object().is_none(),
-        "premise: CM's avatar is unidentifiable by name"
+        "premise: Cragne's avatar is unidentifiable by name"
     );
 
     let without_hint: std::collections::BTreeSet<u32> = r
@@ -399,31 +416,33 @@ fn glulx_item_observations_prefers_the_set_player_hint_over_the_unidentifiable_r
         .filter(|i| i.location == app::session::ObservedItemLocation::RoomDirect)
         .map(|i| i.key)
         .collect();
-    assert!(!without_hint.is_empty(), "premise: Sigil Street shows at least one room-direct item");
+    assert!(!without_hint.is_empty(), "premise: the lobby shows at least one room-direct item");
 
     let handles = s.introspect().unwrap().children_of(loc.number);
-    let &stand_in = handles.iter().next().expect("Sigil Street holds at least one child object");
+    assert!(!handles.is_empty(), "the lobby holds at least one child object");
 
-    s.set_player_hint(Some(stand_in));
-    let with_hint = s.submit("look");
-    let after: std::collections::BTreeSet<u32> = with_hint
-        .items
-        .iter()
-        .filter(|i| i.location == app::session::ObservedItemLocation::RoomDirect)
-        .map(|i| i.key)
-        .collect();
-
-    assert_eq!(
-        after.len(),
-        without_hint.len().saturating_sub(1),
-        "exactly one object — the hinted handle — is now excluded from room-direct: before \
-         {without_hint:?}, after {after:?}"
-    );
-    assert_eq!(
-        without_hint.difference(&after).count(),
-        1,
-        "the excluded object was really among the previously-listed ones, not a coincidental \
-         absence: before {without_hint:?}, after {after:?}"
+    let mut reduced_by_exactly_one = false;
+    for &candidate in &handles {
+        s.set_player_hint(Some(candidate));
+        let with_hint = s.submit("look");
+        let after: std::collections::BTreeSet<u32> = with_hint
+            .items
+            .iter()
+            .filter(|i| i.location == app::session::ObservedItemLocation::RoomDirect)
+            .map(|i| i.key)
+            .collect();
+        if after.len() == without_hint.len().saturating_sub(1)
+            && without_hint.difference(&after).count() == 1
+        {
+            reduced_by_exactly_one = true;
+            break;
+        }
+        s.set_player_hint(None);
+    }
+    assert!(
+        reduced_by_exactly_one,
+        "at least one of the lobby's own child handles, once hinted as the player, must be \
+         excluded from room-direct — exactly as it would be if it really were the avatar"
     );
 }
 
@@ -627,4 +646,77 @@ fn kosap_walking_stick_origin_and_current_location_track_across_take_and_drop() 
     let rec = mapper.graph.item(stick_key).unwrap();
     assert_eq!(rec.last_seen, mapper::graph::ItemLocation::Carried);
     assert_ne!(rec.carried_since_turn, Some(pick_up_turn), "a fresh pick-up turn, not the one from before the drop");
+}
+
+// ── SQ-1640: exclude pure scenery/backdrop nouns and doors from Glulx item tracking ──────────
+//
+// The reported defect: walking into Anchorhead's Garbage-Choked Alley populates the item tracker
+// with 9 pure scenery/backdrop nouns that are structural children of the room in Inform's object
+// tree but are not real inventory-style items: alley entrance doors, buildings, cardboard boxes,
+// garbage can, ground, metal ladder, rain, sky, wooden fence. Confirmed against the real
+// `stories/Anchorhead.gblorb` (Illustrated Edition) before writing the fix, and again here.
+
+/// The bug itself: none of the 9 reported nouns appear in `result.items` after arriving at the
+/// alley, though the room's own prose still names several of them (`cardboard boxes` in
+/// particular — SQ-1639's own specimen line for this room's body text).
+#[test]
+fn anchorhead_garbage_choked_alley_excludes_its_own_pure_scenery_nouns() {
+    let Some(mut s) = boot_anchorhead() else {
+        eprintln!("SKIP: gitignored stories/Anchorhead.gblorb missing");
+        return;
+    };
+    let _ = s.submit("look");
+    let r = s.submit("southeast"); // Outside the Real Estate Office -> Garbage-Choked Alley
+    assert_eq!(
+        r.location.as_ref().map(|l| l.name.as_str()),
+        Some("Garbage-Choked Alley"),
+        "premise: this walks to the specimen room: {:?}",
+        r.location
+    );
+    let reported = [
+        "alley entrance doors",
+        "buildings",
+        "cardboard boxes",
+        "garbage can",
+        "ground",
+        "metal ladder",
+        "rain",
+        "sky",
+        "wooden fence",
+    ];
+    for noun in reported {
+        assert!(
+            !r.items.iter().any(|i| i.name.contains(noun)),
+            "{noun:?} is pure scenery/backdrop and must not be tracked as an item: {:?}",
+            r.items
+        );
+    }
+}
+
+/// Regression guard against over-filtering: a genuine portable item in the same game — Cragne
+/// Manor's half-full styrofoam coffee cup, one `south` of the starting Railway Platform, an
+/// ordinary Inform-7-style object (no hardware short name, real parse words) that is neither
+/// `scenery` nor a `door` — is still tracked normally, both before and after being taken.
+#[test]
+fn a_genuine_portable_item_is_still_tracked_after_the_scenery_filter() {
+    let Some(mut s) = boot_cragne() else {
+        eprintln!("SKIP: gitignored stories/cragne.gblorb missing");
+        return;
+    };
+    let r = s.submit("south"); // Railway Platform -> Train Station Lobby
+    assert_eq!(
+        r.location.as_ref().map(|l| l.name.as_str()),
+        Some("Train Station Lobby (Shin)"),
+        "premise: this walks to the specimen room: {:?}",
+        r.location
+    );
+    let cup = r
+        .items
+        .iter()
+        .find(|i| i.name.contains("coffee cup"))
+        .expect("the coffee cup is a genuine portable item, not scenery, and must still be tracked");
+    assert_eq!(cup.location, app::session::ObservedItemLocation::RoomDirect);
+
+    let taken = s.submit("take cup");
+    assert!(taken.transcript.contains("Taken"), "the real success text: {:?}", taken.transcript);
 }

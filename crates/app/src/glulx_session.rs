@@ -1515,12 +1515,30 @@ impl GlulxSession {
     /// virtually every Inform 7 game `result.items` was previously empty here regardless, because
     /// this format's `printed_name` is routinely blank (Fix 1 below); once that filter is widened,
     /// the player-id bypass alone would still misfire for an unnamed player object.
+    ///
+    /// **SQ-1640: excludes pure scenery/backdrop nouns and doors**, read live off each object's
+    /// own `scenery`/`door` attribute bits (`gvm::objects::ParseNames::is_scenery_or_door`) —
+    /// structural children of the room they stand in exactly like a portable object is, but not
+    /// real inventory-style items (an alley's entrance doors, its garbage can, its sky). Deliberately
+    /// does NOT exclude `static`: a static-but-not-scenery object (a vending machine, a patch of
+    /// soil) is still a genuine take-and-fail candidate for `session::classify_take_attempt`'s
+    /// fixed-in-place detector, which needs it present in `result.items` to work at all. Where this
+    /// image's identifier-names table cannot resolve one or both attribute numbers at all
+    /// (`$OMIT_SYMBOL_TABLE`, or a library that spells neither), `is_scenery_or_door` fails open —
+    /// never hides a real item because the check was inconclusive.
     fn glulx_item_observations(&self, location: Option<&LocationInfo>) -> Vec<crate::session::ItemObservation> {
         use crate::session::{ItemObservation, ObservedItemLocation};
         let mut out = Vec::new();
         let player = self.player_hint.or_else(|| Introspect::player_object(self));
+        let names = self.parse_names();
+        let mem = self.machine.mem();
+        let is_scenery_or_door =
+            |id: u32| names.is_some_and(|n| n.is_scenery_or_door(mem, id));
         if let Some(loc) = location {
             for ow in self.room_objects_excluding(loc.number, player) {
+                if is_scenery_or_door(ow.id) {
+                    continue;
+                }
                 // SQ-1631 Fix 1: `display_name`, not the raw printed name alone — Inform 7's
                 // objects routinely have no hardware short name at all, only parse words, and a
                 // filter on the bare printed name drops every one of them (the exact SQ-1042 bug
@@ -1533,6 +1551,9 @@ impl GlulxSession {
         }
         if let Some(p) = player {
             for ow in self.contents(p) {
+                if is_scenery_or_door(ow.id) {
+                    continue;
+                }
                 let Some(name) = ow.display_name() else {
                     continue;
                 };
@@ -4970,5 +4991,85 @@ mod tests {
         // And round-trips: a second boot against the same story and dir honours it.
         let s2 = boot_for_sidecar(&dir);
         assert_eq!(s2.locked_room_global(), Some(2048), "what was written is what gets read back");
+    }
+
+    /// SQ-1640: a genuinely `static`-but-not-`scenery`/`door` object must still reach
+    /// `result.items` — the property [`GlulxSession::glulx_item_observations`]'s own doc says the
+    /// new filter deliberately preserves, so `session::classify_take_attempt`'s fixed-in-place
+    /// detector still has something to flag. Falsified by temporarily widening the filter in
+    /// `glulx_item_observations` to also exclude `static` and re-running: this test then fails
+    /// with the chair missing from `items` entirely (confirmed by hand before writing the fix).
+    ///
+    /// Reached via a synthetic [`LocationInfo`] rather than real navigation: Cragne Manor's own
+    /// office chair (`mp-chair`, a `supporter` carrying only the `static` attribute of the three
+    /// this fix reads) sits several rooms past a still-unsolved code-lock puzzle beyond the
+    /// starting Railway Platform. Every room reachable by ordinary movement from there — checked
+    /// directly against the real compiled object tree before writing this test — turns out to hold
+    /// either purely `scenery`/`door` objects or ordinary takeable ones (Train Station Lobby's
+    /// coffee cup, `item_tracking.rs`'s own specimen for that case), never a clean static-only
+    /// fixture. `glulx_item_observations` is a private method precisely because it is the seam
+    /// under test here; calling it directly, with a `LocationInfo` built from the chair's own real
+    /// room address via [`GlulxSession::handle_for`] (the same resolution a real arrival would
+    /// produce), exercises the exact production code path against real compiled data without
+    /// needing a walkthrough of an unsolved puzzle.
+    #[test]
+    fn glulx_item_observations_keeps_a_static_only_object_so_fixed_in_place_can_flag_it() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let local = manifest.join("../../stories/cragne.gblorb");
+        let tracked = manifest.join("tests/fixtures/stories/cragne.gblorb");
+        let path = if local.is_file() { local } else { tracked };
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("SKIP: cragne.gblorb missing at {}", path.display());
+            return;
+        };
+        let b = blorb::Blorb::parse(bytes).expect("blorb parse");
+        let (kind, image) = b.executable().expect("has an executable chunk");
+        assert_eq!(kind, blorb::ExecKind::Glulx);
+        let mut s = GlulxSession::new(image.to_vec(), 80, 24, true, false, false, (1.0, 1.0), None, &[])
+            .expect("GlulxSession::new");
+        for _ in 0..6 {
+            if s.pending_input() != crate::session::InputKind::Char {
+                break;
+            }
+            s.submit_key(KeyInput::Enter);
+        }
+        for cmd in ["yes", "yes"] {
+            s.submit(cmd);
+        }
+        s.submit_key(KeyInput::Enter);
+
+        // mp-chair's own real address, found once by an exhaustive sweep of the compiled tree for
+        // an object carrying `static` but neither `scenery` nor `door` — pinned here as a literal
+        // rather than re-derived, since re-deriving it is exactly what
+        // `is_scenery_or_door`/`attribute_number` are already unit-tested to do correctly.
+        const MP_CHAIR: u32 = 0x64b76e;
+        let names = s.parse_names().expect("Cragne's object list reads perfectly");
+        let mem = s.machine.mem();
+        assert!(
+            names.is_object(mem, MP_CHAIR),
+            "premise: this address is still an object of Cragne's own compiled tree"
+        );
+        assert!(
+            !names.is_scenery_or_door(mem, MP_CHAIR),
+            "premise: mp-chair carries `static` but neither `scenery` nor `door`"
+        );
+        let room_addr = names.parent(mem, MP_CHAIR).expect("mp-chair sits in a real room");
+        let handle = s.handle_for(room_addr).expect("that room resolves to a real handle");
+        let loc = LocationInfo { number: handle.into(), parent: 0, name: String::new() };
+
+        let items = s.glulx_item_observations(Some(&loc));
+        let chair = items
+            .iter()
+            .find(|i| i.key == MP_CHAIR)
+            .expect("a static-only, non-scenery, non-door object must still reach result.items");
+        assert_eq!(chair.location, crate::session::ObservedItemLocation::RoomDirect);
+        assert!(chair.words.refers_to("chair"), "its real parse words: {:?}", chair.words);
+
+        // And the fixed-in-place detector, given this exact observation, flags it — precisely the
+        // downstream consumer SQ-1640 was told not to break.
+        let vocab = Engine::story_vocabulary(&s).expect("Cragne's own dictionary reads");
+        let key = crate::session::classify_take_attempt("take chair", &items, Some(&vocab))
+            .expect("an unambiguous candidate, visibly not carried, is flagged fixed-in-place");
+        assert_eq!(key, MP_CHAIR);
     }
 }
