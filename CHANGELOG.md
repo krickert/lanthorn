@@ -66,6 +66,11 @@ while any such tag, or this Unreleased section, still exists.*
   colour Mac/Amiga picture archive is from — "Mac" or "Amiga" — when you
   opened it from a known Mac or Amiga disk image, instead of always saying
   "Amiga" even for the Mac's own colour art.
+- Fixed: the intro/title screens and picture full-view no longer disappear
+  from scrollback — an opening sequence of "press any key" screens (like
+  Anchorhead's intro and quote splash) now all stay readable, and clicking a
+  picture and returning no longer risks wiping everything you played since
+  the last screen change.
 
 ## v0.8.1 — 2026-09-29
 

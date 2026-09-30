@@ -1121,6 +1121,36 @@ fn apply_turn_events(state: &mut AppState, result: &TurnResult) {
     }
 }
 
+/// Whether `new_content` looks like the OLD lines (`old_lines`, the ones a
+/// game-driven screen clear is about to discard) redrawing themselves rather
+/// than an entirely different screen taking over. Used to decide whether a
+/// game-driven `erase_lower` should collapse the prior screen via
+/// `truncate_transcript` (a genuine same-screen reprint — Counterfeit
+/// Monkey's arrow-navigated help menu, which reprints the whole menu on every
+/// keypress with only the cursor line differing) or preserve it (a totally
+/// different screen — Anchorhead's intro/quote/game-start sequence, or a
+/// picture click's empty-content clear followed later by unrelated room
+/// text). (SQ-1654)
+///
+/// Compares non-blank, trimmed lines on both sides. If either side has none,
+/// this is never a reprint — there's nothing to compare against, so don't
+/// destroy scrollback on a hunch; this is what keeps a picture click's
+/// empty-content clear from ever being treated as reprint-worthy. Otherwise
+/// counts how many of the new non-blank lines exactly match some old
+/// non-blank line; >=50% overlap counts as a reprint. The threshold sits in
+/// the middle of a wide gap between the two real cases (~0% overlap for
+/// Anchorhead's transitions, ~90%+ for CM's cursor-only-changes menu redraw)
+/// and does not need precise tuning.
+fn is_screen_reprint(old_lines: &[String], new_content: &str) -> bool {
+    let old_nonblank: Vec<&str> = old_lines.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let new_nonblank: Vec<&str> = new_content.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if old_nonblank.is_empty() || new_nonblank.is_empty() {
+        return false;
+    }
+    let matches = new_nonblank.iter().filter(|l| old_nonblank.contains(l)).count();
+    (matches as f64 / new_nonblank.len() as f64) >= 0.5
+}
+
 /// Apply a `TurnResult` produced by game-driven input that is not a full player
 /// command submission — a char-mode (`read_char`) keypress or a timed-input
 /// interrupt tick. Pushes transcript output (with style runs), routes
@@ -1142,14 +1172,38 @@ pub fn apply_game_driven_result(
 ) -> TurnOutcome {
     state.begin_turn(); // see `finish_command_turn` (SQ-1124)
     if result.erase_lower {
-        // A game-driven screen clear is a menu redraw navigated by keystrokes —
+        // A game-driven screen clear can be a menu redraw navigated by keystrokes —
         // Counterfeit Monkey's help menu clears the primary buffer and reprints
-        // the whole menu on EVERY arrow press. Collapse the previous reprint by
-        // truncating back to the prior clear anchor, so the reprints replace each
-        // other instead of piling up invisibly in scrollback (hidden by the
-        // SQ-0403 view-pin, then revealed when you exit the menu). (SQ-0407)
+        // the whole menu on EVERY arrow press, same menu, only the cursor line
+        // differing — in which case the reprint should COLLAPSE, truncating back
+        // to the prior clear anchor so reprints replace each other instead of
+        // piling up invisibly in scrollback (hidden by the SQ-0403 view-pin, then
+        // revealed when you exit the menu). (SQ-0407) But it can also be a
+        // completely different screen taking over — Anchorhead's intro/quote/
+        // game-start sequence of "press any key" screens, or a picture click's
+        // empty-content clear later followed by unrelated room text — and
+        // `clear_anchor` is STICKY (it only ever moves forward on another
+        // clear), so an unconditional truncate here plants a landmine: the
+        // NEXT game-driven clear in the session, however much later, wipes
+        // everything back to it. Only collapse when the new content actually
+        // looks like the old screen redrawing itself (SQ-1654).
+        let new_content_text: String = if result.transcript_elems.is_empty() {
+            result.transcript.clone()
+        } else {
+            result
+                .transcript_elems
+                .iter()
+                .filter_map(|e| match e {
+                    crate::session::TranscriptElem::Text { text, .. } => Some(text.as_str()),
+                    crate::session::TranscriptElem::Image(_)
+                    | crate::session::TranscriptElem::ScreenClear => None,
+                })
+                .collect()
+        };
         if let Some(anchor) = state.clear_anchor {
-            state.truncate_transcript(anchor);
+            if is_screen_reprint(&state.transcript[anchor..], &new_content_text) {
+                state.truncate_transcript(anchor);
+            }
         }
         state.mark_screen_clear();
     }
@@ -1811,9 +1865,20 @@ mod tests {
     #[test]
     fn game_driven_screen_clear_collapses_menu_reprints() {
         // SQ-0407: a menu navigated by keystrokes (CM's help) clears + reprints the
-        // whole menu into the primary buffer every keypress. Consecutive game-driven
-        // clears must COLLAPSE — each reprint replaces the last instead of piling up
-        // in scrollback — while pre-menu content is preserved.
+        // whole menu into the primary buffer every keypress — same menu, only the
+        // cursor marker line differs. Consecutive game-driven clears of a REPRINT
+        // like this must COLLAPSE — each redraw replaces the last instead of
+        // piling up in scrollback — while pre-menu content is preserved.
+        //
+        // SQ-1654: this fixture used to be two placeholder strings ("MENU v1" /
+        // "MENU v2") with ZERO line overlap, which only ever exercised the OLD
+        // unconditional-truncate code — under the new similarity-gated
+        // `is_screen_reprint` check, two dissimilar strings are correctly NOT
+        // collapsed. Rewritten here with a realistic 5-line menu where only the
+        // cursor-marker line moves (v1 marks "Introduction", v2 marks "Chapter
+        // One"; the other 3 lines are identical) — 3 of 5 lines match (60%),
+        // clearing the >=50% reprint threshold with room to spare, the same shape
+        // the original SQ-0407 commit described.
         let tmp = std::env::temp_dir().join(format!("lanthorn-collapse-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let mut state = crate::state::AppState::default();
@@ -1824,17 +1889,51 @@ mod tests {
 
         state.push_transcript("room description"); // pre-menu content
 
-        // First menu draw (a clearing turn): appends MENU v1.
-        let _ = super::apply_game_driven_result(&mut state, &mut m, &clearing_result("MENU v1"), &tmp, rect, &eng, crate::pager::Driver::PlayerInput);
-        assert!(state.transcript.iter().any(|l| l.contains("MENU v1")));
+        let menu_v1 = "> Introduction\n  Chapter One\n  Chapter Two\n  Chapter Three\n  Epilogue";
+        let menu_v2 = "  Introduction\n> Chapter One\n  Chapter Two\n  Chapter Three\n  Epilogue";
+
+        // First menu draw (a clearing turn): appends menu_v1.
+        let _ = super::apply_game_driven_result(&mut state, &mut m, &clearing_result(menu_v1), &tmp, rect, &eng, crate::pager::Driver::PlayerInput);
+        assert!(state.transcript.iter().any(|l| l.contains("> Introduction")));
         let len_after_v1 = state.transcript.len();
 
-        // Second draw (an arrow keypress): collapses v1, appends MENU v2.
-        let _ = super::apply_game_driven_result(&mut state, &mut m, &clearing_result("MENU v2"), &tmp, rect, &eng, crate::pager::Driver::PlayerInput);
-        assert!(!state.transcript.iter().any(|l| l.contains("MENU v1")), "v1 must be collapsed, not stacked");
-        assert!(state.transcript.iter().any(|l| l.contains("MENU v2")), "v2 present");
+        // Second draw (an arrow keypress): collapses v1, appends menu_v2.
+        let _ = super::apply_game_driven_result(&mut state, &mut m, &clearing_result(menu_v2), &tmp, rect, &eng, crate::pager::Driver::PlayerInput);
+        assert!(!state.transcript.iter().any(|l| l.contains("> Introduction")), "v1's cursor line must be collapsed, not stacked");
+        assert!(state.transcript.iter().any(|l| l.contains("> Chapter One")), "v2 present");
         assert!(state.transcript.iter().any(|l| l.contains("room description")), "pre-menu content preserved");
         assert!(state.transcript.len() <= len_after_v1, "transcript did not grow across reprints");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn game_driven_screen_clear_preserves_dissimilar_screens() {
+        // SQ-1654: the bug this guards against. Two game-driven clears in a row
+        // whose content has ~zero line overlap — e.g. Anchorhead's intro card
+        // giving way to an entirely different quote splash — must NOT collapse:
+        // `clear_anchor` is sticky, so an unconditional truncate here would wipe
+        // the first screen the instant a second, unrelated one appears.
+        let tmp = std::env::temp_dir().join(format!("lanthorn-preserve-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut state = crate::state::AppState::default();
+        state.config.user_dir = tmp.clone();
+        let mut m = mapper::mapper::Mapper::default();
+        let rect = Some((20u16, 20u16));
+        let eng = TraceOnlyEngine { line: None, v6: None, filename_req: None };
+
+        let intro = "Welcome to Anchorhead\nA Gothic Horror Story\nby Michael S. Gentry";
+        let quote = "\"There are more things in heaven and earth...\"\n  -- Shakespeare, Hamlet";
+
+        let _ = super::apply_game_driven_result(&mut state, &mut m, &clearing_result(intro), &tmp, rect, &eng, crate::pager::Driver::PlayerInput);
+        assert!(state.transcript.iter().any(|l| l.contains("Welcome to Anchorhead")));
+
+        let _ = super::apply_game_driven_result(&mut state, &mut m, &clearing_result(quote), &tmp, rect, &eng, crate::pager::Driver::PlayerInput);
+        assert!(
+            state.transcript.iter().any(|l| l.contains("Welcome to Anchorhead")),
+            "a dissimilar screen must not collapse the prior one"
+        );
+        assert!(state.transcript.iter().any(|l| l.contains("Shakespeare")), "new screen present");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

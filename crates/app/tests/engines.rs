@@ -33,6 +33,8 @@ mod host_turn;
 mod sq1586_host_hints_open;
 #[path = "suites/sq1596_min_story_screen_floor.rs"]
 mod sq1596_min_story_screen_floor;
+#[path = "suites/sq1654_scrollback_preserves_screens.rs"]
+mod sq1654_scrollback_preserves_screens;
 
 #[path = "suites/adf_disk_image.rs"]
 mod adf_disk_image;
