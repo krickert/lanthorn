@@ -62,6 +62,116 @@ pub fn suggest(
     room_matches
 }
 
+// ── Host-facing completion (SQ-1549) ────────────────────────────────────────
+//
+// `input::recompute_suggestions` and `input::apply_completion` run this same
+// logic against `AppState`, for the TUI's Tab/Shift-Tab. A host that is not
+// the TUI has no `AppState::current_partial`/`suggestion_idx` of its own, so
+// the ranking, the apply, and the "rest of the word" ghost hint are pulled
+// out here as pure functions over a plain `line` — the data they need
+// (`dict_words`, `seen_words`, `scope_words`) is already reached per-turn by
+// `host::turn` / at boot by `host::boot` (see the module docs there).
+
+/// The trailing whitespace-delimited token of `line[..caret]` — the word a
+/// completion would replace. `caret` is a CHAR index, clamped to the line's
+/// length.
+///
+/// The TUI's own [`crate::state::AppState::current_partial`] always reads the
+/// FULL line's trailing word, cursor position notwithstanding — completing
+/// while the caret sits mid-line has never had defined behaviour there. This
+/// generalises the same rule to an explicit caret, and the two answer
+/// identically whenever `caret` is the line's own length (the case every
+/// existing call site, and every acceptance test here, drives).
+pub fn partial_word(line: &str, caret: usize) -> &str {
+    let char_len = line.chars().count();
+    let caret = caret.min(char_len);
+    let byte_at = line.char_indices().nth(caret).map(|(b, _)| b).unwrap_or(line.len());
+    let head = &line[..byte_at];
+    match head.rfind(' ') {
+        Some(pos) => &head[pos + 1..],
+        None => head,
+    }
+}
+
+/// Completion candidates for `line` with the caret at `caret` — the same
+/// ranking and cap [`crate::input::recompute_suggestions`] applies for the
+/// TUI (SQ-1549).
+///
+/// Inside a slash command's name (the line starts with `prefix` and the body
+/// has no space yet) this offers matching command names from `slash_names`
+/// instead of story vocabulary. Otherwise: scope words first (what's
+/// actually here), then a merge of the story's flat dictionary and its
+/// recently-printed words, deduplicated against the scope hits, capped at 6.
+pub fn completion_candidates(
+    line: &str,
+    caret: usize,
+    prefix: char,
+    slash_names: &[String],
+    dict_words: &[String],
+    seen_words: &[String],
+    scope_words: &[String],
+) -> Vec<String> {
+    const SUGGESTION_LIMIT: usize = 6;
+    if line.starts_with(prefix) {
+        let body = &line[prefix.len_utf8()..];
+        let first_token = body.split_whitespace().next().unwrap_or("");
+        if body.contains(' ') {
+            return Vec::new(); // command name already chosen
+        }
+        return crate::input::slash_suggestions(first_token, slash_names, SUGGESTION_LIMIT);
+    }
+    let partial = partial_word(line, caret);
+    if partial.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = suggest(&[], scope_words, partial, SUGGESTION_LIMIT);
+    if hits.len() < SUGGESTION_LIMIT {
+        for w in suggest(dict_words, seen_words, partial, SUGGESTION_LIMIT) {
+            if !hits.iter().any(|h| h.eq_ignore_ascii_case(&w)) {
+                hits.push(w);
+            }
+            if hits.len() == SUGGESTION_LIMIT {
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// The line that results from applying `completion` to `line` — the pure
+/// twin of `input::apply_completion`, which Tab and Shift-Tab share (SQ-1549).
+///
+/// Inside a slash command's name, rebuilds the line as `prefix` + `completion`
+/// (the leading prefix survives). Otherwise replaces `line`'s own trailing
+/// word (by [`partial_word`], over the FULL line — matching
+/// `apply_completion`'s use of `AppState::current_partial`) with `completion`.
+/// The caret always lands at the end of the result, exactly as the TUI's own
+/// does.
+pub fn apply_completion_to_line(line: &str, prefix: char, completion: &str) -> String {
+    let is_slash_name = line.starts_with(prefix) && !line[prefix.len_utf8()..].contains(' ');
+    if is_slash_name {
+        return format!("{prefix}{completion}");
+    }
+    let char_len = line.chars().count();
+    let partial = partial_word(line, char_len);
+    let keep = char_len - partial.chars().count();
+    let byte_at = line.char_indices().nth(keep).map(|(b, _)| b).unwrap_or(line.len());
+    format!("{}{}", &line[..byte_at], completion)
+}
+
+/// The "rest of the word" a completion `candidate` adds beyond `partial` —
+/// the pure half of `render::transcript::ghost_completion`'s dim inline hint
+/// (SQ-1549). `None` when `candidate` does not extend `partial`
+/// case-insensitively, or adds nothing (the state right after the candidate
+/// was applied).
+pub fn completion_ghost_tail(candidate: &str, partial: &str) -> Option<String> {
+    if !candidate.to_lowercase().starts_with(&partial.to_lowercase()) {
+        return None;
+    }
+    let hint: String = candidate.chars().skip(partial.chars().count()).collect();
+    (!hint.is_empty()).then_some(hint)
+}
+
 /// Split prose into words for a story whose own tokeniser we cannot borrow.
 ///
 /// The last resort, for an engine with no
@@ -203,13 +313,16 @@ pub struct PaletteCandidate {
 
 /// Rank every registry command by fuzzy-matching its name against `query`.
 ///
-/// Non-matching commands are dropped. Results are sorted best-first, ties broken
-/// alphabetically by command name so the order is stable. An empty query returns
-/// every command in registry order (scores are all neutral).
+/// Non-matching commands are dropped, and so are the story browser's
+/// (`Context::Browser`) — the palette only exists while a game is running, so a
+/// browser-only command has nothing to act on there and dispatching one is a
+/// dead end (SQ-1535). Uses [`crate::slash::non_browser_commands`], the same
+/// filter Tab autocomplete's `slash_names` uses, so the two surfaces cannot
+/// drift apart. Results are sorted best-first, ties broken alphabetically by
+/// command name so the order is stable. An empty query returns every
+/// non-browser command in registry order (scores are all neutral).
 pub fn palette_candidates(query: &str) -> Vec<PaletteCandidate> {
-    let mut out: Vec<PaletteCandidate> = crate::slash::COMMANDS
-        .iter()
-        .enumerate()
+    let mut out: Vec<PaletteCandidate> = crate::slash::non_browser_commands()
         .filter_map(|(i, spec)| {
             fuzzy_match(query, spec.name).map(|m| PaletteCandidate {
                 cmd_index: i,
@@ -226,7 +339,7 @@ pub fn palette_candidates(query: &str) -> Vec<PaletteCandidate> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-input"))]
 mod tests {
     use super::*;
 
@@ -444,8 +557,16 @@ mod tests {
 
     #[test]
     fn palette_candidates_empty_query_returns_all() {
+        // Every command EXCEPT the story browser's (SQ-1535) — the palette only
+        // exists while a game is running, so a browser-only command is never a
+        // candidate there.
         let cands = palette_candidates("");
-        assert_eq!(cands.len(), crate::slash::COMMANDS.len());
+        let expected = crate::slash::COMMANDS
+            .iter()
+            .filter(|c| c.context != crate::keymap::Context::Browser)
+            .count();
+        assert_eq!(cands.len(), expected);
+        assert!(cands.len() < crate::slash::COMMANDS.len(), "the browser's commands must be excluded");
     }
 
     #[test]
@@ -453,5 +574,48 @@ mod tests {
         let cands = palette_candidates("quit");
         assert!(cands.iter().all(|c| fuzzy_match("quit", crate::slash::COMMANDS[c.cmd_index].name).is_some()));
         assert!(cands.iter().any(|c| crate::slash::COMMANDS[c.cmd_index].name == "quit"));
+    }
+
+    // ── SQ-1535: the palette must not surface story-browser-only commands ──────
+
+    #[test]
+    fn palette_candidates_excludes_browser_only_commands() {
+        // fetch-story and sort-library are Context::Browser (Category::Library):
+        // they belong to the pre-game story browser, which has no command line and
+        // no AppState — dispatching one from the in-game palette was a dead end
+        // (SQ-1535). A query that would otherwise match them by name must return
+        // nothing.
+        assert!(
+            palette_candidates("fetch-story").is_empty(),
+            "fetch-story is Context::Browser and must not appear in the in-game palette"
+        );
+        assert!(
+            palette_candidates("sort-library").is_empty(),
+            "sort-library is Context::Browser and must not appear in the in-game palette"
+        );
+
+        // Sanity: a Context::Global command matching the same style of query still
+        // works, so this isn't accidentally filtering everything.
+        assert!(
+            !palette_candidates("zoom-map").is_empty(),
+            "zoom-map is Context::Global and should still be offered"
+        );
+    }
+
+    #[test]
+    fn palette_candidates_never_includes_a_browser_context_spec() {
+        // Broader guard: no candidate the palette returns, for any query in this
+        // suite, ever resolves to a Context::Browser command.
+        for query in ["", "story", "fetch", "sort", "quit", "browser"] {
+            for c in palette_candidates(query) {
+                let spec = &crate::slash::COMMANDS[c.cmd_index];
+                assert_ne!(
+                    spec.context,
+                    crate::keymap::Context::Browser,
+                    "palette_candidates({query:?}) returned browser-only command {:?}",
+                    spec.name
+                );
+            }
+        }
     }
 }

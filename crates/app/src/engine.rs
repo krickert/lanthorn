@@ -22,6 +22,30 @@ use crate::session::{FilenameReq, InputKind, TurnResult};
 /// an object's adjectives at all, which is a different claim from having none.
 pub use grammar_model::{Adjectives, ObjectWordSet, ObjectWords};
 
+/// What a room's own exit table declares for one direction (SQ-1257).
+///
+/// Not a re-export of `zvm::world::DeclaredExit` (SQ-1297): that type's
+/// `Room(u16)` is a real Z-machine object number, which zvm (zero external
+/// deps) has no reason to know about `RoomId`. `Engine::declared_exit` is
+/// implemented by every engine, and Glulx's declared destination is a
+/// [`crate::roomid::glulx_room_id`] hash that needs the full widened `RoomId`
+/// space — so this app-level type carries a `RoomId` and each engine's
+/// `declared_exit` converts its own `zvm`/`gvm` answer into it at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredExit {
+    /// The exit is a fixed room.
+    Room(mapper::graph::RoomId),
+    /// The destination is computed at run time.
+    Code,
+    /// The property holds a printed string rather than a destination.
+    Message,
+    /// The compass was identified for this story, and this direction's
+    /// property is simply absent.
+    Absent,
+    /// No exit is declared this way at all.
+    Unknown,
+}
+
 // ── Neutral key input ───────────────────────────────────────────────────────
 
 /// A neutral, terminal-agnostic key press.
@@ -134,6 +158,11 @@ pub struct ErasedFill {
 
 #[derive(Debug, Clone, Default)]
 pub struct GridWindow {
+    /// This window's Glk id (0 for a Z-machine/Scott grid, which has no Glk
+    /// identity). Lets the renderer record which drawn rect belongs to which
+    /// window for mouse/hyperlink hit-testing (SQ-1203) without re-deriving it
+    /// from gvm's own (possibly gutter-skewed) layout.
+    pub win: u32,
     /// Logical grid width in columns.
     pub cols: u16,
     /// Logical grid height in rows (allocation height).
@@ -260,6 +289,11 @@ impl GridWindow {
 /// set `primary = false` and carry their inline content in `lines`/`runs`/`scroll`.
 #[derive(Debug, Clone, Default)]
 pub struct BufferWindow {
+    /// This window's Glk id (0 for a Z-machine/Scott buffer, which has no Glk
+    /// identity). Lets the renderer record which drawn rect belongs to which
+    /// window for mouse/hyperlink hit-testing (SQ-1203) without re-deriving it
+    /// from gvm's own (possibly gutter-skewed) layout.
+    pub win: u32,
     /// Accumulated logical lines (split on `\n`) for an inline (non-primary)
     /// buffer window. Empty for the primary window.
     pub lines: Vec<String>,
@@ -281,8 +315,8 @@ pub struct BufferWindow {
     /// This window's own Normal-style foreground colour (packed RGB), or `None`.
     pub fg: Option<u32>,
     /// True for a chrome panel (e.g. the Scott room panel) drawn with the themed
-    /// `room_panel` colour instead of the transcript colour, so the top and bottom
-    /// of a split read as distinct regions. A game-set `bg` still wins.
+    /// `scott_room_panel` colour instead of the transcript colour, so the top and
+    /// bottom of a split read as distinct regions. A game-set `bg` still wins.
     pub panel: bool,
     /// Where the prose this window has streamed is currently SITTING on the v6
     /// screen (SQ-0729), as absolute pixel runs — zvm's `ZWindow::streamed`.
@@ -306,11 +340,46 @@ pub struct BufferWindow {
     pub reads_input: bool,
 }
 
+/// Which leaf kind a recorded drawn rect ([`crate::render::screen::StoryPaneMetrics::win_rects`])
+/// belongs to. Engine-neutral (unlike gvm's own `WinType`, which stays inside
+/// the Glulx adapter per the architecture rule that Glk never leaks into
+/// shared app types) — it exists only to pick the right coordinate space
+/// (cells vs. pixels) when hit-testing a click against the DRAWN rect (SQ-1203).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinKind {
+    Grid,
+    Buffer,
+    Graphics,
+}
+
 /// How a [`WinNode::Pair`] divides its space.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Split {
     /// Size (rows or cols, per `vertical`) given to the first child.
     pub fixed: u16,
+    /// The first child's pixel-exact split size on the split axis, when it is
+    /// a graphics window that requested a specific pixel footprint through
+    /// Glk's window arrangement (fixed or proportional — gvm's
+    /// `window_pixel_size` resolves both) — the same number the game reads
+    /// back via `glk_window_get_size`, which `fixed` above necessarily
+    /// discards by rounding up to a whole cell. `None` when the first child
+    /// is a text window (cell-granular by nature, no sub-cell fact to carry)
+    /// or gvm reports none. The TUI's own cell-based layout still uses
+    /// `fixed` unchanged; this is an additional fact a pixel-aware host (or a
+    /// window's own canvas allocation) can use instead (SQ-1565).
+    pub fixed_px: Option<u32>,
+    /// Size (rows or cols, per `vertical`) given to the SECOND child — its own
+    /// cell count, exactly as gvm's `layout_window` computed it (each child
+    /// rounds down independently on a proportional split; see the doc comment
+    /// there). This is NOT "whatever's left over after `fixed` and the
+    /// border": a proportional split can leave a one-cell remainder that
+    /// belongs to neither child, and a consumer that instead handed the second
+    /// child the full remaining area drew it one cell too large (SQ-1605).
+    /// `None` for a `WinNode::Pair` that isn't built from a real gvm split
+    /// (the app's own fixed-upper/fill-lower layouts for Z-machine and Scott
+    /// Adams, and hand-built test fixtures) — those have no rounding slack to
+    /// account for, so the second child correctly takes whatever's left.
+    pub rest: Option<u16>,
 }
 
 /// A graphics-window leaf: a snapshot of the window's canvas for rendering.
@@ -467,14 +536,20 @@ pub trait Introspect {
     /// [`Self::visible_contents`] for the question SCOPE asks.
     fn contents(&self, container: u16) -> Vec<ObjectWords>;
     /// The objects located directly in `room`.
-    fn room_objects(&self, room: u16) -> Vec<ObjectWords>;
+    fn room_objects(&self, room: mapper::graph::RoomId) -> Vec<ObjectWords>;
     /// Same as [`Self::room_objects`], but omitting `exclude` (the command
     /// band's "here" column passes the player object — SQ-0667). The player
     /// object is structurally a child of whatever room they're in, so
     /// without this it would show up in every room of every game; excluded
     /// by id, deliberately not by name (a scenery object could coincidentally
     /// share the player's printed name).
-    fn room_objects_excluding(&self, room: u16, exclude: Option<u16>) -> Vec<ObjectWords>;
+    ///
+    /// `room` is a [`mapper::graph::RoomId`], not a plain object handle like
+    /// `exclude`: Glulx's room handles are the same widened
+    /// [`crate::roomid::glulx_room_id`] hash the mapper uses (SQ-1297), so this
+    /// needs the full RoomId space to stay unambiguous, where an ordinary
+    /// object handle (`exclude`, the player object) never approaches it.
+    fn room_objects_excluding(&self, room: mapper::graph::RoomId, exclude: Option<u16>) -> Vec<ObjectWords>;
     /// The contents of `container` the player can SEE: its direct children,
     /// plus the contents of any child whose contents are visible, as deep as
     /// the engine's own containment model will vouch for (SQ-1133).
@@ -509,11 +584,14 @@ pub trait Introspect {
     /// need no flag layout.
     ///
     /// `None` means the question could not be ASKED — an engine with no such
-    /// list, which is Glulx and Scott Adams today (`gvm::objects::ParseNames`
-    /// could answer it; reaching it wants Glulx introspection). An empty `Some`
-    /// is a story that was asked and holds no parse names anywhere, which is
-    /// what Journey and `advent.z8` really are. A caller that flattens the two
-    /// reports "this story names no things" about one it never managed to read.
+    /// list, which is Scott Adams today. Glulx answers the folded-set form
+    /// through [`Engine::object_word_set`] instead (`gvm::objects::ParseNames`,
+    /// SQ-1210) without implementing this trait, whose tree questions it cannot
+    /// answer — see that method for why the two capabilities are separate
+    /// seams. An empty `Some` is a story that was asked and holds no parse
+    /// names anywhere, which is what Journey and `advent.z8` really are. A
+    /// caller that flattens the two reports "this story names no things" about
+    /// one it never managed to read.
     fn all_object_words(&self) -> Option<Vec<ObjectWords>> {
         None
     }
@@ -537,7 +615,14 @@ pub trait Introspect {
         self.all_object_words().map(|objs| std::sync::Arc::new(ObjectWordSet::build(&objs)))
     }
     /// The object handles whose parent is `parent` (drives inventory tracking).
-    fn children_of(&self, parent: u16) -> std::collections::BTreeSet<u16>;
+    ///
+    /// `parent` is a [`mapper::graph::RoomId`] rather than a plain object
+    /// handle (SQ-1297): its one real caller (`turn::post_turn_bookkeeping`)
+    /// passes the CURRENT ROOM, and on Glulx that is the same widened
+    /// [`crate::roomid::glulx_room_id`] hash `room_objects_excluding` needs —
+    /// see that method's doc for why. An ordinary object handle passed here
+    /// (as in the test suite) is always far smaller and fits either way.
+    fn children_of(&self, parent: mapper::graph::RoomId) -> std::collections::BTreeSet<u16>;
     /// The player object, if it can be identified.
     fn player_object(&self) -> Option<u16>;
 }
@@ -565,6 +650,7 @@ impl From<zvm::cpu::disasm_cache::Provenance> for DisasmProvenance {
             P::Rd => DisasmProvenance::Rd,
             P::Soft => DisasmProvenance::Soft,
             P::Data => DisasmProvenance::Data,
+            _ => DisasmProvenance::Soft,
         }
     }
 }
@@ -696,7 +782,21 @@ pub trait Debugger {
 // ── Engine-tagged save ──────────────────────────────────────────────────────
 
 /// The location/room currency shared between the engine and the mapper.
-pub type LocationInfo = zvm::ObjectSnapshot;
+///
+/// Not `zvm::ObjectSnapshot` (SQ-1297): `zvm` takes zero external deps and
+/// knows nothing of `mapper::graph::RoomId`, and its own `ObjectSnapshot.number`
+/// stays `u16` because that is a real Z-machine object number, which always
+/// fits. `LocationInfo.number` is a full `RoomId` — Glulx and Scott Adams rooms
+/// are synthetic ids that need the whole widened space, not real object
+/// numbers. A Z-machine session crosses this boundary once, in
+/// `session::location_to_snapshot`, converting a `zvm::ObjectSnapshot`'s
+/// `u16` into this `RoomId`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationInfo {
+    pub number: mapper::graph::RoomId,
+    pub parent: u16,
+    pub name: String,
+}
 
 /// A persisted game state, tagged with the engine that produced it.
 ///
@@ -787,6 +887,15 @@ impl std::error::Error for EngineError {}
 pub trait Engine {
     // ── turn cycle ──
     /// Supply a player command and run to the next input request / quit.
+    ///
+    /// A LINE must never reach a keypress read (SQ-1270): every adapter routes
+    /// by [`Engine::pending_input`] — while the VM is waiting for a `Char`, a
+    /// submitted line is delivered as ONE keypress (its first character, or
+    /// Enter for an empty line), never as a line; while it is waiting for a
+    /// `Line`, `command` is supplied as today. This is belt-and-braces on top
+    /// of any VM-level guard against the same mistake (e.g. zvm's `supply_line`
+    /// no-op on a `read_char`, SQ-1266) — a future engine gets the protection
+    /// from following this contract, not from remembering that history.
     fn submit(&mut self, command: &str) -> TurnResult;
     /// Supply a single keypress.  Returns `None` when the key has no input
     /// meaning for this engine (e.g. an arrow key under the Z-machine), in
@@ -912,6 +1021,23 @@ pub trait Engine {
     /// event path). (Lane M)
     fn set_mouse(&mut self, _y_px: u16, _x_px: u16) {}
 
+    /// Publish the host's own LOCKED player-object id
+    /// ([`crate::state::AppState::player_obj`]) into the engine (SQ-1631 Fix 3), mirroring
+    /// `set_mouse`/`set_screen_dims`/`set_default_colours`'s pattern of pushing a host-known fact
+    /// into the session rather than re-deriving it engine-side.
+    ///
+    /// Once the host has locked a player id — by watching what moved between rooms, for a story
+    /// whose player object carries no short name the engine's own heuristic could find directly —
+    /// every later per-turn item observation should prefer that hint over the raw heuristic, the
+    /// same fallback order [`crate::vocab::scope_split`]'s own `player_hint` parameter already
+    /// uses. `crate::host::turn::finish_command_turn` calls this once per command turn, right after
+    /// its own lock attempt, so the FOLLOWING turn's observations see it.
+    ///
+    /// Default no-op: only the Z-machine and Glulx sessions track item observations by object id
+    /// at all (Scott Adams has no player-object concept — every item is simply in a room, carried,
+    /// or nowhere) and override this to store it.
+    fn set_player_hint(&mut self, _hint: Option<u16>) {}
+
     /// The v6 screen's PAINTED ground — filled rectangles left by `erase_window`,
     /// in native pixels (SQ-0706). `None` for every engine and every game that
     /// never paints one, which is all of them but scopa-shaped v6 titles.
@@ -997,6 +1123,39 @@ pub trait Engine {
     /// Clear the auxiliary-data dirty flag.
     fn clear_aux_dirty(&mut self);
 
+    // ── transcript / command-record files (Z-machine output streams 2 and 4) ──
+    /// Tell the engine which directory its transcript and command-record files
+    /// live in — `<game_dir>/script.txt` and `<game_dir>/commands.txt`,
+    /// beside `default.aux` and for the same reason (see
+    /// [`crate::aux_store::aux_path`]): they are the GAME's side data, keyed by
+    /// story, and lanthorn never asks the player for a host filename.
+    ///
+    /// Wired once per session, at startup. Naming the directory does not START
+    /// anything: the transcript begins when the story's own SCRIPT verb selects
+    /// output stream 2 (ZMSD §7.4) or the player types `/transcript on`, and the
+    /// files are opened lazily at the first byte either stream produces.
+    ///
+    /// Defaulted to a no-op: only the Z-machine has these streams. Glk's
+    /// transcript is a `fileusage_Transcript` stream the game opens for itself,
+    /// which the Glulx adapter already routes through the Glk VFS.
+    fn set_stream_files(&mut self, _game_dir: &std::path::Path) {}
+
+    /// Is the game's transcript (Z-machine output stream 2) running?
+    /// `false` for engines without the concept.
+    fn transcript_on(&self) -> bool {
+        false
+    }
+
+    /// Start or stop the game's transcript from the host side, as `/transcript
+    /// on|off` does — the same switch the story's SCRIPT verb throws.
+    ///
+    /// Returns the file the transcript is being written to when this turned it
+    /// ON, so the caller can name it in the notice; `None` when the engine has
+    /// no transcript, or when switching it off.
+    fn set_transcript(&mut self, _on: bool) -> Option<std::path::PathBuf> {
+        None
+    }
+
     // ── Glk file VFS (Glulx only; default no-ops for the Z-machine) ──
     /// Encode the Glk file VFS as a disk sidecar blob (empty for engines
     /// without a Glk VFS).
@@ -1011,6 +1170,74 @@ pub trait Engine {
     // ── mapping ──
     /// The player's current location, for the mapper.
     fn current_location(&self) -> Option<LocationInfo>;
+
+    /// What `origin`'s own map data declares for `dir` (SQ-1257) — read from
+    /// the story's compiled exit table, never from anything ever walked.
+    ///
+    /// This is what lets the mapper tell a REAL passage from one a routine
+    /// improvised on the spot: Lost Pig's gnome tunnels relocate the player
+    /// somewhere the room's own exit table never named, and a caller that
+    /// compares this against where the player actually landed is the whole of
+    /// what tells the two apart. `RoomId` is `mapper::graph::RoomId`, which for
+    /// every engine here is that engine's own object-number space.
+    ///
+    /// Default `DeclaredExit::Unknown`: an engine with no such table (Scott
+    /// Adams) has nothing to answer with, which is a real answer and not a
+    /// failure to look. `GameSession` (Z-machine) and `GlulxSession` override
+    /// it — the latter from the Inform 6 `door_dir` convention where the story
+    /// has one (SQ-1264) and from Inform 7's own `Map_Storage` array where it
+    /// does not (SQ-1303).
+    fn declared_exit(
+        &self,
+        _origin: mapper::graph::RoomId,
+        _dir: mapper::direction::Direction,
+    ) -> DeclaredExit {
+        DeclaredExit::Unknown
+    }
+
+    /// This engine's current random-number seed, when it exposes one (SQ-1257
+    /// Phase 2) — `zvm`'s `random` opcode xorshift32 state. `None` for an
+    /// engine with no seed to read (Glulx, Scott) or none of `declared_exit`'s
+    /// `Absent`/`Code` answers are ever worth a reseeded probe for anyway.
+    fn rng_seed(&self) -> Option<u32> {
+        None
+    }
+
+    /// Force this engine's random-number generator to `seed` (SQ-1257 Phase
+    /// 2): the shadow's own draw, made to differ from the live game's, so a
+    /// probe walking the same command twice under two different seeds can
+    /// tell "the story rolled dice" apart from "the story is deterministic
+    /// and my snapshot happened to agree with itself twice". Default no-op —
+    /// an engine that answers `None` from [`Self::rng_seed`] has nothing here
+    /// worth forcing either.
+    fn reseed_random(&mut self, _seed: u32) {}
+
+    /// Opaque, engine-defined bytes describing whatever HOST-SIDE state this
+    /// engine's room ids currently depend on — carried from the live session
+    /// into a [`crate::probe`] shadow so the shadow keys rooms exactly as the
+    /// live session does (SQ-1267).
+    ///
+    /// A Glulx `RoomId` is a hash of either the room object's ADDRESS (once
+    /// the story's `location` global has been located — see
+    /// `glulx_roomlock`) or, before that, of the room's printed NAME — and
+    /// which of the two is in force is host-side bookkeeping a [`EngineSave`]
+    /// snapshot never carries (a gvm snapshot is VM memory only). A shadow
+    /// left to learn this on its own, from its own exploratory commands, can
+    /// answer with a THIRD id that matches neither: the live session's own
+    /// address-derived hash if it has locked, or a stale/absent guess if it
+    /// has not. Default `None`: an engine whose room ids need no such
+    /// state — `GameSession`'s are `zvm`'s own object numbers, fixed by the
+    /// story compile and identical in the live session and any shadow of it.
+    fn room_identity_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Apply a [`Self::room_identity_state`] captured from the live session.
+    /// Called by the probe worker immediately after every `restore_state`,
+    /// before the shadow runs a command, so a shadow reused across many
+    /// questions is re-synced to the live session's CURRENT identity state on
+    /// every one of them rather than only at boot. Default no-op.
+    fn apply_room_identity_state(&mut self, _state: &[u8]) {}
 
     // ── boot ──
     /// Drain the game's pending screen clear — the fact [`TurnResult::erase_lower`]
@@ -1072,8 +1299,19 @@ pub trait Engine {
     /// and neither plays its sounds nor prints its diagnostics. Surfacing a boot
     /// sound and a boot warning at the boot is the real change, and it waits for a
     /// story that needs one.
+    ///
+    /// SQ-1629: also drains `transcript`/`transcript_elems` (the same pair
+    /// `host::boot` used to drain a second time, separately, for the opening
+    /// banner) so this is now the ONE boot drain — an engine that fills
+    /// `description`/`items` from that same drain (overriding this default, as
+    /// `GameSession` does) needs the text still warm, not re-drained empty by a
+    /// caller who read it first.
     fn seed_turn(&mut self) -> TurnResult {
+        let transcript_elems = self.take_transcript_elems();
+        let transcript = if transcript_elems.is_empty() { self.take_transcript() } else { String::new() };
         TurnResult {
+            transcript,
+            transcript_elems,
             location: self.current_location(),
             quit: self.has_quit(),
             erase_lower: self.drain_screen_clear(),
@@ -1109,6 +1347,23 @@ pub trait Engine {
         None
     }
 
+    /// Every word the story's own static text holds — what it CAN print, read
+    /// from the story file once, not what it has printed so far (SQ-1553).
+    ///
+    /// It is what spells a truncated dictionary key out in full
+    /// ([`crate::vocab::StoryVocabulary::spell`]): a Version 3 dictionary stores
+    /// `lanter`, and the story's text says `lantern`. Asked once a session, at
+    /// [`crate::vocab::VocabState::get`].
+    ///
+    /// `None` — the default — for an engine with no reader for its text. The
+    /// Z-machine answers ([`crate::story_text::zmachine_words`]); a Glulx image's
+    /// strings are compressed through a decoding table and a Scott Adams
+    /// database keeps words shorter than any key worth spelling out, so both
+    /// fall back to the lexicon alone.
+    fn story_text_words(&self) -> Option<std::collections::BTreeSet<String>> {
+        None
+    }
+
     /// Split prose the way this story's own parser splits an input line
     /// (SQ-1116).
     ///
@@ -1134,6 +1389,32 @@ pub trait Engine {
     fn introspect(&self) -> Option<&dyn Introspect> {
         None
     }
+    /// **Does ANY object answer to this word** — the folded set of every
+    /// object's parse names ([`Introspect::object_word_set`]), reachable
+    /// without the rest of introspection (SQ-1210).
+    ///
+    /// It sits on `Engine` and not only on [`Introspect`] because the two are
+    /// different capabilities that happened to travel together until Glulx
+    /// could answer one and not the other. [`Introspect`]'s tree questions —
+    /// contents, room objects, children — need object handles the app can
+    /// correlate with rooms, which Glulx has none of (its objects are heap
+    /// addresses, its rooms synthetic heading ids). Answering those with empty
+    /// lists to smuggle the word set through `introspect()` would turn every
+    /// "could not ask" into a false "asked, nothing there": `probe::WorldPrint`
+    /// would fingerprint an empty world as a real one, the command band would
+    /// label a column `here` off a tree that was never walked, and
+    /// `vocab::scope_split` would stop saying `None`. So the word set gets its
+    /// own seam and the tree questions keep refusing honestly.
+    ///
+    /// The default forwards through [`Self::introspect`], so an engine with
+    /// full introspection (the Z-machine) answers here for free, with its own
+    /// caching. The Glulx adapter overrides it (`gvm::objects::ParseNames`);
+    /// Scott Adams keeps the `None`, which callers treat exactly as
+    /// [`Introspect::object_word_set`] documents — the question could not be
+    /// asked, distinct from an empty set.
+    fn object_word_set(&self) -> Option<std::sync::Arc<ObjectWordSet>> {
+        self.introspect().and_then(|i| i.object_word_set())
+    }
     /// Debug-inspection capability, when the engine has one.
     fn debugger(&self) -> Option<&dyn Debugger> {
         None
@@ -1142,7 +1423,7 @@ pub trait Engine {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-session"))]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1172,7 +1453,7 @@ mod tests {
         let model = ScreenModel {
             root: WinNode::Pair {
                 vertical: true,
-                split: Split { fixed: 1 },
+                split: Split { fixed: 1, fixed_px: None, rest: None },
                 border: false,
                 key_bg: None,
                 key_fg: None,
@@ -1213,7 +1494,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-session"))]
 mod debugger_trait_tests {
     use super::*;
 

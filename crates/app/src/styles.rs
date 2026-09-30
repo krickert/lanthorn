@@ -16,12 +16,23 @@ pub fn per_game_style_path(game_dir: &Path) -> PathBuf {
 /// story file. Holds per-game overrides that are not part of the style schema
 /// (`honor_game_colours`, `borderless_windows`, `show_map`, `pictures`,
 /// `interpreter_number`, `v6_pixel_lock`, `guidance`, `v6_render`,
-/// `command_band`, `return_probe`), kept separate from `style.toml` so the style parser/writer
+/// `panel`, `return_probe`), kept separate from `style.toml` so the style parser/writer
 /// stays a pure style document.
 ///
 /// Bare lines, never templated: an absent key means "inherit the global config",
 /// so a file that listed every key with its default could not express that. See
 /// [`PerGameConfig`].
+///
+/// **Lanthorn ignores keys it doesn't recognise, and never removes them**
+/// (SQ-1560): [`PerGameConfig::write`] read-modify-writes this file, so any
+/// top-level key or table it doesn't know about — including one an embedding
+/// host put here itself — survives every write the TUI makes, exactly as an
+/// unrecognised key in the global `config.toml` does. A host that wants to
+/// keep its own per-story settings in this same sidecar should namespace them
+/// under a table, e.g. `[host.<name>]`, so they can't collide with a future
+/// lanthorn-native key; this isn't enforced, just recommended. See
+/// [`read_host_table`]/[`write_host_table`] for a way to read and write one
+/// such table without touching anything else.
 pub fn per_game_config_path(game_dir: &Path) -> PathBuf {
     game_dir.join("config.toml")
 }
@@ -51,10 +62,50 @@ pub struct PerGameConfig {
     /// The v6 render mode for this story, as its config-file spelling
     /// (`hybrid` / `raster` / `extended`) — SQ-1123.
     pub v6_render: Option<String>,
-    /// Whether the command band opens with this story (SQ-1123).
-    pub command_band: Option<bool>,
+    /// Which panel opens with this story — command, inventory, or none
+    /// (SQ-1123, widened to a three-state cycle by SQ-1237). `None` here means
+    /// no override at all (inherit `[command_panel] auto_open`), which is a
+    /// different thing from `Some(SidePanel::None)` (this story is pinned to
+    /// neither panel).
+    pub panel: Option<crate::state::SidePanel>,
     /// Whether the return probe runs for this story (SQ-0785).
     pub return_probe: Option<bool>,
+    /// ScottFree's `-y`/`YOUARE` option for this Scott Adams story (SQ-1413):
+    /// second-person replies in place of ScottFree's plain first-person
+    /// default. Meaningless for a Z-machine/Glulx story; `scott_session.rs`
+    /// is the only reader.
+    pub scott_you_are: Option<bool>,
+    /// ScottFree's `-s`/`SCOTTLIGHT` option (SQ-1413): the original Adams
+    /// lamp countdown wording in place of ScottFree's own embellished one.
+    pub scott_light: Option<bool>,
+    /// ScottFree's `-t`/`TRS80_STYLE` option (SQ-1413): only the flag —
+    /// lanthorn's own room-block presentation is unaffected (see
+    /// `scott::Presentation`'s doc for why the two are separate).
+    pub scott_trs80_style: Option<bool>,
+    /// ScottFree's `-p`/`PREHISTORIC_LAMP` option (SQ-1413): the light
+    /// source is destroyed the instant its fuel reaches zero.
+    pub scott_prehistoric_lamp: Option<bool>,
+    /// Which resolution to draw a Commodore 64 *Mysterious Adventures* story's
+    /// native vector artwork at (SQ-1473), as its config-file spelling
+    /// (`hires` / `original`, [`crate::graphics::ScottPictureResolution::key`]).
+    /// `None` = no override, so the default (hi-res) decides. Meaningless for
+    /// every other Scott story — a Blorb's pictures have no second resolution.
+    pub scott_picture_resolution: Option<crate::graphics::ScottPictureResolution>,
+    /// Which of the three default-colour sources this story draws its page and
+    /// ink from — `--colour terminal|theme|machine` (SQ-1082), persisted per-game
+    /// from the launch-options dialog (SQ-1532). `None` = no override, so the
+    /// global `colour_source` decides; that is also what "Default" means in the
+    /// dialog's own row, which is why there is no fourth enum variant for it.
+    pub colour_source: Option<crate::config::ColourSource>,
+    /// This story's own one-click quick-action row (SQ-1552), overriding the
+    /// global `[command_panel] quick`. `None` = no override, so the global list
+    /// decides (and, if that is empty too, the built-in row —
+    /// [`crate::config::CommandBandConfig::resolve_quick_for`]); `Some([])`
+    /// reads the same as no override, matching the global list's own "empty
+    /// means built-in" rule. The TUI has no UI for setting this key; it exists
+    /// so an embedding host can let a player edit quick words per story and
+    /// have the choice actually persist.
+    pub quick: Option<Vec<String>>,
 }
 
 impl PerGameConfig {
@@ -75,11 +126,18 @@ impl PerGameConfig {
         "show_map",
         "v6_pixel_lock",
         "guidance",
-        "command_band",
+        "panel",
         "return_probe",
         "pictures",
         "v6_render",
         "interpreter_number",
+        "scott_you_are",
+        "scott_light",
+        "scott_trs80_style",
+        "scott_prehistoric_lamp",
+        "scott_picture_resolution",
+        "colour_source",
+        "quick",
     ];
 
     /// Read the sidecar. Every key absent when the file is missing or unparseable
@@ -96,6 +154,11 @@ impl PerGameConfig {
             v.get(k).and_then(|x| x.as_str()).map(str::trim).filter(|x| !x.is_empty())
                 .map(str::to_string)
         };
+        let list = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        };
         PerGameConfig {
             honor_game_colours: b("honor_game_colours"),
             borderless_windows: b("borderless_windows"),
@@ -108,57 +171,160 @@ impl PerGameConfig {
             v6_pixel_lock: b("v6_pixel_lock"),
             guidance: b("guidance"),
             v6_render: s("v6_render"),
-            command_band: b("command_band"),
+            panel: s("panel").as_deref().and_then(crate::state::SidePanel::from_key),
             return_probe: b("return_probe"),
+            scott_you_are: b("scott_you_are"),
+            scott_light: b("scott_light"),
+            scott_trs80_style: b("scott_trs80_style"),
+            scott_prehistoric_lamp: b("scott_prehistoric_lamp"),
+            scott_picture_resolution: s("scott_picture_resolution")
+                .as_deref()
+                .and_then(crate::graphics::ScottPictureResolution::from_key),
+            colour_source: s("colour_source").as_deref().and_then(crate::config::ColourSource::from_key),
+            quick: list("quick"),
         }
     }
 
-    /// Write the sidecar, omitting every `None` key and DELETING the file when
-    /// nothing is set. Creates `game_dir` if needed, so a click on turn one of a
-    /// story that has never been saved writes the directory into existence.
+    /// Write the sidecar: known keys are set or removed exactly as `self`
+    /// says, but the file is otherwise READ-MODIFY-WRITTEN (SQ-1560, following
+    /// the same `toml_edit` approach as the global `write_config_at`), so any
+    /// top-level key or table this struct doesn't know about — an embedding
+    /// host's own `[host.<name>]` table, say — is left exactly as it was.
+    /// Deletes the file only when NOTHING AT ALL remains in it: no known key
+    /// set and no unrecognised data present. Creates `game_dir` if needed, so
+    /// a click on turn one of a story that has never been saved writes the
+    /// directory into existence.
     pub fn write(&self, game_dir: &Path) -> std::io::Result<()> {
-        let path = per_game_config_path(game_dir);
-        let mut body = String::new();
-        let mut put_bool = |k: &str, v: Option<bool>| {
-            if let Some(v) = v {
-                body.push_str(&format!("{k} = {v}\n"));
+        edit_raw(game_dir, |doc| {
+            put_bool(doc, "honor_game_colours", self.honor_game_colours);
+            put_bool(doc, "borderless_windows", self.borderless_windows);
+            put_bool(doc, "show_map", self.show_map);
+            put_bool(doc, "v6_pixel_lock", self.v6_pixel_lock);
+            put_bool(doc, "guidance", self.guidance);
+            put_str(doc, "panel", self.panel.map(|p| p.key()));
+            put_bool(doc, "return_probe", self.return_probe);
+            put_str(doc, "pictures", self.pictures.as_deref());
+            put_str(doc, "v6_render", self.v6_render.as_deref());
+            put_int(doc, "interpreter_number", self.interpreter_number.map(i64::from));
+            put_bool(doc, "scott_you_are", self.scott_you_are);
+            put_bool(doc, "scott_light", self.scott_light);
+            put_bool(doc, "scott_trs80_style", self.scott_trs80_style);
+            put_bool(doc, "scott_prehistoric_lamp", self.scott_prehistoric_lamp);
+            put_str(doc, "scott_picture_resolution", self.scott_picture_resolution.map(|v| v.key()));
+            put_str(doc, "colour_source", self.colour_source.map(|v| v.key()));
+            match &self.quick {
+                Some(v) => {
+                    let arr: toml_edit::Array = v.iter().map(String::as_str).collect();
+                    doc["quick"] = toml_edit::value(arr);
+                }
+                None => {
+                    doc.remove("quick");
+                }
             }
-        };
-        put_bool("honor_game_colours", self.honor_game_colours);
-        put_bool("borderless_windows", self.borderless_windows);
-        put_bool("show_map", self.show_map);
-        put_bool("v6_pixel_lock", self.v6_pixel_lock);
-        put_bool("guidance", self.guidance);
-        put_bool("command_band", self.command_band);
-        put_bool("return_probe", self.return_probe);
-        if let Some(v) = &self.pictures {
-            body.push_str(&format!("pictures = {}\n", toml::Value::String(v.clone())));
-        }
-        if let Some(v) = &self.v6_render {
-            body.push_str(&format!("v6_render = {}\n", toml::Value::String(v.clone())));
-        }
-        if let Some(v) = self.interpreter_number {
-            body.push_str(&format!("interpreter_number = {v}\n"));
-        }
-        if body.is_empty() {
-            return match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            };
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, body)
+        })
     }
 }
 
-/// Set one key and write the sidecar back, leaving every sibling key alone.
+/// Set `key` in a [`toml_edit::DocumentMut`] to `v`, or remove it when `None`
+/// — the boolean-valued half of [`PerGameConfig::write`]'s per-key rule.
+fn put_bool(doc: &mut toml_edit::DocumentMut, key: &str, v: Option<bool>) {
+    match v {
+        Some(v) => doc[key] = toml_edit::value(v),
+        None => {
+            doc.remove(key);
+        }
+    }
+}
+
+/// [`put_bool`] for a string-valued key.
+fn put_str(doc: &mut toml_edit::DocumentMut, key: &str, v: Option<&str>) {
+    match v {
+        Some(v) => doc[key] = toml_edit::value(v),
+        None => {
+            doc.remove(key);
+        }
+    }
+}
+
+/// [`put_bool`] for an integer-valued key.
+fn put_int(doc: &mut toml_edit::DocumentMut, key: &str, v: Option<i64>) {
+    match v {
+        Some(v) => doc[key] = toml_edit::value(v),
+        None => {
+            doc.remove(key);
+        }
+    }
+}
+
+/// Read-modify-write the sidecar's raw TOML document (SQ-1560): parse the
+/// existing file — or start a fresh, empty document when it's missing or
+/// doesn't parse, matching [`PerGameConfig::read`]'s own "unparseable inherits
+/// the global config" rule — hand it to `mutate`, then either delete the file
+/// (when nothing remains in it at all) or write it back. The one place that
+/// owns "no sidecar at all" for both [`PerGameConfig::write`] and
+/// [`write_host_table`], so neither can disagree with the other about when the
+/// file should exist.
+fn edit_raw(
+    game_dir: &Path,
+    mutate: impl FnOnce(&mut toml_edit::DocumentMut),
+) -> std::io::Result<()> {
+    let path = per_game_config_path(game_dir);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = existing.parse().unwrap_or_default();
+    mutate(&mut doc);
+    if doc.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+    }
+    crate::storage::atomic_write(&path, doc.to_string().as_bytes())
+}
+
+/// Set one key and write the sidecar back, leaving every sibling key — known
+/// or not — alone.
 fn edit(game_dir: &Path, f: impl FnOnce(&mut PerGameConfig)) -> std::io::Result<()> {
     let mut cfg = PerGameConfig::read(game_dir);
     f(&mut cfg);
     cfg.write(game_dir)
+}
+
+/// Read one whole table from the sidecar by name, without touching or caring
+/// about any of the known [`PerGameConfig`] keys (SQ-1560). For an embedding
+/// host storing its own per-story settings alongside lanthorn's — see
+/// [`per_game_config_path`]'s doc for the `[host.<name>]` naming convention.
+/// `None` when the file, or the named table, is absent.
+pub fn read_host_table(game_dir: &Path, name: &str) -> Option<toml::Table> {
+    let text = std::fs::read_to_string(per_game_config_path(game_dir)).ok()?;
+    let v: toml::Value = text.parse().ok()?;
+    v.get(name)?.as_table().cloned()
+}
+
+/// Write (or clear) one whole table in the sidecar by name, going through the
+/// same [`edit_raw`] read-modify-write every other writer here does, so it
+/// preserves every known key and every other unrecognised one exactly as
+/// [`PerGameConfig::write`] does. `None` removes the table.
+pub fn write_host_table(
+    game_dir: &Path,
+    name: &str,
+    table: Option<&toml::Table>,
+) -> std::io::Result<()> {
+    edit_raw(game_dir, |doc| match table {
+        Some(t) => {
+            // Round-trip through a TOML string rather than hand-converting
+            // `toml::Value` to `toml_edit::Value`: the two crates' value types
+            // don't otherwise interconvert, and this lets toml_edit's own
+            // parser handle whatever shape the host's table holds (nested
+            // tables, arrays, …) instead of a partial hand-rolled mapping.
+            let text = toml::to_string(t).unwrap_or_default();
+            let sub: toml_edit::DocumentMut = text.parse().unwrap_or_default();
+            doc[name] = toml_edit::Item::Table(sub.as_table().clone());
+        }
+        None => {
+            doc.remove(name);
+        }
+    })
 }
 
 /// Read the per-game `honor_game_colours` override, if the user set one.
@@ -234,11 +400,57 @@ pub fn read_per_game_v6_render(game_dir: &Path) -> Option<String> {
     PerGameConfig::read(game_dir).v6_render
 }
 
-/// Read the per-game `command_band` override (SQ-1123). `None` = no override, so
-/// the global `[command_band] auto_open` decides whether the band opens with the
-/// story.
-pub fn read_per_game_command_band(game_dir: &Path) -> Option<bool> {
-    PerGameConfig::read(game_dir).command_band
+/// Read the per-game `panel` override (SQ-1123, widened to three states by
+/// SQ-1237). `None` = no override, so the global `[command_panel] auto_open`
+/// decides whether the command panel opens with the story (the inventory panel
+/// has no global auto-open of its own).
+pub fn read_per_game_panel(game_dir: &Path) -> Option<crate::state::SidePanel> {
+    PerGameConfig::read(game_dir).panel
+}
+
+/// Read the per-game ScottFree `-y`/`YOUARE` override (SQ-1413). `None` = no
+/// override — `scott_session.rs` falls back to `scott::Options::default`
+/// (off, matching ScottFree's own plain build). Meaningless for a
+/// Z-machine/Glulx story.
+pub fn read_per_game_scott_you_are(game_dir: &Path) -> Option<bool> {
+    PerGameConfig::read(game_dir).scott_you_are
+}
+
+/// Read the per-game ScottFree `-s`/`SCOTTLIGHT` override (SQ-1413). `None` =
+/// no override — `scott_session.rs` falls back to `scott::Options::default`
+/// (off, matching ScottFree's own plain build).
+pub fn read_per_game_scott_light(game_dir: &Path) -> Option<bool> {
+    PerGameConfig::read(game_dir).scott_light
+}
+
+/// Read the per-game ScottFree `-t`/`TRS80_STYLE` override (SQ-1413). `None` =
+/// no override (off by default) — see `PerGameConfig::scott_trs80_style`'s
+/// doc: this sets `scott::Options::trs80_style` only, never lanthorn's own
+/// room-block presentation.
+pub fn read_per_game_scott_trs80_style(game_dir: &Path) -> Option<bool> {
+    PerGameConfig::read(game_dir).scott_trs80_style
+}
+
+/// Read the per-game ScottFree `-p`/`PREHISTORIC_LAMP` override (SQ-1413).
+/// `None` = no override (off by default).
+pub fn read_per_game_scott_prehistoric_lamp(game_dir: &Path) -> Option<bool> {
+    PerGameConfig::read(game_dir).scott_prehistoric_lamp
+}
+
+/// Read the per-game `scott_picture_resolution` override (SQ-1473). `None` =
+/// no override, so the default ([`crate::graphics::ScottPictureResolution::HiRes`])
+/// decides. Meaningless for a Scott story with no native C64 vector artwork.
+pub fn read_per_game_scott_picture_resolution(
+    game_dir: &Path,
+) -> Option<crate::graphics::ScottPictureResolution> {
+    PerGameConfig::read(game_dir).scott_picture_resolution
+}
+
+/// Read the per-game `colour_source` override (SQ-1532). `None` = no override,
+/// so the global `colour_source` decides — which is also what "Default" means
+/// in the launch-options dialog's own row.
+pub fn read_per_game_colour_source(game_dir: &Path) -> Option<crate::config::ColourSource> {
+    PerGameConfig::read(game_dir).colour_source
 }
 
 /// Read the per-game `return_probe` override (SQ-0785). `None` = no override, so
@@ -252,10 +464,50 @@ pub fn read_per_game_return_probe(game_dir: &Path) -> Option<bool> {
     PerGameConfig::read(game_dir).return_probe
 }
 
+/// Read the per-game `quick` override (SQ-1552). `None` = no override, so the
+/// global `[command_panel] quick` decides (and, if that is empty too, the
+/// built-in row) — see [`crate::config::CommandBandConfig::resolve_quick_for`].
+pub fn read_per_game_quick(game_dir: &Path) -> Option<Vec<String>> {
+    PerGameConfig::read(game_dir).quick
+}
+
 /// Persist (or clear) the per-game `return_probe` override, preserving every
 /// sibling key (SQ-0785).
 pub fn write_per_game_return_probe(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
     edit(game_dir, |c| c.return_probe = value)
+}
+
+/// Persist (or clear) the per-game ScottFree `-y`/`YOUARE` override
+/// (SQ-1413), preserving every sibling key.
+pub fn write_per_game_scott_you_are(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
+    edit(game_dir, |c| c.scott_you_are = value)
+}
+
+/// Persist (or clear) the per-game ScottFree `-s`/`SCOTTLIGHT` override
+/// (SQ-1413), preserving every sibling key.
+pub fn write_per_game_scott_light(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
+    edit(game_dir, |c| c.scott_light = value)
+}
+
+/// Persist (or clear) the per-game ScottFree `-t`/`TRS80_STYLE` override
+/// (SQ-1413), preserving every sibling key.
+pub fn write_per_game_scott_trs80_style(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
+    edit(game_dir, |c| c.scott_trs80_style = value)
+}
+
+/// Persist (or clear) the per-game ScottFree `-p`/`PREHISTORIC_LAMP` override
+/// (SQ-1413), preserving every sibling key.
+pub fn write_per_game_scott_prehistoric_lamp(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
+    edit(game_dir, |c| c.scott_prehistoric_lamp = value)
+}
+
+/// Persist (or clear) the per-game `scott_picture_resolution` override
+/// (SQ-1473), preserving every sibling key.
+pub fn write_per_game_scott_picture_resolution(
+    game_dir: &Path,
+    value: Option<crate::graphics::ScottPictureResolution>,
+) -> std::io::Result<()> {
+    edit(game_dir, |c| c.scott_picture_resolution = value)
 }
 
 /// Persist (or clear) the per-game `honor_game_colours` override, preserving
@@ -263,6 +515,33 @@ pub fn write_per_game_return_probe(game_dir: &Path, value: Option<bool>) -> std:
 /// garglk.ini / the global default).
 pub fn write_per_game_honor(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
     edit(game_dir, |c| c.honor_game_colours = value)
+}
+
+/// [`write_per_game_honor`], guarded for the launch-options dialog's "Save as
+/// this game's default" checkbox (SQ-1532).
+///
+/// **The persistence-layer backstop.** CLI arguments are a one-time run
+/// override and must never be persisted, under any circumstance — the dialog's
+/// UI layer already keeps a CLI-locked row's live value pinned to its baseline,
+/// so `overrides()`/the checkbox never *asks* to write a CLI-sourced value, but
+/// this is the guard that holds even if something calls it anyway: `cli_locked`
+/// true refuses the write outright, whatever `value` is, and every other
+/// sibling key in the sidecar is left exactly as it was (a no-op `edit`, not a
+/// call that never happened, would still be safe here — but refusing before
+/// touching the file at all is the more honest shape of "refused").
+///
+/// Every other caller of `write_per_game_honor` (`/set-game-colours`, the
+/// reload path) is unaffected — this is a second, narrower entry point for one
+/// call site, not a change to the general one.
+pub fn write_per_game_honor_for_launch(
+    game_dir: &Path,
+    value: Option<bool>,
+    cli_locked: bool,
+) -> std::io::Result<()> {
+    if cli_locked {
+        return Ok(());
+    }
+    write_per_game_honor(game_dir, value)
 }
 
 /// Persist (or clear) the per-game `borderless_windows` override, preserving
@@ -294,6 +573,33 @@ pub fn write_per_game_interpreter_number(game_dir: &Path, value: Option<u8>) -> 
     edit(game_dir, |c| c.interpreter_number = value)
 }
 
+/// Persist (or clear) the per-game `colour_source` override — the
+/// launch-options dialog's "Save as this game's default" checkbox (SQ-1532),
+/// preserving every sibling key.
+///
+/// **Double-`Option`, and a CLI guard, deliberately.** The outer `Option`
+/// mirrors every other launch-options setter's convention (the caller decides
+/// whether this key is even touched — `None` is a no-op, exactly as never
+/// calling [`write_per_game_pictures`] leaves `pictures` alone); the inner
+/// `Option<ColourSource>` is the value itself, where `None` explicitly clears
+/// the override back to "Default" (inherit the global `colour_source`) rather
+/// than leaving whatever was there. `cli_locked` is the persistence-layer
+/// backstop (see [`write_per_game_honor_for_launch`]'s doc, which explains why
+/// it exists independently of the UI lock): CLI arguments are a one-time run
+/// override and must never be persisted, so a `true` here refuses the write
+/// outright, whatever `value` is.
+pub fn write_per_game_colour_source(
+    game_dir: &Path,
+    value: Option<Option<crate::config::ColourSource>>,
+    cli_locked: bool,
+) -> std::io::Result<()> {
+    if cli_locked {
+        return Ok(());
+    }
+    let Some(v) = value else { return Ok(()) };
+    edit(game_dir, |c| c.colour_source = v)
+}
+
 /// Persist (or clear) the per-game `v6_pixel_lock` override (SQ-0945),
 /// preserving every sibling key. `None` clears it back to inheriting the global
 /// `v6_pixel_lock`, which is NOT the same as writing the global value down.
@@ -313,14 +619,23 @@ pub fn write_per_game_v6_render(game_dir: &Path, value: Option<String>) -> std::
     edit(game_dir, |c| c.v6_render = value)
 }
 
-/// Persist (or clear) the per-game `command_band` override (SQ-1123), preserving
-/// every sibling key. `None` clears it back to inheriting `[command_band]
-/// auto_open`.
-pub fn write_per_game_command_band(game_dir: &Path, value: Option<bool>) -> std::io::Result<()> {
-    edit(game_dir, |c| c.command_band = value)
+/// Persist (or clear) the per-game `panel` override (SQ-1123, widened by
+/// SQ-1237), preserving every sibling key. `None` clears it back to inheriting
+/// `[command_panel] auto_open`.
+pub fn write_per_game_panel(
+    game_dir: &Path,
+    value: Option<crate::state::SidePanel>,
+) -> std::io::Result<()> {
+    edit(game_dir, |c| c.panel = value)
 }
 
-#[cfg(test)]
+/// Persist (or clear) the per-game `quick` override (SQ-1552), preserving
+/// every sibling key. `None` clears it back to inheriting the global list.
+pub fn write_per_game_quick(game_dir: &Path, value: Option<Vec<String>>) -> std::io::Result<()> {
+    edit(game_dir, |c| c.quick = value)
+}
+
+#[cfg(all(test, feature = "t-persist"))]
 mod tests {
     use super::*;
 
@@ -394,8 +709,15 @@ mod tests {
             v6_pixel_lock: Some(true),
             guidance: Some(true),
             v6_render: Some("raster".into()),
-            command_band: Some(true),
+            panel: Some(crate::state::SidePanel::Command),
             return_probe: Some(true),
+            scott_you_are: Some(true),
+            scott_light: Some(true),
+            scott_trs80_style: Some(true),
+            scott_prehistoric_lamp: Some(true),
+            scott_picture_resolution: Some(crate::graphics::ScottPictureResolution::Original),
+            colour_source: Some(crate::config::ColourSource::Terminal),
+            quick: Some(vec!["n".to_string(), "s".to_string()]),
         };
         every.write(&dir).unwrap();
         let text = std::fs::read_to_string(per_game_config_path(&dir)).unwrap();
@@ -415,11 +737,11 @@ mod tests {
         let dir = tmp("controls");
         assert_eq!(read_per_game_guidance(&dir), None);
         assert_eq!(read_per_game_v6_render(&dir), None);
-        assert_eq!(read_per_game_command_band(&dir), None);
+        assert_eq!(read_per_game_panel(&dir), None);
 
         write_per_game_guidance(&dir, Some(false)).unwrap();
         write_per_game_v6_render(&dir, Some("raster".into())).unwrap();
-        write_per_game_command_band(&dir, Some(true)).unwrap();
+        write_per_game_panel(&dir, Some(crate::state::SidePanel::Command)).unwrap();
         // …alongside two keys that predate them, to prove the shared sidecar is
         // read-modify-written rather than rewritten from whatever the caller
         // remembered to pass.
@@ -428,7 +750,7 @@ mod tests {
 
         assert_eq!(read_per_game_guidance(&dir), Some(false));
         assert_eq!(read_per_game_v6_render(&dir).as_deref(), Some("raster"));
-        assert_eq!(read_per_game_command_band(&dir), Some(true));
+        assert_eq!(read_per_game_panel(&dir), Some(crate::state::SidePanel::Command));
         assert_eq!(read_per_game_v6_pixel_lock(&dir), Some(true));
         assert_eq!(read_per_game_pictures(&dir).as_deref(), Some("Pic.data"));
 
@@ -442,12 +764,52 @@ mod tests {
         // inherit, which a file full of defaults could not say.
         for f in [
             write_per_game_guidance as fn(&Path, Option<bool>) -> std::io::Result<()>,
-            write_per_game_command_band,
             write_per_game_v6_pixel_lock,
         ] {
             f(&dir, None).unwrap();
         }
+        write_per_game_panel(&dir, None).unwrap();
         write_per_game_pictures(&dir, None).unwrap();
+        assert!(!per_game_config_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-game quick-word override round-trips through
+    /// [`PerGameConfig::write`] alongside sibling keys, without dropping the
+    /// list or corrupting anything else in the shared sidecar (SQ-1552).
+    #[test]
+    fn per_game_quick_roundtrips_and_coexists_with_other_keys() {
+        let dir = tmp("quick");
+        assert_eq!(read_per_game_quick(&dir), None);
+
+        write_per_game_quick(&dir, Some(vec!["n".to_string(), "s".to_string(), "look".to_string()]))
+            .unwrap();
+        assert_eq!(
+            read_per_game_quick(&dir),
+            Some(vec!["n".to_string(), "s".to_string(), "look".to_string()])
+        );
+
+        // A sibling key written afterward must PRESERVE quick (shared sidecar,
+        // read-modify-write).
+        write_per_game_guidance(&dir, Some(false)).unwrap();
+        assert_eq!(read_per_game_guidance(&dir), Some(false));
+        assert_eq!(
+            read_per_game_quick(&dir),
+            Some(vec!["n".to_string(), "s".to_string(), "look".to_string()]),
+            "writing a sibling key must not drop quick"
+        );
+
+        // Overwriting quick must PRESERVE the sibling.
+        write_per_game_quick(&dir, Some(vec!["xyzzy".to_string()])).unwrap();
+        assert_eq!(read_per_game_quick(&dir), Some(vec!["xyzzy".to_string()]));
+        assert_eq!(read_per_game_guidance(&dir), Some(false), "quick write kept guidance");
+
+        // Clearing quick keeps guidance; clearing the last key removes the
+        // sidecar entirely.
+        write_per_game_quick(&dir, None).unwrap();
+        assert_eq!(read_per_game_quick(&dir), None);
+        assert_eq!(read_per_game_guidance(&dir), Some(false), "quick clear kept guidance");
+        write_per_game_guidance(&dir, None).unwrap();
         assert!(!per_game_config_path(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -609,6 +971,296 @@ mod tests {
         write_per_game_show_map(&dir, None).unwrap();
         write_per_game_pictures(&dir, None).unwrap();
         write_per_game_interpreter_number(&dir, None).unwrap();
+        assert!(!per_game_config_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1413: the four ScottFree option keys roundtrip, coexist with an
+    /// unrelated sibling, and clear back to "inherit `scott::Options::default`".
+    #[test]
+    fn the_scott_option_keys_roundtrip_and_coexist() {
+        let dir = tmp("scott-options");
+        assert_eq!(read_per_game_scott_you_are(&dir), None);
+        assert_eq!(read_per_game_scott_light(&dir), None);
+        assert_eq!(read_per_game_scott_trs80_style(&dir), None);
+        assert_eq!(read_per_game_scott_prehistoric_lamp(&dir), None);
+
+        write_per_game_scott_you_are(&dir, Some(true)).unwrap();
+        write_per_game_scott_light(&dir, Some(true)).unwrap();
+        write_per_game_scott_trs80_style(&dir, Some(true)).unwrap();
+        write_per_game_scott_prehistoric_lamp(&dir, Some(true)).unwrap();
+        assert_eq!(read_per_game_scott_you_are(&dir), Some(true));
+        assert_eq!(read_per_game_scott_light(&dir), Some(true));
+        assert_eq!(read_per_game_scott_trs80_style(&dir), Some(true));
+        assert_eq!(read_per_game_scott_prehistoric_lamp(&dir), Some(true));
+
+        // An unrelated sibling write keeps them, and they keep it.
+        write_per_game_guidance(&dir, Some(false)).unwrap();
+        assert_eq!(read_per_game_scott_you_are(&dir), Some(true), "sibling write kept it");
+        assert_eq!(read_per_game_guidance(&dir), Some(false), "and it kept the sibling");
+
+        // Clearing all four (and the sibling) removes the file.
+        write_per_game_scott_you_are(&dir, None).unwrap();
+        write_per_game_scott_light(&dir, None).unwrap();
+        write_per_game_scott_trs80_style(&dir, None).unwrap();
+        write_per_game_scott_prehistoric_lamp(&dir, None).unwrap();
+        write_per_game_guidance(&dir, None).unwrap();
+        assert!(!per_game_config_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1532: `colour_source` round-trips, clears back to ABSENT ("Default" —
+    /// inherit the global `colour_source`, not "written at the default"), and
+    /// survives a sibling's whole-file rewrite, as every key here must.
+    #[test]
+    fn per_game_colour_source_roundtrips_and_coexists_with_others() {
+        let dir = tmp("coloursource");
+        assert_eq!(read_per_game_colour_source(&dir), None);
+
+        write_per_game_colour_source(&dir, Some(Some(crate::config::ColourSource::Terminal)), false)
+            .unwrap();
+        assert_eq!(read_per_game_colour_source(&dir), Some(crate::config::ColourSource::Terminal));
+        let body = std::fs::read_to_string(per_game_config_path(&dir)).unwrap();
+        assert!(body.contains("colour_source = \"terminal\""), "got {body:?}");
+
+        // A sibling write preserves it, and it preserves the sibling.
+        write_per_game_honor(&dir, Some(true)).unwrap();
+        assert_eq!(
+            read_per_game_colour_source(&dir),
+            Some(crate::config::ColourSource::Terminal),
+            "honor write kept colour_source"
+        );
+        assert_eq!(read_per_game_honor(&dir), Some(true));
+
+        // The outer `None` is a no-op: it must not touch — let alone clear —
+        // the key, unlike every OTHER write_per_game_* function's single Option.
+        write_per_game_colour_source(&dir, None, false).unwrap();
+        assert_eq!(
+            read_per_game_colour_source(&dir),
+            Some(crate::config::ColourSource::Terminal),
+            "an outer None must be a no-op, not a clear"
+        );
+
+        // The inner `None` explicitly clears back to "Default".
+        write_per_game_colour_source(&dir, Some(None), false).unwrap();
+        assert_eq!(read_per_game_colour_source(&dir), None);
+        assert_eq!(read_per_game_honor(&dir), Some(true), "clearing it kept the sibling");
+        write_per_game_honor(&dir, None).unwrap();
+        assert!(!per_game_config_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1532: the persistence-layer backstop, independent of any dialog-level
+    /// test — CLI arguments are a one-time run override and must never be
+    /// persisted, under any circumstance, so calling the write path DIRECTLY
+    /// with a CLI-sourced value must refuse it, whatever the caller asks for.
+    #[test]
+    fn write_per_game_colour_source_refuses_a_cli_sourced_value() {
+        let dir = tmp("coloursource-cli-guard");
+        assert_eq!(read_per_game_colour_source(&dir), None);
+
+        // `cli_locked = true`: refused outright, sidecar never created.
+        write_per_game_colour_source(&dir, Some(Some(crate::config::ColourSource::Machine)), true)
+            .unwrap();
+        assert_eq!(read_per_game_colour_source(&dir), None, "a CLI-sourced value must not land");
+        assert!(!per_game_config_path(&dir).exists(), "refusing must not even create the file");
+
+        // Falsify: the same call with the guard OFF does write it, so the test
+        // above is proof the guard did something rather than the value being
+        // unwritable for some other reason.
+        write_per_game_colour_source(&dir, Some(Some(crate::config::ColourSource::Machine)), false)
+            .unwrap();
+        assert_eq!(read_per_game_colour_source(&dir), Some(crate::config::ColourSource::Machine));
+
+        // And the guard refuses a CHANGE too, not only a fresh write: an already
+        // -persisted value must not be overwritten by a CLI-sourced one either.
+        write_per_game_colour_source(&dir, Some(Some(crate::config::ColourSource::Terminal)), true)
+            .unwrap();
+        assert_eq!(
+            read_per_game_colour_source(&dir),
+            Some(crate::config::ColourSource::Machine),
+            "a locked call must not overwrite what was already there"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1532: the same backstop on `write_per_game_honor_for_launch`, the
+    /// launch-options dialog's own guarded entry point into `honor_game_colours`
+    /// — independent of `write_per_game_honor` itself, which every OTHER caller
+    /// (`/set-game-colours`, reload) still reaches unguarded, and rightly so:
+    /// only a launch-options commit needs to ask whether `--game-colours` decided
+    /// this row for the current run.
+    #[test]
+    fn write_per_game_honor_for_launch_refuses_a_cli_sourced_value() {
+        let dir = tmp("honor-cli-guard");
+        assert_eq!(read_per_game_honor(&dir), None);
+
+        write_per_game_honor_for_launch(&dir, Some(false), true).unwrap();
+        assert_eq!(read_per_game_honor(&dir), None, "a CLI-sourced value must not land");
+        assert!(!per_game_config_path(&dir).exists());
+
+        // Falsify: the guard OFF does write it.
+        write_per_game_honor_for_launch(&dir, Some(false), false).unwrap();
+        assert_eq!(read_per_game_honor(&dir), Some(false));
+
+        // And a locked call must not overwrite an already-persisted value either.
+        write_per_game_honor_for_launch(&dir, Some(true), true).unwrap();
+        assert_eq!(read_per_game_honor(&dir), Some(false), "locked call must not overwrite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1560: a table an embedding host wrote under its own name must survive
+    /// an ordinary TUI toggle through [`write_per_game_guidance`] byte-for-byte
+    /// — the write path is read-modify-write, not "known fields only".
+    #[test]
+    fn an_unknown_table_survives_a_known_key_write() {
+        let dir = tmp("unknown-table");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            per_game_config_path(&dir),
+            "guidance = true\n\n[host.example]\nfont = \"Serif\"\n",
+        )
+        .unwrap();
+
+        write_per_game_guidance(&dir, Some(false)).unwrap();
+
+        assert_eq!(read_per_game_guidance(&dir), Some(false), "the known key changed");
+        let text = std::fs::read_to_string(per_game_config_path(&dir)).unwrap();
+        assert!(text.contains("[host.example]"), "host table dropped, got {text:?}");
+        assert!(text.contains("font = \"Serif\""), "host table's own key dropped, got {text:?}");
+        assert_eq!(
+            read_host_table(&dir, "host").and_then(|h| h.get("example").cloned()),
+            Some(toml::Value::Table({
+                let mut t = toml::Table::new();
+                t.insert("font".into(), toml::Value::String("Serif".into()));
+                t
+            })),
+            "host table is still semantically the same table, got {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1560: clearing every KNOWN key while an unknown table remains must
+    /// leave the sidecar in place — with only the unknown data left — rather
+    /// than deleting it. Deletion is reserved for when NOTHING remains at all.
+    #[test]
+    fn clearing_every_known_key_keeps_the_file_while_unknown_data_remains() {
+        let dir = tmp("unknown-survives-clear");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            per_game_config_path(&dir),
+            "guidance = true\nshow_map = false\n\n[host.example]\nfont = \"Serif\"\n",
+        )
+        .unwrap();
+
+        write_per_game_guidance(&dir, None).unwrap();
+        write_per_game_show_map(&dir, None).unwrap();
+
+        assert_eq!(read_per_game_guidance(&dir), None);
+        assert_eq!(read_per_game_show_map(&dir), None);
+        assert!(
+            per_game_config_path(&dir).is_file(),
+            "the file must stay while the host table is still in it"
+        );
+        assert_eq!(
+            read_host_table(&dir, "host").and_then(|h| h.get("example").cloned()),
+            Some(toml::Value::Table({
+                let mut t = toml::Table::new();
+                t.insert("font".into(), toml::Value::String("Serif".into()));
+                t
+            }))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1560: once EVERY key is gone — known and unknown alike — the sidecar
+    /// is deleted, exactly as it always was for known-only content.
+    #[test]
+    fn clearing_everything_known_and_unknown_still_deletes_the_file() {
+        let dir = tmp("clear-everything");
+        write_per_game_guidance(&dir, Some(true)).unwrap();
+        assert!(per_game_config_path(&dir).is_file());
+
+        write_per_game_guidance(&dir, None).unwrap();
+        assert!(!per_game_config_path(&dir).exists(), "known-only content still deletes as before");
+
+        // Now with an unknown table added and then removed via the host helper.
+        write_host_table(&dir, "host", Some(&{
+            let mut t = toml::Table::new();
+            t.insert("font".into(), toml::Value::String("Serif".into()));
+            t
+        }))
+        .unwrap();
+        assert!(per_game_config_path(&dir).is_file());
+        write_host_table(&dir, "host", None).unwrap();
+        assert!(!per_game_config_path(&dir).exists(), "removing the last unknown table deletes the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1560: an unknown TOP-LEVEL scalar key (not only a table) also
+    /// survives a write, alongside a known sibling.
+    #[test]
+    fn an_unknown_top_level_key_survives_a_write() {
+        let dir = tmp("unknown-scalar");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(per_game_config_path(&dir), "future_key = \"mystery\"\n").unwrap();
+
+        write_per_game_guidance(&dir, Some(true)).unwrap();
+
+        let text = std::fs::read_to_string(per_game_config_path(&dir)).unwrap();
+        assert!(text.contains("future_key = \"mystery\""), "got {text:?}");
+        assert_eq!(read_per_game_guidance(&dir), Some(true));
+
+        // Clearing the known key must not remove the unknown one either.
+        write_per_game_guidance(&dir, None).unwrap();
+        let text = std::fs::read_to_string(per_game_config_path(&dir)).unwrap();
+        assert!(text.contains("future_key = \"mystery\""), "got {text:?}");
+        assert!(per_game_config_path(&dir).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1560: [`read_host_table`]/[`write_host_table`] round-trip a whole
+    /// table by name without disturbing a sibling KNOWN key, and clearing the
+    /// host table via `None` keeps that sibling.
+    #[test]
+    fn host_table_helpers_roundtrip_and_coexist_with_known_keys() {
+        let dir = tmp("host-helpers");
+        assert_eq!(read_host_table(&dir, "host"), None);
+
+        write_per_game_guidance(&dir, Some(false)).unwrap();
+
+        let mut t = toml::Table::new();
+        t.insert("font".into(), toml::Value::String("Serif".into()));
+        t.insert("size".into(), toml::Value::Integer(14));
+        write_host_table(&dir, "host", Some(&t)).unwrap();
+
+        assert_eq!(read_host_table(&dir, "host"), Some(t.clone()));
+        assert_eq!(read_per_game_guidance(&dir), Some(false), "host write kept the known key");
+
+        // A normal known-key write must keep the host table too.
+        write_per_game_show_map(&dir, Some(true)).unwrap();
+        assert_eq!(read_host_table(&dir, "host"), Some(t));
+        assert_eq!(read_per_game_show_map(&dir), Some(true));
+
+        // Clearing the host table (None) keeps the known keys.
+        write_host_table(&dir, "host", None).unwrap();
+        assert_eq!(read_host_table(&dir, "host"), None);
+        assert_eq!(read_per_game_guidance(&dir), Some(false));
+        assert_eq!(read_per_game_show_map(&dir), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A normal per-game toggle round-trip with no unknown data present must
+    /// look exactly as it did before SQ-1560 — the read-modify-write must not
+    /// change ordinary behaviour when there is nothing extra to preserve.
+    #[test]
+    fn a_plain_roundtrip_with_no_unknown_data_is_unaffected() {
+        let dir = tmp("plain-roundtrip");
+        assert_eq!(read_per_game_guidance(&dir), None);
+        write_per_game_guidance(&dir, Some(true)).unwrap();
+        assert_eq!(read_per_game_guidance(&dir), Some(true));
+        assert!(per_game_config_path(&dir).is_file());
+        write_per_game_guidance(&dir, None).unwrap();
         assert!(!per_game_config_path(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

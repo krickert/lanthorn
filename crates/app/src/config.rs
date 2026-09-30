@@ -68,6 +68,7 @@ pub(crate) fn default_badge_hint_available() -> String {
 }
 pub(crate) fn default_diagonal_corners() -> bool { true }
 pub(crate) fn default_portal_path_style() -> String { "dotted".into() }
+pub(crate) fn default_ghost_box_style() -> String { "dashed".into() }
 pub(crate) fn default_control_icons() -> String { "plain".into() }
 
 /// The resolved map glyph configuration, built from style.toml's `[map]`
@@ -78,6 +79,11 @@ pub struct SymbolConfig {
     /// Room outline style preset name.
     #[serde(default = "default_box_style")]
     pub box_style: String,
+    /// Outline preset for a CROSS-LAYER GHOST box (SQ-1356): "dashed" (the default), "dotted",
+    /// or "ascii". Separate from `box_style` because it says how a ghost differs from a room,
+    /// not what the house line art is — see [`crate::symbols::BoxStyle::ghost_preset`].
+    #[serde(default = "default_ghost_box_style")]
+    pub ghost_box_style: String,
     /// Arrow glyph set preset name.
     #[serde(default = "default_arrow_set")]
     pub arrow_set: String,
@@ -125,6 +131,7 @@ impl Default for SymbolConfig {
             portal_icons: default_portal_icons(),
             path_style: default_path_style(),
             portal_path_style: default_portal_path_style(),
+            ghost_box_style: default_ghost_box_style(),
             control_icons: default_control_icons(),
             badge_save: default_badge_save(),
             badge_hint: default_badge_hint(),
@@ -264,6 +271,19 @@ pub struct Cli {
     #[arg(long, value_enum, value_name = "ON|OFF")]
     pub sound: Option<OnOff>,
 
+    /// Save the resume state after every turn for this run, so an abrupt end —
+    /// a killed process, a dropped connection, a closed laptop — loses at most
+    /// the turn in progress. Overrides the config's `auto_save` in both
+    /// directions.
+    ///
+    /// The write is off the main thread and coalescing (`archive_worker`), so
+    /// the cost to a turn is a channel send. Like every flag here it is never
+    /// written back to config.toml; `docker/entrypoint.sh` passes `--auto-save
+    /// on` in the container's browser mode, where the pty can vanish under a
+    /// game at any moment (SQ-1323).
+    #[arg(long = "auto-save", value_enum, value_name = "ON|OFF")]
+    pub auto_save: Option<OnOff>,
+
     /// Force the terminal image protocol for cover art (default: auto-detect).
     #[arg(long, value_enum, default_value_t = ImageProtocol::Auto)]
     pub image_protocol: ImageProtocol,
@@ -302,6 +322,25 @@ pub struct Cli {
     // registry requires a verb.
     #[arg(long, value_enum, value_name = "ON|OFF")]
     pub guidance: Option<OnOff>,
+
+    /// Live-stream the transcript to a file as you play, appending — for a
+    /// screen reader or a second terminal running `tail -f` (SQ-0410).
+    ///
+    /// This is the app's own transcript — the words on screen, engine-neutral
+    /// across Z-machine, Glulx and Scott Adams alike — not a Z-machine output
+    /// stream: `/set-transcript` (stream 2) is the STORY's own log, Z-machine
+    /// only, and only of what the game itself chooses to write there. Nor is
+    /// it `/export-transcript`, which writes the visible transcript once, on
+    /// request, rather than growing live.
+    ///
+    /// Opened for APPEND at launch (an existing file is added to, not
+    /// truncated) and flushed after every turn. A path that cannot be opened
+    /// — a directory, a permission error — is reported once as a transcript
+    /// Warning rather than aborting the launch. Plain text; no colour or
+    /// styling. Never written to config.toml: an accessibility choice for
+    /// this run, like `--interpreter` is a header choice for this run.
+    #[arg(long = "transcript-file", value_name = "PATH")]
+    pub transcript_file: Option<PathBuf>,
 
     /// Ask whether this terminal's font draws lanthorn's Nerd Font icon glyphs —
     /// the map's arrows, the portal and stairs icons, and the mark of Lanthorn's
@@ -428,6 +467,30 @@ pub struct Cli {
     #[arg(long = "story", value_name = "N|NAME", requires = "story")]
     pub story_pick: Option<String>,
 
+    /// Fetch IFDB metadata and cover art for the library, then exit.
+    ///
+    /// The browser's `r` (missing) or `f` (all) pass, run without a terminal:
+    /// the stories under the directory, sub-folders included, get their
+    /// sidecar and cover written where the browser writes them, with one
+    /// printed line per story as it completes. A library on a server gets
+    /// its sidecars built this way, with no one at the picker.
+    ///
+    /// `missing` skips a story whose sidecar is current; `all` refetches them
+    /// all. Exits 0 when nothing failed to fetch.
+    #[arg(long, value_enum, value_name = "MISSING|ALL")]
+    pub fetch: Option<FetchMode>,
+
+    /// Import curated metadata for stories from a TSV file, then exit.
+    ///
+    /// For stories the IFDB pass could not identify by IFID, or that IFDB has
+    /// no cover for. A header row names the columns (any order): `path`, and
+    /// then `ifdb_tuid` (the story is fetched from IFDB by that id), or
+    /// `title`, `author`, `year`, `genre`, `language`, `description` (written
+    /// as a curated record), and `cover_url` (downloaded as the cover). One
+    /// printed line per row; exits 0 unless a row failed.
+    #[arg(long = "import-metadata", value_name = "TSV")]
+    pub import_metadata: Option<PathBuf>,
+
     /// How the Version 6 graphical pane is drawn, for this launch only. The two
     /// modes are listed below, out of the same doc comments the settings screen
     /// reads, so there is no second description here to fall out of step.
@@ -478,6 +541,15 @@ pub struct Cli {
     /// (blue lines) persists across runs. (SQ-0449)
     #[arg(long)]
     pub debug: bool,
+
+    /// Boot with no resume attempted from either reserved save slot, even when
+    /// one holds a resume point — for a host whose own "reboot"/"new game"
+    /// crosses a process boundary and needs a genuinely fresh launch rather
+    /// than one that silently resumes an old quick save (SQ-1626). Sets
+    /// `BootRequest::fresh_start`; the quick save itself is left untouched on
+    /// disk either way, ready to resume on the next ordinary launch.
+    #[arg(long = "fresh-start")]
+    pub fresh_start: bool,
 }
 
 /// A boolean setting said the way its slash command says it, so a flag and the
@@ -494,6 +566,23 @@ pub enum OnOff {
 impl From<OnOff> for bool {
     fn from(v: OnOff) -> bool {
         matches!(v, OnOff::On)
+    }
+}
+
+/// Which stories a headless `--fetch` visits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum FetchMode {
+    /// Stories with no current sidecar: what the browser's `r` does.
+    Missing,
+    /// All of them, ignoring the cache: the browser's `f`, for the lot.
+    All,
+}
+
+impl FetchMode {
+    /// Whether the fetch ignores a current sidecar.
+    pub fn forced(self) -> bool {
+        matches!(self, FetchMode::All)
     }
 }
 
@@ -533,6 +622,36 @@ pub enum ColourSource {
     /// the machine's own ZMSD §8.3.3 pair, when one is named; else theme
     #[default]
     Machine,
+}
+
+impl ColourSource {
+    /// The per-game sidecar's own spelling (SQ-1532), read by [`Self::from_key`].
+    /// Deliberately hand-written rather than read off the `clap::ValueEnum`
+    /// derive's `PossibleValue` — that borrows from a temporary, so it cannot
+    /// hand back a `&'static str` the way every other per-game key's `.key()`
+    /// does ([`crate::graphics::ScottPictureResolution::key`] is the pattern) —
+    /// but it MUST agree with the derive's `rename_all = "lowercase"` spelling,
+    /// which is what `--colour`/`--color` parses; the round-trip test below
+    /// checks the two against each other so they cannot drift apart.
+    pub fn key(self) -> &'static str {
+        match self {
+            ColourSource::Terminal => "terminal",
+            ColourSource::Theme => "theme",
+            ColourSource::Machine => "machine",
+        }
+    }
+
+    /// Parse the sidecar's spelling. An unrecognised token is `None` — the same
+    /// "a corrupt sidecar inherits the default" rule every other per-game key
+    /// follows (`styles::PerGameConfig::read`).
+    pub fn from_key(s: &str) -> Option<ColourSource> {
+        match s {
+            "terminal" => Some(ColourSource::Terminal),
+            "theme" => Some(ColourSource::Theme),
+            "machine" => Some(ColourSource::Machine),
+            _ => None,
+        }
+    }
 }
 
 /// Terminal image protocol for cover art. `Auto` detects the best available
@@ -577,9 +696,9 @@ pub struct HotkeysConfig {
     pub group: Vec<HotkeyGroupConfig>,
 }
 
-// ── [command_band] ────────────────────────────────────────────────────────────
+// ── [command_panel] ────────────────────────────────────────────────────────────
 
-/// One verb entry in `[command_band] verbs` / `extra_verbs`:
+/// One verb entry in `[command_panel] verbs` / `extra_verbs`:
 /// `{ word = "unlock", arity = "pair", prep = "with" }`.
 ///
 /// `arity` is one of `solo`, `object`, `object_opt` (`object?` is accepted too)
@@ -605,7 +724,7 @@ fn default_verb_arity() -> String {
     "object".to_string()
 }
 
-/// The `[command_band]` section: the bottom command band's size, whether it
+/// The `[command_panel]` section: the bottom command band's size, whether it
 /// opens with the story, and its grammar.
 ///
 /// Not to be confused with the top-level `command_bar` boolean, which is an
@@ -670,7 +789,7 @@ fn arity_lines(
     })
 }
 
-/// Lower one `[command_band]` verb entry, pushing a warning for an unrecognised
+/// Lower one `[command_panel]` verb entry, pushing a warning for an unrecognised
 /// `arity` rather than silently reinterpreting it.
 fn lower_verb(
     v: &VerbConfig,
@@ -762,10 +881,31 @@ impl CommandBandConfig {
         warnings: &mut Vec<String>,
     ) -> crate::render::command_band::VerbTable {
         for extra in &self.extra_verbs {
-            if let Some(e) = lower_verb(extra, warnings) {
+            if let Some(mut e) = lower_verb(extra, warnings) {
                 match table.entries.iter_mut().find(|t| t.word == e.word) {
-                    Some(slot) => *slot = e,
-                    None => table.entries.push(e),
+                    // Replacing a row keeps where it ranks and the story's other
+                    // spellings of it (SQ-1554).
+                    Some(slot) => {
+                        e.tier = slot.tier;
+                        e.synonyms = std::mem::take(&mut slot.synonyms);
+                        *slot = e;
+                    }
+                    None => {
+                        // A folded synonym this row now overrides is its own row
+                        // again, as it was before folding.
+                        for t in &mut table.entries {
+                            t.synonyms.retain(|s| *s != e.word);
+                        }
+                        // The player's own word leads the ranked column with the
+                        // core verbs — a list of built-ins or a configured list is
+                        // all `Core`, so there this is still the end.
+                        let at = table
+                            .entries
+                            .iter()
+                            .rposition(|t| t.tier == crate::render::command_band::VerbTier::Core)
+                            .map_or(0, |i| i + 1);
+                        table.entries.insert(at, e);
+                    }
                 }
             }
         }
@@ -780,6 +920,19 @@ impl CommandBandConfig {
             self.quick.clone()
         }
     }
+
+    /// [`Self::resolve_quick`], but letting this ONE story's own override
+    /// (SQ-1552) win over the global list when it set a non-empty one —
+    /// exactly the precedence every other per-game setting follows: per-game,
+    /// else global, else the built-in default. The TUI has no UI for setting
+    /// the override; this is the read side of the data path a headless host
+    /// uses to give a player per-game quick words that actually persist.
+    pub fn resolve_quick_for(&self, game_dir: &std::path::Path) -> Vec<String> {
+        match crate::styles::read_per_game_quick(game_dir) {
+            Some(q) if !q.is_empty() => q,
+            _ => self.resolve_quick(),
+        }
+    }
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -787,7 +940,7 @@ impl CommandBandConfig {
 fn default_command_prefix() -> char { '/' }
 fn default_undo_levels() -> usize { 16 }
 /// Rewind/replay history cap (SQ-1185): generous enough that the feature still
-/// reaches "further back than the game's own UNDO" (`docs/features/saves.md`),
+/// reaches "further back than the game's own UNDO" (`docs/internals/saves.md`),
 /// while bounding the per-turn VM snapshots the archive keeps in memory across
 /// an arbitrarily long session.
 fn default_history_turns() -> usize { 500 }
@@ -808,6 +961,9 @@ pub(crate) fn default_inv_dock_pct() -> u16 { 33 }
 /// about eleven rows rather than the sixteen the single column needed. 33% of a
 /// 40-row terminal is thirteen, which admits all of it with room to spare.
 pub(crate) fn default_room_dock_pct() -> u16 { 33 }
+/// Matches the zones lanthorn has always drawn for a mouse (one cell either
+/// side of the splitter, or above a dock edge); see `grab_zone_cells`.
+pub(crate) fn default_grab_zone_cells() -> u16 { 2 }
 pub(crate) fn default_band_height() -> u16 {
     crate::render::command_band::DEFAULT_BAND_ROWS
 }
@@ -900,6 +1056,32 @@ pub enum BackgroundTidy {
     OnOverlap,
     /// Re-tidy once every K new rooms (`BG_TIDY_DEBOUNCE`).
     Debounced,
+}
+
+impl BackgroundTidy {
+    /// The `background_tidy` token for a mode — what the file holds, so that
+    /// [`write_config_at`] writes back exactly what it read (the reason
+    /// [`v6_render_key`] exists).
+    pub fn key(self) -> &'static str {
+        match self {
+            BackgroundTidy::Off => "off",
+            BackgroundTidy::EveryRoom => "every_room",
+            BackgroundTidy::OnOverlap => "on_overlap",
+            BackgroundTidy::Debounced => "debounced",
+        }
+    }
+
+    /// Parse a `background_tidy` token, or `None` for anything else — the
+    /// inverse of [`Self::key`].
+    pub fn from_key(s: &str) -> Option<BackgroundTidy> {
+        match s {
+            "off" => Some(BackgroundTidy::Off),
+            "every_room" => Some(BackgroundTidy::EveryRoom),
+            "on_overlap" => Some(BackgroundTidy::OnOverlap),
+            "debounced" => Some(BackgroundTidy::Debounced),
+            _ => None,
+        }
+    }
 }
 
 /// Number of new rooms that must accumulate before a `Debounced` background tidy fires.
@@ -1068,6 +1250,49 @@ pub fn v6_render_from_key(token: &str) -> Option<V6RenderMode> {
     }
 }
 
+/// Whether lanthorn may hand a kitty terminal its artwork through POSIX shared
+/// memory instead of base64 on the wire (SQ-1374).
+///
+/// TOML: `kitty_shared_memory = "auto"` (default) or `"off"`. Two values on
+/// purpose: there is no "on". Shared memory is a thing the terminal has to be
+/// able to DO — one on the far end of an ssh connection cannot open our object,
+/// and a transmission it refuses draws nothing at all — so the answer is asked
+/// for, never asserted. `auto` means "use it if the terminal answered the
+/// probe"; `off` means "do not even ask".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KittySharedMemory {
+    /// Probe at startup, and use shared memory only if the terminal answered.
+    #[default]
+    Auto,
+    /// Never probe and never use it: every image goes down the wire as base64,
+    /// deflated where the terminal can inflate it.
+    Off,
+}
+
+/// The `kitty_shared_memory` token for a mode — what the file holds, so that
+/// [`write_config_at`] writes back exactly what it read (the reason
+/// [`v6_render_key`] exists).
+pub fn kitty_shared_memory_key(mode: KittySharedMemory) -> &'static str {
+    match mode {
+        KittySharedMemory::Auto => "auto",
+        KittySharedMemory::Off => "off",
+    }
+}
+
+/// Read `kitty_shared_memory`, falling back to `Auto` on any unrecognised
+/// string — the silence every other token-valued key here already has.
+fn deserialize_kitty_shared_memory<'de, D>(d: D) -> Result<KittySharedMemory, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    Ok(match s.as_str() {
+        "off" => KittySharedMemory::Off,
+        _ => KittySharedMemory::Auto,
+    })
+}
+
 /// Read `v6_render`, falling back to the default on any unrecognised string.
 ///
 /// Deliberately silent, matching [`deserialize_easing`]: a config naming a mode
@@ -1090,6 +1315,7 @@ where
 // ── Animation config ──────────────────────────────────────────────────────────
 
 fn default_scroll_ms() -> u64 { 120 }
+fn default_follow_ms() -> u64 { 200 }
 fn default_scrollbar_hide_ms() -> u64 { 1500 }
 fn default_scrollbar_fade_ms() -> u64 { 300 }
 fn default_easing() -> Easing { Easing::EaseOut }
@@ -1118,6 +1344,21 @@ pub struct AnimationConfig {
     /// Smooth-scroll duration in milliseconds (default 120). Zero = instant.
     #[serde(default = "default_scroll_ms")]
     pub scroll_ms: u64,
+    /// SQ-1595: how long the story pane eases toward NEW output arriving at the
+    /// bottom, in milliseconds (default 200). Zero — or `enabled = false` —
+    /// makes it the pre-SQ-1595 instant jump.
+    ///
+    /// This applies only when the reader was already at (or following) the
+    /// bottom the moment a turn's output arrived — scrolling into history and
+    /// leaving it there is never dragged back down by this or by anything
+    /// else. When the new output overflows the pane and the `[more]` pager
+    /// engages, the ease runs only up to wherever the pager parks; paging
+    /// further with a keypress is a reader action and always uses `scroll_ms`,
+    /// not this. Any key press or mouse event ends an in-flight follow-ease
+    /// immediately (the player outranks paced output, same principle as the
+    /// v6 picture pacer) rather than fighting the reader's own scroll.
+    #[serde(default = "default_follow_ms")]
+    pub follow_ms: u64,
     /// SQ-0782: how long the STORY PANE's scrollbar stays up after a scroll,
     /// in milliseconds (default 1500). Zero keeps it up permanently — the
     /// pre-auto-hide behaviour. Only the story pane auto-hides: a modal's bar
@@ -1137,6 +1378,7 @@ impl Default for AnimationConfig {
             enabled: true,
             easing: Easing::EaseOut,
             scroll_ms: 120,
+            follow_ms: default_follow_ms(),
             scrollbar_hide_ms: default_scrollbar_hide_ms(),
             scrollbar_fade_ms: default_scrollbar_fade_ms(),
         }
@@ -1154,6 +1396,7 @@ pub mod keys {
     pub const USER_DIR: &str = "user_dir";
     pub const HONOR_GAME_COLOURS: &str = "honor_game_colours";
     pub const ENABLE_SOUND: &str = "enable_sound";
+    pub const AUTO_SAVE: &str = "auto_save";
     pub const INTERPRETER_NUMBER: &str = "interpreter_number";
     pub const V6_PIXEL_LOCK: &str = "v6_pixel_lock";
     pub const GUIDANCE: &str = "guidance";
@@ -1161,6 +1404,14 @@ pub mod keys {
     pub const V6_RENDER: &str = "v6_render";
     pub const SYSTEM_FONT_DISK: &str = "system_font_disk";
     pub const SYSTEM_COLOURS: &str = "system_colours";
+    /// Not a `config.toml` key at all — `colour_source` is `#[serde(skip)]` and
+    /// has no global-config write path to guard. Pinned only so
+    /// `Config::one_run` can answer "was `--colour` passed on THIS launch",
+    /// which is what the launch-options dialog's colour-source row (SQ-1532)
+    /// reads to decide whether it is CLI-locked. Pinned for every arm of
+    /// `--colour`, not only `machine` — `SYSTEM_COLOURS` above stays the
+    /// narrower, `machine`-only signal it already was.
+    pub const COLOUR_SOURCE: &str = "colour_source";
 }
 
 /// A value a one-run source pinned, in the shape the TOML key holds it.
@@ -1322,8 +1573,8 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub auto_load: bool,
     /// When true, save the archive after every game turn (in addition to the
-    /// exit-save and Ctrl+S quick-save). Default false.
-    #[serde(default)]
+    /// exit-save and Ctrl+S quick-save). Default true.
+    #[serde(default = "default_true")]
     pub auto_save: bool,
     /// When true, invert mouse-wheel scroll direction (for terminals reporting
     /// "natural" scrolling). Default false = conventional direction.
@@ -1398,12 +1649,11 @@ pub struct Config {
     /// After a move, discover the way BACK in a silent copy of the game, so the
     /// automap closes one-way gaps without inventing reciprocity (SQ-0785).
     ///
-    /// **Off by default** — the first switch here that is. It runs the player's
-    /// game a few extra turns in private after every move that opens a gap, and
-    /// that is a thing to opt into rather than to discover having happened. The
-    /// map-pane control is drawn whether it is on or off (muted when off) for
-    /// exactly that reason: a feature nobody has seen lit is a feature nobody
-    /// turns on.
+    /// **On by default** since the probe seam got cheap (SQ-1177/SQ-1178: the
+    /// snapshot is shared with the turn's own bookkeeping, refused before it is
+    /// paid for when the worker is busy, and cloned by Arc per direction) — a
+    /// map that closes its own gaps is the automap working as advertised, and a
+    /// probe that lands anywhere but the room it left records nothing at all.
     ///
     /// Not part of [`guidance`](Self::guidance), and not part of
     /// [`guidance_probe`](Self::guidance_probe) either: neither of those speaks to
@@ -1412,7 +1662,7 @@ pub struct Config {
     /// `/set-return-probe` says it mid-game and persists it per-game, which is
     /// where a preference about how much work a particular story is worth
     /// belongs.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub return_probe: bool,
     /// Keep [`adult_words`](Self::adult_words) out of any panel that ENUMERATES
     /// a story's vocabulary unprompted (SQ-1122). Default true.
@@ -1441,6 +1691,10 @@ pub struct Config {
     /// How the v6 graphical story pane is rendered. Default: Hybrid.
     #[serde(default, deserialize_with = "deserialize_v6_render")]
     pub v6_render: V6RenderMode,
+    /// Whether a kitty terminal may be handed artwork through POSIX shared
+    /// memory rather than base64 on the wire (SQ-1374). Default: Auto.
+    #[serde(default, deserialize_with = "deserialize_kitty_shared_memory")]
+    pub kitty_shared_memory: KittySharedMemory,
     /// Fuse a 640-wide rendition's colour dither, because the card's pixels were
     /// half as wide as the unit screen's (SQ-0797). Default: true.
     ///
@@ -1560,7 +1814,11 @@ pub struct Config {
     /// launch that actually failed to ask ever writes it.
     #[serde(default)]
     pub font_check_pending: bool,
-    /// Undo depth: max retained in-memory undo snapshots (default 16; 0 disables).
+    /// Undo depth for the story's own in-game `UNDO` command (the Z-machine
+    /// `save_undo`/`restore_undo` opcodes): max retained in-memory undo
+    /// snapshots (default 16; 0 disables). Distinct from
+    /// `record_turn_history`'s separate Rewind/replay history — the two share
+    /// no state.
     #[serde(default = "default_undo_levels")]
     pub undo_levels: usize,
     /// The prefix character that triggers slash-command routing (default: '/').
@@ -1598,20 +1856,33 @@ pub struct Config {
     /// Story pane's share of the story/map Split, as a percentage (default 50).
     #[serde(default = "default_split_ratio")]
     pub split_ratio: u16,
-    /// The `[command_band]` section: the bottom command band's height, whether
+    /// The `[command_panel]` section: the command panel's height, whether
     /// it auto-opens, and its verb grammar / quick row. (SQ-0664 retired the
-    /// old `verb_dock_pct` key along with the left dock it sized.)
-    #[serde(default)]
+    /// old `verb_dock_pct` key along with the left dock it sized.) The Rust
+    /// field keeps its `command_band` name (an internal identifier); only the
+    /// TOML section it (de)serialises to is `command_panel` (SQ-1237).
+    #[serde(default, rename = "command_panel")]
     pub command_band: CommandBandConfig,
-    /// Inventory dock height cap as a percentage of screen height (default 33,
+    /// Inventory panel height cap as a percentage of screen height (default 33,
     /// ≈ the old fixed 1/3 cap).
     #[serde(default = "default_inv_dock_pct")]
     pub inv_dock_pct: u16,
-    /// Room dock height as a percentage of screen height (default 33). The dock
-    /// is carved out of the MAP pane's bottom, but its size is measured against
-    /// the frame so both docks share one unit (SQ-0692).
+    /// Room panel height as a percentage of screen height (default 33). The
+    /// panel is carved out of the MAP pane's bottom, but its size is measured
+    /// against the frame so both panels share one unit (SQ-0692).
     #[serde(default = "default_room_dock_pct")]
     pub room_dock_pct: u16,
+    /// How many cells wide (the story/map splitter) or tall (a dock's top edge)
+    /// each draggable pane boundary's grab zone is. Default 2 — one cell either
+    /// side of the divider, matching the zones lanthorn has always drawn for a
+    /// mouse. Raise it for a touchscreen session (e.g. the Docker web image on
+    /// a tablet), where a finger cannot land on so narrow a target. Clamped to
+    /// `layout::MIN_GRAB_ZONE_CELLS..=layout::MAX_GRAB_ZONE_CELLS` (1..=6). The
+    /// command band's own top edge ignores this and always keeps a single-row
+    /// zone — widening it down into the band would swallow clicks on its own
+    /// column headers (SQ-0667), a worse trade than a narrow grab (SQ-1327).
+    #[serde(default = "default_grab_zone_cells")]
+    pub grab_zone_cells: u16,
     /// Inner margin reserved inside the text-buffer (transcript) window, in
     /// character cells: `text_margin_x` blank columns on each side,
     /// `text_margin_y` blank rows top and bottom. Default 0. Populated from
@@ -1719,7 +1990,7 @@ pub struct Config {
     ///
     /// Turning this on says "I know what I am asking for": with `--interpreter 4`
     /// it gets you the Amiga's page on a bare file, which is what
-    /// `docs/features/interpreter.md` used to promise unconditionally.
+    /// `docs/internals/interpreter.md` used to promise unconditionally.
     ///
     /// It cannot conjure a machine out of nothing — see
     /// [`ProfileSource::Fallback`](crate::interpreter::ProfileSource::Fallback).
@@ -1747,6 +2018,17 @@ pub struct Config {
     /// checkbox is what writes a choice down.
     #[serde(skip)]
     pub pictures_override: Option<String>,
+    /// The picture resolution named for THIS launch — a choice the
+    /// launch-options dialog made and the user did not persist (SQ-1473).
+    ///
+    /// Parked here for the same reason `pictures_override` is: it rides with
+    /// the story for the session, so `@restart` (`reset.rs`) re-applies it
+    /// without a second door back into `crate::launch_options`. `None` = no
+    /// session choice, so the per-game sidecar decides, then the default
+    /// (`ScottPictureResolution::HiRes`). Never persisted; the dialog's
+    /// checkbox is what writes a choice down.
+    #[serde(skip)]
+    pub scott_picture_resolution_override: Option<crate::graphics::ScottPictureResolution>,
     /// Which story on the disk image this launch opened — the browser row's own
     /// name, as [`blorb::medium::DiskStory`] spells it (SQ-0876).
     ///
@@ -1760,6 +2042,17 @@ pub struct Config {
     /// persisted.
     #[serde(skip)]
     pub disk_entry: Option<String>,
+    /// Header `$1F`, when this run was launched with `--interpreter-version`
+    /// (SQ-0885's experiment knob).
+    ///
+    /// Not a config key, and parked here for the reason `disk_entry` and
+    /// `pictures_override` are: it rides with the story for the session. It used
+    /// to be a process-wide static in `zvm`, which is how an `@restart` kept it
+    /// without anybody carrying it; since SQ-1393 the byte is a `MachineBoot`
+    /// fact, and `reset.rs` has no other way to re-ask for a flag of THIS run.
+    /// Never persisted.
+    #[serde(skip)]
+    pub interpreter_version: Option<u8>,
     /// When true (default), play audio for `sound_effect` (bleeps + Blorb samples).
     #[serde(default = "default_enable_sound")]
     pub enable_sound: bool,
@@ -1795,7 +2088,7 @@ impl Config {
         if self.hide_adult_words { &self.adult_words } else { &[] }
     }
 
-    /// The command band's VERB column as the band is BORN — `[command_band]`'s
+    /// The command band's VERB column as the band is BORN — `[command_panel]`'s
     /// own resolution with [`for_display`](Self::for_display) applied to
     /// whatever came out.
     ///
@@ -1814,7 +2107,7 @@ impl Config {
     }
 
     /// The same for the table the story's own grammar produces a tick later —
-    /// `[command_band] extra_verbs` layered on, then
+    /// `[command_panel] extra_verbs` layered on, then
     /// [`for_display`](Self::for_display).
     ///
     /// The filter runs AFTER `extra_verbs`, so it catches a word the player's own
@@ -2049,7 +2342,7 @@ impl Default for Config {
             user_dir: default_user_dir(),
             default_story_dir: None,
             auto_load: true,
-            auto_save: false,
+            auto_save: true,
             mouse_wheel_invert: false,
             mouse: true,
             command_bar: false,
@@ -2060,12 +2353,13 @@ impl Default for Config {
             hint_skip_screen_warning: true,
             guidance: true,
             guidance_probe: true,
-            return_probe: false,
+            return_probe: true,
             hide_adult_words: true,
             adult_words: default_adult_words(),
             background_tidy: BackgroundTidy::EveryRoom,
             aux_storage: AuxStorage::Ask,
             v6_render: V6RenderMode::Hybrid,
+            kitty_shared_memory: KittySharedMemory::Auto,
             fuse_art_dither: true,
             glk_pixel_scale: GlkPixelScale::Native,
             v6_arrow_keys: false,
@@ -2087,6 +2381,7 @@ impl Default for Config {
             command_band: CommandBandConfig::default(),
             inv_dock_pct: default_inv_dock_pct(),
             room_dock_pct: default_room_dock_pct(),
+            grab_zone_cells: default_grab_zone_cells(),
             text_margin_x: 0,
             text_margin_y: 0,
             animation: AnimationConfig::default(),
@@ -2103,7 +2398,9 @@ impl Default for Config {
             system_colours: default_system_colours(),
             colour_source: ColourSource::default(),
             pictures_override: None,
+            scott_picture_resolution_override: None,
             disk_entry: None,
+            interpreter_version: None,
             enable_sound: default_enable_sound(),
             volume: default_volume(),
             acceleration: default_acceleration(),
@@ -2154,89 +2451,7 @@ pub fn resolve(cli: &Cli) -> Config {
     // Determine which config file to read.
     let config_path = config_path(cli);
 
-    // Start from defaults.
-    let mut cfg = Config { config_file: config_path.clone(), ..Config::default() };
-
-    // Layer in the config file if it exists.
-    if let Ok(text) = std::fs::read_to_string(&config_path) {
-        let parsed = toml::from_str::<Config>(&text);
-        // A file that exists but doesn't load used to be dropped in silence, so one
-        // stray character reverted every setting to its default with nothing said —
-        // and the next settings save then overwrote the user's file (SQ-0580). Keep
-        // the error for startup to show; `write_config_at` refuses to clobber.
-        //
-        // This fires for a TYPE error (`volume = 300`, `auto_load = "yes"`) exactly as
-        // it does for a syntax error: `from_str` fails either way, so either way the
-        // whole file is lost to memory. That distinction used to matter, because the
-        // write side re-parsed with toml_edit — which accepts a type error happily —
-        // and then stamped in-memory defaults over every key the file already had
-        // (SQ-0645). The write side now gates on THIS field instead.
-        if let Err(e) = &parsed {
-            cfg.config_error = Some(e.to_string());
-        }
-        if let Ok(from_file) = parsed {
-            // NOTE: this is a field-by-field merge — every persisted field must
-            // be copied here or the file's value is ignored on load. See the
-            // checklist on `struct Config`. (Also mirror it in `write_config`.)
-            // Carry the file's own version stamp (0 if the file predates
-            // versioning) so a future check can flag an out-of-date config.
-            cfg.version = from_file.version;
-            cfg.user_dir = from_file.user_dir;
-            cfg.default_story_dir = from_file.default_story_dir;
-            cfg.auto_load = from_file.auto_load;
-            cfg.auto_save = from_file.auto_save;
-            cfg.mouse_wheel_invert = from_file.mouse_wheel_invert;
-            cfg.mouse = from_file.mouse;
-            cfg.command_bar = from_file.command_bar;
-            cfg.prompt_save_on_quit = from_file.prompt_save_on_quit;
-            cfg.prompt_load_on_launch = from_file.prompt_load_on_launch;
-            cfg.record_turn_history = from_file.record_turn_history;
-            cfg.history_turns = from_file.history_turns;
-            cfg.hint_skip_screen_warning = from_file.hint_skip_screen_warning;
-            cfg.guidance = from_file.guidance;
-            cfg.guidance_probe = from_file.guidance_probe;
-            cfg.return_probe = from_file.return_probe;
-            cfg.hide_adult_words = from_file.hide_adult_words;
-            cfg.adult_words = from_file.adult_words;
-            cfg.background_tidy = from_file.background_tidy;
-            cfg.aux_storage = from_file.aux_storage;
-            cfg.v6_render = from_file.v6_render;
-            cfg.fuse_art_dither = from_file.fuse_art_dither;
-            cfg.glk_pixel_scale = from_file.glk_pixel_scale;
-            cfg.v6_arrow_keys = from_file.v6_arrow_keys;
-            cfg.v6_pixel_lock = from_file.v6_pixel_lock;
-            cfg.system_font_disk = from_file.system_font_disk;
-            cfg.keymap = from_file.keymap;
-            cfg.hotkeys = from_file.hotkeys;
-            cfg.style = from_file.style;
-            cfg.watch_style = from_file.watch_style;
-            cfg.font_check_pending = from_file.font_check_pending;
-            cfg.undo_levels = from_file.undo_levels;
-            cfg.command_prefix = from_file.command_prefix;
-            cfg.show_room_numbers = from_file.show_room_numbers;
-            cfg.show_status_bar = from_file.show_status_bar;
-            cfg.honor_game_colours = from_file.honor_game_colours;
-            cfg.period_look = from_file.period_look;
-            cfg.system_colours = from_file.system_colours;
-            cfg.honor_timed_input = from_file.honor_timed_input;
-            cfg.interpreter_number = from_file.interpreter_number;
-            cfg.random_seed = from_file.random_seed;
-            cfg.enable_sound = from_file.enable_sound;
-            cfg.volume = from_file.volume;
-            cfg.search = from_file.search;
-            cfg.virtual_screen_cols = from_file.virtual_screen_cols;
-            cfg.virtual_screen_rows = from_file.virtual_screen_rows;
-            cfg.split_ratio = from_file.split_ratio;
-            cfg.command_band = from_file.command_band;
-            cfg.inv_dock_pct = from_file.inv_dock_pct;
-            cfg.room_dock_pct = from_file.room_dock_pct;
-            cfg.text_margin_x = from_file.text_margin_x;
-            cfg.text_margin_y = from_file.text_margin_y;
-            cfg.animation = from_file.animation;
-        }
-        // A malformed file leaves every field at its default — TOML is parsed as one
-        // document, so there is no half-loaded config to salvage.
-    }
+    let mut cfg = resolve_config_file(config_path, cli.user_dir.clone());
 
     // CLI overrides beat the file — and every one of them that lands on a key
     // `write_config_at` persists is PINNED as it lands, so a later settings save
@@ -2244,15 +2459,10 @@ pub fn resolve(cli: &Cli) -> Config {
     // `OneRunOverrides`). `--accel`, `--image-protocol`, `--images`,
     // `--trace` and `--pictures` need no pin: their fields are `#[serde(skip)]`
     // and never written at all.
-    if let Some(dir) = &cli.user_dir {
-        cfg.user_dir = dir.clone();
-        // `--user-dir` relocates BOTH the file and the data root for one run,
-        // which is not the same thing as the `user_dir` key (that moves the data
-        // only). With `--config` naming a different file, writing it back would
-        // pin this run's temporary root into the user's real config.
-        cfg.one_run.pin(keys::USER_DIR, dir.to_string_lossy().into_owned());
-    }
-
+    //
+    // (The `--user-dir` override itself is handled inside `resolve_config_file`,
+    // shared with `resolve_at` — see its doc comment.)
+    //
     // SQ-1082: every switch below is `Option<OnOff>`, and the `Option` is the
     // point. These were negative-only — `--no-sound`, `--no-images` — which made
     // them ONE-WAY: they could force a setting off for a run and nothing on the
@@ -2274,6 +2484,14 @@ pub fn resolve(cli: &Cli) -> Config {
     if let Some(v) = cli.sound {
         cfg.enable_sound = v.into();
         cfg.one_run.pin(keys::ENABLE_SOUND, bool::from(v));
+    }
+
+    // Pinned like the rest: `auto_save` is a persisted key, so one `--auto-save on`
+    // launch plus any settings save would otherwise bake this run's cadence into
+    // the user's file for good. (SQ-1323.)
+    if let Some(v) = cli.auto_save {
+        cfg.auto_save = v.into();
+        cfg.one_run.pin(keys::AUTO_SAVE, bool::from(v));
     }
 
     // Pinned like the rest: `guidance` is a persisted key, so one `--guidance off`
@@ -2322,6 +2540,10 @@ pub fn resolve(cli: &Cli) -> Config {
     // wrote `system_colours = true` into the user's file for good.
     if let Some(src) = cli.colour {
         cfg.colour_source = src;
+        // Pinned for every arm (SQ-1532), not only `Machine`: this is the
+        // launch-options dialog's one signal for "was `--colour` passed on this
+        // launch at all", independent of which source it named.
+        cfg.one_run.pin(keys::COLOUR_SOURCE, src.key());
         if src == ColourSource::Machine {
             cfg.system_colours = true;
             cfg.one_run.pin(keys::SYSTEM_COLOURS, true);
@@ -2344,6 +2566,127 @@ pub fn resolve(cli: &Cli) -> Config {
     }
 
     cfg
+}
+
+/// The shared resolution body behind both [`resolve`] and [`resolve_at`]:
+/// defaults, layered under whatever `config_path` holds, with `user_dir_override`
+/// (when given) pinned over the top exactly as `--user-dir` pins it for a CLI
+/// launch (SQ-0574 — see [`config_path`]'s doc comment for why the override
+/// moves both the file read AND the data root).
+///
+/// This is "read the config file for this directory and merge it over
+/// defaults" — the one thing a host that never builds a [`Cli`] needs. Every
+/// other CLI flag (`--sound`, `--v6-render`, `--colour`, …) is layered on top
+/// by `resolve` itself, after this returns, because those have no meaning
+/// outside an actual command-line launch.
+fn resolve_config_file(config_path: PathBuf, user_dir_override: Option<PathBuf>) -> Config {
+    // Start from defaults.
+    let mut cfg = Config { config_file: config_path.clone(), ..Config::default() };
+
+    // Layer in the config file if it exists.
+    if let Ok(text) = std::fs::read_to_string(&config_path) {
+        let parsed = toml::from_str::<Config>(&text);
+        // A file that exists but doesn't load used to be dropped in silence, so one
+        // stray character reverted every setting to its default with nothing said —
+        // and the next settings save then overwrote the user's file (SQ-0580). Keep
+        // the error for startup to show; `write_config_at` refuses to clobber.
+        //
+        // This fires for a TYPE error (`volume = 300`, `auto_load = "yes"`) exactly as
+        // it does for a syntax error: `from_str` fails either way, so either way the
+        // whole file is lost to memory. That distinction used to matter, because the
+        // write side re-parsed with toml_edit — which accepts a type error happily —
+        // and then stamped in-memory defaults over every key the file already had
+        // (SQ-0645). The write side now gates on THIS field instead.
+        if let Err(e) = &parsed {
+            cfg.config_error = Some(e.to_string());
+        }
+        if let Ok(from_file) = parsed {
+            // NOTE: this is a field-by-field merge — every persisted field must
+            // be copied here or the file's value is ignored on load. See the
+            // checklist on `struct Config`. (Also mirror it in `write_config`.)
+            // Carry the file's own version stamp (0 if the file predates
+            // versioning) so a future check can flag an out-of-date config.
+            cfg.version = from_file.version;
+            cfg.user_dir = from_file.user_dir;
+            cfg.default_story_dir = from_file.default_story_dir;
+            cfg.auto_load = from_file.auto_load;
+            cfg.auto_save = from_file.auto_save;
+            cfg.mouse_wheel_invert = from_file.mouse_wheel_invert;
+            cfg.mouse = from_file.mouse;
+            cfg.command_bar = from_file.command_bar;
+            cfg.prompt_save_on_quit = from_file.prompt_save_on_quit;
+            cfg.prompt_load_on_launch = from_file.prompt_load_on_launch;
+            cfg.record_turn_history = from_file.record_turn_history;
+            cfg.history_turns = from_file.history_turns;
+            cfg.hint_skip_screen_warning = from_file.hint_skip_screen_warning;
+            cfg.guidance = from_file.guidance;
+            cfg.guidance_probe = from_file.guidance_probe;
+            cfg.return_probe = from_file.return_probe;
+            cfg.hide_adult_words = from_file.hide_adult_words;
+            cfg.adult_words = from_file.adult_words;
+            cfg.background_tidy = from_file.background_tidy;
+            cfg.aux_storage = from_file.aux_storage;
+            cfg.v6_render = from_file.v6_render;
+            cfg.kitty_shared_memory = from_file.kitty_shared_memory;
+            cfg.fuse_art_dither = from_file.fuse_art_dither;
+            cfg.glk_pixel_scale = from_file.glk_pixel_scale;
+            cfg.v6_arrow_keys = from_file.v6_arrow_keys;
+            cfg.v6_pixel_lock = from_file.v6_pixel_lock;
+            cfg.system_font_disk = from_file.system_font_disk;
+            cfg.keymap = from_file.keymap;
+            cfg.hotkeys = from_file.hotkeys;
+            cfg.style = from_file.style;
+            cfg.watch_style = from_file.watch_style;
+            cfg.font_check_pending = from_file.font_check_pending;
+            cfg.undo_levels = from_file.undo_levels;
+            cfg.command_prefix = from_file.command_prefix;
+            cfg.show_room_numbers = from_file.show_room_numbers;
+            cfg.show_status_bar = from_file.show_status_bar;
+            cfg.honor_game_colours = from_file.honor_game_colours;
+            cfg.period_look = from_file.period_look;
+            cfg.system_colours = from_file.system_colours;
+            cfg.honor_timed_input = from_file.honor_timed_input;
+            cfg.interpreter_number = from_file.interpreter_number;
+            cfg.random_seed = from_file.random_seed;
+            cfg.enable_sound = from_file.enable_sound;
+            cfg.volume = from_file.volume;
+            cfg.search = from_file.search;
+            cfg.virtual_screen_cols = from_file.virtual_screen_cols;
+            cfg.virtual_screen_rows = from_file.virtual_screen_rows;
+            cfg.split_ratio = from_file.split_ratio;
+            cfg.command_band = from_file.command_band;
+            cfg.inv_dock_pct = from_file.inv_dock_pct;
+            cfg.room_dock_pct = from_file.room_dock_pct;
+            cfg.grab_zone_cells = from_file.grab_zone_cells;
+            cfg.text_margin_x = from_file.text_margin_x;
+            cfg.text_margin_y = from_file.text_margin_y;
+            cfg.animation = from_file.animation;
+        }
+        // A malformed file leaves every field at its default — TOML is parsed as one
+        // document, so there is no half-loaded config to salvage.
+    }
+
+    // `--user-dir` (or, from `resolve_at`, the directory a non-CLI host named
+    // directly) relocates BOTH the file and the data root for one run, which is
+    // not the same thing as the `user_dir` key (that moves the data only). With
+    // `--config` naming a different file, writing it back would pin this run's
+    // temporary root into the user's real config.
+    if let Some(dir) = user_dir_override {
+        cfg.user_dir = dir.clone();
+        cfg.one_run.pin(keys::USER_DIR, dir.to_string_lossy().into_owned());
+    }
+
+    cfg
+}
+
+/// [`resolve`] for a host that has no [`Cli`] to build — a directory to read
+/// `config.toml` from and nothing else. Equivalent to `resolve` given a `Cli`
+/// whose only flag is `--user-dir user_dir`: same file (`user_dir/config.toml`),
+/// same defaults-under-file merge, same `user_dir` pin. A caller that also wants
+/// CLI-flag-shaped overrides (sound, v6-render, colour, …) applies them the way
+/// `resolve` does, on top of what this returns.
+pub fn resolve_at(user_dir: &std::path::Path) -> Config {
+    resolve_config_file(user_dir.join("config.toml"), Some(user_dir.to_path_buf()))
 }
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
@@ -2408,7 +2751,7 @@ impl ConfigDoc<'_> {
 }
 
 /// [`ConfigDoc::put`] for a key inside a table. No one-run source pins a table key
-/// (`[search]`, `[animation]`, `[command_band]` have no CLI flag, sidecar key or
+/// (`[search]`, `[animation]`, `[command_panel]` have no CLI flag, sidecar key or
 /// inferred value), so this stays the plain default-elision rule.
 fn put_in(tbl: &mut toml_edit::Item, key: &str, value: toml_edit::Value, is_default: bool) {
     let present = tbl.get(key).is_some();
@@ -2508,13 +2851,7 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
     doc.put("command_bar", cfg.command_bar.into(), cfg.command_bar == def.command_bar);
     doc.put("prompt_save_on_quit", cfg.prompt_save_on_quit.into(), cfg.prompt_save_on_quit == def.prompt_save_on_quit);
     doc.put("prompt_load_on_launch", cfg.prompt_load_on_launch.into(), cfg.prompt_load_on_launch == def.prompt_load_on_launch);
-    let bg_str = match cfg.background_tidy {
-        BackgroundTidy::Off => "off",
-        BackgroundTidy::EveryRoom => "every_room",
-        BackgroundTidy::OnOverlap => "on_overlap",
-        BackgroundTidy::Debounced => "debounced",
-    };
-    doc.put("background_tidy", bg_str.into(), cfg.background_tidy == def.background_tidy);
+    doc.put("background_tidy", cfg.background_tidy.key().into(), cfg.background_tidy == def.background_tidy);
     let aux_str = match cfg.aux_storage {
         AuxStorage::Ask => "ask",
         AuxStorage::Archive => "archive",
@@ -2522,6 +2859,11 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
     };
     doc.put("aux_storage", aux_str.into(), cfg.aux_storage == def.aux_storage);
     doc.put("v6_render", v6_render_key(cfg.v6_render).into(), cfg.v6_render == def.v6_render);
+    doc.put(
+        "kitty_shared_memory",
+        kitty_shared_memory_key(cfg.kitty_shared_memory).into(),
+        cfg.kitty_shared_memory == def.kitty_shared_memory,
+    );
     doc.put("fuse_art_dither", cfg.fuse_art_dither.into(), cfg.fuse_art_dither == def.fuse_art_dither);
     let scale_val: toml_edit::Value = match cfg.glk_pixel_scale {
         GlkPixelScale::Native => "native".into(),
@@ -2598,6 +2940,11 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
     doc.put("split_ratio", i64::from(cfg.split_ratio).into(), cfg.split_ratio == def.split_ratio);
     doc.put("inv_dock_pct", i64::from(cfg.inv_dock_pct).into(), cfg.inv_dock_pct == def.inv_dock_pct);
     doc.put("room_dock_pct", i64::from(cfg.room_dock_pct).into(), cfg.room_dock_pct == def.room_dock_pct);
+    doc.put(
+        "grab_zone_cells",
+        i64::from(cfg.grab_zone_cells).into(),
+        cfg.grab_zone_cells == def.grab_zone_cells,
+    );
     doc.put("text_margin_x", i64::from(cfg.text_margin_x).into(), cfg.text_margin_x == def.text_margin_x);
     doc.put("text_margin_y", i64::from(cfg.text_margin_y).into(), cfg.text_margin_y == def.text_margin_y);
 
@@ -2624,6 +2971,7 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
         || cfg.animation.enabled != def.animation.enabled
         || cfg.animation.easing != def.animation.easing
         || cfg.animation.scroll_ms != def.animation.scroll_ms
+        || cfg.animation.follow_ms != def.animation.follow_ms
         || cfg.animation.scrollbar_hide_ms != def.animation.scrollbar_hide_ms
         || cfg.animation.scrollbar_fade_ms != def.animation.scrollbar_fade_ms
     {
@@ -2631,19 +2979,20 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
         put_in(tbl, "enabled", cfg.animation.enabled.into(), cfg.animation.enabled == def.animation.enabled);
         put_in(tbl, "easing", crate::anim::easing_token(cfg.animation.easing).into(), cfg.animation.easing == def.animation.easing);
         put_in(tbl, "scroll_ms", (cfg.animation.scroll_ms as i64).into(), cfg.animation.scroll_ms == def.animation.scroll_ms);
+        put_in(tbl, "follow_ms", (cfg.animation.follow_ms as i64).into(), cfg.animation.follow_ms == def.animation.follow_ms);
         put_in(tbl, "scrollbar_hide_ms", (cfg.animation.scrollbar_hide_ms as i64).into(), cfg.animation.scrollbar_hide_ms == def.animation.scrollbar_hide_ms);
         put_in(tbl, "scrollbar_fade_ms", (cfg.animation.scrollbar_fade_ms as i64).into(), cfg.animation.scrollbar_fade_ms == def.animation.scrollbar_fade_ms);
     }
 
-    // [command_band] table — same rule as [search]. The verb/quick LISTS are
+    // [command_panel] table — same rule as [search]. The verb/quick LISTS are
     // hand-authored grammar, never written back by the app: resize mode edits
     // `height` and nothing else touches this section, so re-emitting a list here
     // could only ever damage what the user wrote.
-    if doc.contains_key("command_band")
+    if doc.contains_key("command_panel")
         || cfg.command_band.height != def.command_band.height
         || cfg.command_band.auto_open != def.command_band.auto_open
     {
-        let tbl = doc["command_band"].or_insert(toml_edit::table());
+        let tbl = doc["command_panel"].or_insert(toml_edit::table());
         put_in(tbl, "height", i64::from(cfg.command_band.height).into(), cfg.command_band.height == def.command_band.height);
         put_in(tbl, "auto_open", cfg.command_band.auto_open.into(), cfg.command_band.auto_open == def.command_band.auto_open);
     }
@@ -2678,7 +3027,7 @@ pub fn write_config_at(config_path: &std::path::Path, cfg: &Config) -> std::io::
     }
 
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-persist"))]
 mod tests {
     use super::*;
 
@@ -2815,7 +3164,7 @@ mod tests {
         );
     }
 
-    // ── [command_band] ────────────────────────────────────────────────────────
+    // ── [command_panel] ────────────────────────────────────────────────────────
 
     #[test]
     fn command_band_defaults_and_round_trips() {
@@ -2826,12 +3175,44 @@ mod tests {
         assert!(d.command_band.quick.is_empty());
 
         let cfg: Config = toml::from_str(
-            "[command_band]\nheight = 10\nauto_open = true\nquick = [\"n\", \"s\"]\n",
+            "[command_panel]\nheight = 10\nauto_open = true\nquick = [\"n\", \"s\"]\n",
         )
         .unwrap();
         assert_eq!(cfg.command_band.height, 10);
         assert!(cfg.command_band.auto_open);
         assert_eq!(cfg.command_band.resolve_quick(), vec!["n".to_string(), "s".to_string()]);
+    }
+
+    /// A per-game `quick` override wins over the global list for the game that
+    /// set it, and only that game — a story with no sidecar of its own still
+    /// gets the global/built-in list (SQ-1552).
+    #[test]
+    fn resolve_quick_for_prefers_the_per_game_override_for_that_game_only() {
+        let dir = crate::scratch_dir("cmdband-quick-for");
+        let other = crate::scratch_dir("cmdband-quick-for-other");
+        let mut cfg = CommandBandConfig::default();
+        cfg.quick = vec!["n".to_string(), "s".to_string()];
+
+        // No sidecar for either dir yet: both fall back to the global list.
+        assert_eq!(cfg.resolve_quick_for(&dir), vec!["n".to_string(), "s".to_string()]);
+        assert_eq!(cfg.resolve_quick_for(&other), vec!["n".to_string(), "s".to_string()]);
+
+        // Set an override for `dir` only.
+        crate::styles::write_per_game_quick(&dir, Some(vec!["xyzzy".to_string()])).unwrap();
+        assert_eq!(cfg.resolve_quick_for(&dir), vec!["xyzzy".to_string()], "this game's override wins");
+        assert_eq!(
+            cfg.resolve_quick_for(&other),
+            vec!["n".to_string(), "s".to_string()],
+            "a different game is unaffected"
+        );
+
+        // An explicit empty override reads the same as no override.
+        crate::styles::write_per_game_quick(&dir, Some(Vec::new())).unwrap();
+        assert_eq!(cfg.resolve_quick_for(&dir), vec!["n".to_string(), "s".to_string()]);
+
+        crate::styles::write_per_game_quick(&dir, None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     /// `verbs` REPLACES the whole column; `extra_verbs` is additive. Both keep
@@ -2843,7 +3224,7 @@ mod tests {
 
         // Replace: only what the file lists survives.
         let cfg: Config = toml::from_str(
-            "[command_band]\nverbs = [{ word = \"polish\", arity = \"object\" }]\n",
+            "[command_panel]\nverbs = [{ word = \"polish\", arity = \"object\" }]\n",
         )
         .unwrap();
         let (table, warn) = cfg.command_band.resolve_verbs();
@@ -2865,7 +3246,7 @@ mod tests {
 
         // Additive: the built-ins stay and the extra joins them.
         let cfg: Config = toml::from_str(
-            "[command_band]\nextra_verbs = [{ word = \"xyzzy\", arity = \"solo\" }]\n",
+            "[command_panel]\nextra_verbs = [{ word = \"xyzzy\", arity = \"solo\" }]\n",
         )
         .unwrap();
         let (table, warn) = cfg.command_band.resolve_verbs();
@@ -2884,7 +3265,7 @@ mod tests {
 
         // Additive over a word that already exists RE-SHAPES it.
         let cfg: Config = toml::from_str(
-            "[command_band]\nextra_verbs = [{ word = \"take\", arity = \"pair\", prep = \"from\" }]\n",
+            "[command_panel]\nextra_verbs = [{ word = \"take\", arity = \"pair\", prep = \"from\" }]\n",
         )
         .unwrap();
         let (table, _) = cfg.command_band.resolve_verbs();
@@ -2925,7 +3306,7 @@ mod tests {
         // names one: a player cannot re-add the test rig by config either.
         let cfg: Config = toml::from_str(
             "hide_adult_words = false\n\
-             [command_band]\nverbs = [{ word = \"$verify\", arity = \"solo\" }, \
+             [command_panel]\nverbs = [{ word = \"$verify\", arity = \"solo\" }, \
              { word = \"polish\", arity = \"object\" }]\n",
         )
         .unwrap();
@@ -2941,7 +3322,7 @@ mod tests {
     fn object_opt_lowers_to_the_two_lines_it_always_meant() {
         use crate::render::command_band::VerbLine;
         let cfg: Config = toml::from_str(
-            "[command_band]\nverbs = [{ word = \"search\", arity = \"object?\" }]\n",
+            "[command_panel]\nverbs = [{ word = \"search\", arity = \"object?\" }]\n",
         )
         .unwrap();
         let (table, warn) = cfg.command_band.resolve_verbs();
@@ -2955,7 +3336,7 @@ mod tests {
     #[test]
     fn command_band_bad_arity_warns_and_skips() {
         let cfg: Config = toml::from_str(
-            "[command_band]\nextra_verbs = [{ word = \"frob\", arity = \"triple\" }]\n",
+            "[command_panel]\nextra_verbs = [{ word = \"frob\", arity = \"triple\" }]\n",
         )
         .unwrap();
         let (table, warn) = cfg.command_band.resolve_verbs();
@@ -2982,7 +3363,7 @@ mod tests {
         // A hand-authored verb list is NOT rewritten by a settings save.
         std::fs::write(
             dir.join("config.toml"),
-            "[command_band]\nheight = 11\nverbs = [{ word = \"polish\", arity = \"object\" }]\n",
+            "[command_panel]\nheight = 11\nverbs = [{ word = \"polish\", arity = \"object\" }]\n",
         )
         .unwrap();
         let mut cfg2 = Config::default();
@@ -3010,6 +3391,15 @@ mod tests {
         assert!(!cfg.show_status_bar);
     }
 
+    /// SQ-1327: the default (2) must match the grab zones lanthorn has always
+    /// drawn for a mouse — see `layout::default_grab_zone_cells_matches_todays_pinned_zones`.
+    #[test]
+    fn config_grab_zone_cells_defaults_to_2_and_round_trips() {
+        assert_eq!(Config::default().grab_zone_cells, 2);
+        let cfg: Config = toml::from_str("grab_zone_cells = 5\n").unwrap();
+        assert_eq!(cfg.grab_zone_cells, 5);
+    }
+
     #[test]
     fn config_reads_command_prefix() {
         let cfg: Config = toml::from_str("command_prefix = \";\"\n").unwrap();
@@ -3028,6 +3418,7 @@ mod tests {
             config: Some(path.to_path_buf()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3036,12 +3427,16 @@ mod tests {
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         }
     }
@@ -3115,6 +3510,7 @@ mod tests {
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3123,12 +3519,16 @@ mod tests {
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
 
@@ -3146,6 +3546,7 @@ mod tests {
             config: Some(PathBuf::from("/nonexistent/path/config.toml")),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3154,12 +3555,16 @@ mod tests {
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         let cfg = resolve(&cli);
@@ -3177,6 +3582,7 @@ mod tests {
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3185,17 +3591,82 @@ mod tests {
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         let cfg = resolve(&cli);
         assert_eq!(cfg.user_dir, PathBuf::from("/tmp/from-file"));
         let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    /// A `Cli` whose only flag is `--user-dir dir` — everything else absent/default,
+    /// same shape [`resolve_at`] is documented as being equivalent to.
+    fn cli_with_only_user_dir(dir: &std::path::Path) -> Cli {
+        Cli {
+            story: Some(PathBuf::from("foo.z5")),
+            user_dir: Some(dir.to_path_buf()),
+            data_dir: None,
+            config: None,
+            accel: None,
+            sound: None,
+            auto_save: None,
+            image_protocol: ImageProtocol::Auto,
+            images: None,
+            game_colours: None,
+            colour: None,
+            interpreter_number: None,
+            interpreter_version: None,
+            pictures: None,
+            story_pick: None,
+            fetch: None,
+            import_metadata: None,
+            v6_render: None,
+            v6_pixel_lock: None,
+            machines: false,
+            trace: None,
+            debug: false,
+            fresh_start: false,
+            guidance: None,
+            transcript_file: None,
+            font_check: None,
+        }
+    }
+
+    #[test]
+    fn resolve_at_matches_resolve_with_user_dir_only() {
+        let dir = crate::scratch_dir("resolve-at-with-file");
+        std::fs::write(dir.join("config.toml"), "auto_load = false\nvolume = 42\n").unwrap();
+
+        let via_cli = resolve(&cli_with_only_user_dir(&dir));
+        let via_resolve_at = resolve_at(&dir);
+        assert_eq!(format!("{via_resolve_at:?}"), format!("{via_cli:?}"));
+        // Non-vacuity: the file's own values actually landed, so the comparison
+        // above isn't just two default configs agreeing with each other.
+        assert!(!via_resolve_at.auto_load);
+        assert_eq!(via_resolve_at.volume, 42);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_at_matches_resolve_with_user_dir_only_no_config_file() {
+        let dir = crate::scratch_dir("resolve-at-no-file");
+        // Deliberately not created — no config.toml exists under it.
+
+        let via_cli = resolve(&cli_with_only_user_dir(&dir));
+        let via_resolve_at = resolve_at(&dir);
+        assert_eq!(format!("{via_resolve_at:?}"), format!("{via_cli:?}"));
+        assert_eq!(via_resolve_at.user_dir, dir);
+        assert!(via_resolve_at.auto_load, "no file means defaults, and auto_load defaults true");
     }
 
     #[test]
@@ -3229,9 +3700,9 @@ use_defaults = false
     }
 
     #[test]
-    fn auto_save_defaults_false() {
+    fn auto_save_defaults_true() {
         let cfg = Config::default();
-        assert!(!cfg.auto_save, "auto_save must default to false");
+        assert!(cfg.auto_save, "auto_save must default to true (SQ-1624)");
     }
 
     #[test]
@@ -3268,6 +3739,19 @@ use_defaults = false
     fn background_tidy_parses_debounced_from_toml() {
         let cfg: Config = toml::from_str("background_tidy = \"debounced\"").unwrap();
         assert_eq!(cfg.background_tidy, BackgroundTidy::Debounced);
+    }
+
+    #[test]
+    fn background_tidy_round_trips_through_key_and_from_key() {
+        for mode in [
+            BackgroundTidy::Off,
+            BackgroundTidy::EveryRoom,
+            BackgroundTidy::OnOverlap,
+            BackgroundTidy::Debounced,
+        ] {
+            assert_eq!(BackgroundTidy::from_key(mode.key()), Some(mode));
+        }
+        assert_eq!(BackgroundTidy::from_key("bogus"), None);
     }
 
     #[test]
@@ -3331,6 +3815,33 @@ use_defaults = false
                 rows, 3,
                 "a {cell_h}px cell must still give advent's 36px toolbar 3 rows (saw {seen}px)"
             );
+        }
+    }
+
+    /// SQ-1374: two values and a tolerant reader. `auto` is the default because
+    /// the terminal is asked before anything is handed to it — the setting exists
+    /// for someone who wants the asking itself to stop, not to force a capability
+    /// on a terminal that does not have it, which is why there is no `"on"`.
+    #[test]
+    fn kitty_shared_memory_defaults_to_auto_and_round_trips() {
+        assert_eq!(Config::default().kitty_shared_memory, KittySharedMemory::Auto);
+        let c: Config = toml::from_str("kitty_shared_memory = \"off\"").unwrap();
+        assert_eq!(c.kitty_shared_memory, KittySharedMemory::Off);
+        let c: Config = toml::from_str("kitty_shared_memory = \"auto\"").unwrap();
+        assert_eq!(c.kitty_shared_memory, KittySharedMemory::Auto);
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.kitty_shared_memory, KittySharedMemory::Auto, "absent is auto");
+        // Unrecognised reads as the default rather than failing a boot, exactly
+        // as `v6_render` and every other token-valued key here does.
+        let c: Config = toml::from_str("kitty_shared_memory = \"on\"").unwrap();
+        assert_eq!(c.kitty_shared_memory, KittySharedMemory::Auto);
+
+        // And the token written back is the token read, or a `/set` would silently
+        // un-pin the key (the reason `v6_render_key` exists).
+        for mode in [KittySharedMemory::Auto, KittySharedMemory::Off] {
+            let toml = format!("kitty_shared_memory = \"{}\"", kitty_shared_memory_key(mode));
+            let c: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(c.kitty_shared_memory, mode, "{toml}");
         }
     }
 
@@ -3453,7 +3964,7 @@ use_defaults = false
             user_dir: dir.clone(),
             default_story_dir: None,
             auto_load: false,
-            auto_save: true,
+            auto_save: false,
             mouse_wheel_invert: false,
             mouse: true,
             command_bar: false,
@@ -3464,12 +3975,13 @@ use_defaults = false
             hint_skip_screen_warning: true,
             guidance: true,
             guidance_probe: true,
-            return_probe: false,
+            return_probe: true,
             hide_adult_words: true,
             adult_words: default_adult_words(),
             background_tidy: BackgroundTidy::OnOverlap,
             aux_storage: AuxStorage::Ask,
             v6_render: V6RenderMode::Hybrid,
+            kitty_shared_memory: KittySharedMemory::Auto,
             fuse_art_dither: false,
             glk_pixel_scale: GlkPixelScale::Native,
             v6_arrow_keys: true,
@@ -3497,7 +4009,9 @@ use_defaults = false
             system_colours: default_system_colours(),
             colour_source: ColourSource::default(),
             pictures_override: None,
+            scott_picture_resolution_override: None,
             disk_entry: None,
+            interpreter_version: None,
             enable_sound: true,
             volume: 100,
             search: SearchConfig::default(),
@@ -3507,6 +4021,7 @@ use_defaults = false
             command_band: CommandBandConfig::default(),
             inv_dock_pct: 25,
             room_dock_pct: 25,
+            grab_zone_cells: 3,
             text_margin_x: 0,
             text_margin_y: 0,
             animation: AnimationConfig::default(),
@@ -3522,11 +4037,12 @@ use_defaults = false
 
         // Scalars are set.
         assert_eq!(doc["auto_load"].as_bool(), Some(false));
-        assert_eq!(doc["auto_save"].as_bool(), Some(true));
+        assert_eq!(doc["auto_save"].as_bool(), Some(false));
         assert_eq!(doc["background_tidy"].as_str(), Some("on_overlap"));
         assert_eq!(doc["split_ratio"].as_integer(), Some(70));
         assert_eq!(doc["inv_dock_pct"].as_integer(), Some(25));
-        assert_eq!(doc["room_dock_pct"].as_integer(), Some(25), "the room dock's height persists too");
+        assert_eq!(doc["room_dock_pct"].as_integer(), Some(25), "the room panel's height persists too");
+        assert_eq!(doc["grab_zone_cells"].as_integer(), Some(3), "the touch grab-zone knob persists too");
         // SQ-0573: `mouse` is at its DEFAULT and the pre-existing file did not carry
         // it, so it is deliberately not written — a default belongs in the commented
         // template, not as a live key. `user_dir` here is the test's temp dir, so it
@@ -3740,6 +4256,7 @@ use_defaults = false
         assert!(c.animation.enabled);
         assert_eq!(c.animation.easing, Easing::EaseOut);
         assert_eq!(c.animation.scroll_ms, 120);
+        assert_eq!(c.animation.follow_ms, 200);
     }
 
     #[test]
@@ -3748,8 +4265,28 @@ use_defaults = false
         assert!(cfg.animation.enabled);
         assert_eq!(cfg.animation.easing, Easing::EaseOut);
         assert_eq!(cfg.animation.scroll_ms, 120);
+        assert_eq!(cfg.animation.follow_ms, 200);
         assert_eq!(cfg.animation.scrollbar_hide_ms, 1500);
         assert_eq!(cfg.animation.scrollbar_fade_ms, 300);
+    }
+
+    /// SQ-1595: `follow_ms` parses on its own, independent of `scroll_ms`.
+    #[test]
+    fn follow_ms_parses_and_round_trips() {
+        let cfg: Config = toml::from_str("[animation]\nfollow_ms = 350\n").unwrap();
+        assert_eq!(cfg.animation.follow_ms, 350);
+        assert_eq!(cfg.animation.scroll_ms, 120, "unrelated to scroll_ms");
+
+        let dir = std::env::temp_dir().join(format!("lanthorn_follow_ms_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut written = Config::default();
+        written.animation.follow_ms = 350;
+        write_config(&dir, &written).unwrap();
+        let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert_eq!(doc["animation"]["follow_ms"].as_integer(), Some(350));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SQ-0782: the story-pane scrollbar's hide delay and fade are config keys,
@@ -3840,6 +4377,7 @@ use_defaults = false
             config: Some(PathBuf::from("/nonexistent/path/config.toml")),
             accel: Some(OnOff::Off),
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3848,12 +4386,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         let cfg = resolve(&cli);
@@ -3869,6 +4411,7 @@ use_defaults = false
             config: Some(PathBuf::from("/nonexistent/path/config.toml")),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3877,12 +4420,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         // Absent flag: sound stays on (config default).
@@ -3915,6 +4462,7 @@ use_defaults = false
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -3923,12 +4471,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         // Absent flags: the file governs, as it always did.
@@ -4011,6 +4563,7 @@ use_defaults = false
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4019,12 +4572,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         assert!(resolve(&base).v6_arrow_keys, "persisted true must hold");
@@ -4042,6 +4599,7 @@ use_defaults = false
             config: Some(PathBuf::from("/nonexistent/path/config.toml")),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4050,12 +4608,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         cli.trace = Some("screen,map".to_string());
@@ -4074,6 +4636,7 @@ use_defaults = false
             config: Some(PathBuf::from("/nonexistent/path/config.toml")),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: Some(OnOff::Off),
             game_colours: None,
@@ -4082,12 +4645,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         let cfg = resolve(&cli);
@@ -4141,6 +4708,7 @@ use_defaults = false
             config: None,
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4149,12 +4717,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         // The read path follows --user-dir, and the resolved config remembers it.
@@ -4201,6 +4773,7 @@ use_defaults = false
             config: Some(home.join("config.toml")),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4209,12 +4782,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         let mut cfg = resolve(&cli);
@@ -4249,6 +4826,7 @@ use_defaults = false
             config: Some(path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4257,12 +4835,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         let cfg = resolve(&cli);
@@ -4341,6 +4923,45 @@ use_defaults = false
         write_config(&dir, &cfg).unwrap();
         let back = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!toml::from_str::<Config>(&back).unwrap().enable_sound, "an explicit off persists");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--auto-save on` turns the per-turn resume write on for ONE run, in both
+    /// directions and without persisting — the shape the container's browser mode
+    /// needs (SQ-1323), where a dropped websocket can end the process at any
+    /// moment and a config file that turns `auto_save` back off means nothing
+    /// was written for that run.
+    #[test]
+    fn auto_save_flag_overrides_the_file_for_one_run_only() {
+        let dir = crate::scratch_dir("autosave-flag");
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, "# mine\nauto_save = false\n").unwrap();
+
+        let base = cli_with_config(&cfg_path, None);
+        assert!(!resolve(&base).auto_save, "the file's value stands with no flag");
+
+        let cli = Cli { auto_save: Some(OnOff::On), ..cli_with_config(&cfg_path, None) };
+        let mut cfg = resolve(&cli);
+        assert!(cfg.auto_save, "the flag turns per-turn saving on for this run");
+
+        write_config(&dir, &cfg).unwrap();
+        let back = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            !toml::from_str::<Config>(&back).unwrap().auto_save,
+            "--auto-save on is for one run; the FILE must still say false: {back}"
+        );
+        assert!(back.contains("# mine"), "and the user's comment survives: {back}");
+
+        // The settings panel turning it on IS a decision, and it persists.
+        cfg.one_run.release(keys::AUTO_SAVE);
+        write_config(&dir, &cfg).unwrap();
+        let back = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(toml::from_str::<Config>(&back).unwrap().auto_save, "an explicit on persists");
+
+        // And the flag points both ways: `off` beats a file that says true.
+        std::fs::write(&cfg_path, "auto_save = true\n").unwrap();
+        let off = Cli { auto_save: Some(OnOff::Off), ..cli_with_config(&cfg_path, None) };
+        assert!(!resolve(&off).auto_save, "--auto-save off beats a file that says true");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4442,6 +5063,7 @@ use_defaults = false
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4450,12 +5072,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         });
         assert!(cfg.honor_game_colours, "the file's value loads");
@@ -4501,6 +5127,7 @@ use_defaults = false
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4509,12 +5136,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         });
         assert!(!cfg.v6_pixel_lock, "the file's value loads");
@@ -4558,6 +5189,7 @@ use_defaults = false
             config: Some(cfg_path.clone()),
             accel: None,
             sound: None,
+            auto_save: None,
             image_protocol: ImageProtocol::Auto,
             images: None,
             game_colours: None,
@@ -4566,12 +5198,16 @@ use_defaults = false
             interpreter_version: None,
             pictures: None,
             story_pick: None,
+            fetch: None,
+            import_metadata: None,
             v6_render: None,
             v6_pixel_lock: None,
             machines: false,
             trace: None,
             debug: false,
+            fresh_start: false,
             guidance: None,
+            transcript_file: None,
             font_check: None,
         };
         // No flag: the file's Amiga (4) stands, and it is provenance-clean.
@@ -4636,6 +5272,9 @@ use_defaults = false
             ("--images", "on"),
             ("--game-colours", "off"),
             ("--colour", "machine"),
+            ("--fetch", "missing"),
+            ("--fetch", "all"),
+            ("--import-metadata", "/tmp/rows.tsv"),
         ] {
             let cli = Cli::try_parse_from(["lanthorn", flag, value, "g.z5"])
                 .unwrap_or_else(|e| panic!("{flag} {value} should parse: {e}"));
@@ -4994,6 +5633,46 @@ use_defaults = false
             let cfg = resolve(&flagged(Some(src)));
             assert_eq!(cfg.colour_source, src);
             assert!(!cfg.system_colours, "{src:?} asks for a source, not for a machine");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ColourSource::key()` is hand-written (it needs a `&'static str`, which
+    /// `clap::ValueEnum`'s `PossibleValue` cannot hand back), so this checks it
+    /// against the derive's own `rename_all = "lowercase"` spelling directly —
+    /// the same spelling `--colour`/`--color` parses — and round-trips through
+    /// `from_key`.
+    #[test]
+    fn colour_source_key_matches_the_clap_spelling_and_round_trips() {
+        use clap::ValueEnum;
+        for src in [ColourSource::Terminal, ColourSource::Theme, ColourSource::Machine] {
+            let clap_name = src.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(src.key(), clap_name, "{src:?} key must match the clap spelling");
+            assert_eq!(ColourSource::from_key(src.key()), Some(src));
+        }
+        assert_eq!(ColourSource::from_key("bogus"), None);
+    }
+
+    /// SQ-1532: pinned for every arm now, not only `Machine` — the launch-options
+    /// dialog's colour-source row needs to tell "`--colour` was passed on this
+    /// launch" apart from "nothing was said and `Machine` is simply the default",
+    /// and only a pin unconditional on the arm can say that.
+    #[test]
+    fn colour_source_pins_for_every_arm_not_only_machine() {
+        let dir = std::env::temp_dir().join(format!("bm-coloursourcepin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, "# mine\n").unwrap();
+        let flagged =
+            |v: Option<ColourSource>| Cli { colour: v, ..cli_with_config(&cfg_path, None) };
+
+        let plain = resolve(&flagged(None));
+        assert!(!plain.one_run.holds(keys::COLOUR_SOURCE), "nothing was typed, nothing is pinned");
+
+        for src in [ColourSource::Terminal, ColourSource::Theme, ColourSource::Machine] {
+            let cfg = resolve(&flagged(Some(src)));
+            assert!(cfg.one_run.holds(keys::COLOUR_SOURCE), "{src:?} must pin the launch-only key");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

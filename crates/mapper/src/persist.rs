@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use crate::direction::Direction;
-use crate::graph::{Connection, MapGraph, Room, RoomId};
+use crate::graph::{Connection, ItemKey, ItemRecord, MapGraph, Room, RoomId};
 use crate::layer::{LayerId, LayerMeta};
 use crate::mapper::Mapper;
 use crate::suggest::{SeamDecision, SeamKey};
@@ -41,6 +41,17 @@ pub struct PersistState {
     /// passage already declined would be the exact nagging the prompt was designed to avoid.
     #[serde(default)]
     pub seams: Vec<SeamRecord>,
+    /// "Never for this story" (SQ-1298): the player has told the layer-suggestion prompt not to
+    /// speak up at all on this map. Absent from any file written before this existed, which loads
+    /// as `false` — nobody has said it yet.
+    #[serde(default)]
+    pub suggestions_disabled: bool,
+    /// Every item the map has ever been shown (SQ-1627), keyed by [`ItemKey`]. `BTreeMap<u32, _>`
+    /// serializes as a plain JSON object (numeric keys as strings, same as `last_visited` above),
+    /// so no flattening to a `Vec` is needed. Absent from a file written before this existed,
+    /// which loads as empty — nothing has been tracked yet.
+    #[serde(default)]
+    pub items: BTreeMap<ItemKey, ItemRecord>,
 }
 
 pub fn to_json(mapper: &Mapper) -> String {
@@ -59,6 +70,8 @@ pub fn to_json(mapper: &Mapper) -> String {
             .iter()
             .map(|(k, v)| SeamRecord { from: k.from, dir: k.dir, decision: *v })
             .collect(),
+        suggestions_disabled: mapper.graph.suggestions_disabled(),
+        items: mapper.graph.items().map(|(k, v)| (*k, v.clone())).collect(),
     };
     serde_json::to_string_pretty(&state).expect("PersistState is always serializable")
 }
@@ -78,6 +91,8 @@ pub fn from_json(s: &str) -> Result<Mapper, serde_json::Error> {
             .into_iter()
             .map(|r| (SeamKey { from: r.from, dir: r.dir }, r.decision)),
     );
+    graph.set_suggestions_disabled(state.suggestions_disabled);
+    graph.restore_items(state.items);
     // A loaded map has no walked arrival: the player has not moved yet this
     // session, so a bare peel falls back to the portal-seam search until they do.
     Ok(Mapper::restored(graph))
@@ -88,6 +103,21 @@ mod tests {
     use super::*;
     use crate::mapper::Mapper;
     use crate::direction::Direction;
+
+    /// SQ-1297: `RoomId` widened from u16 to u32 so a Glulx/name-hash synthetic id gets the full
+    /// 31-bit space instead of folding into 15 bits (where two real Counterfeit Monkey rooms
+    /// collided). A save must carry an id well above the old u16 ceiling without truncating it.
+    #[test]
+    fn round_trips_a_room_id_above_u16_max() {
+        let big: crate::graph::RoomId = 0x8000_1234; // > 65535, high bit set like a synthetic id
+        let mut m = Mapper::default();
+        m.observe(big, "Your Bunk", None);
+        let json = to_json(&m);
+        assert!(json.contains("2147488308"), "the id must be written in full, not folded: {json}");
+        let m2 = from_json(&json).unwrap();
+        assert_eq!(m2.graph.current(), Some(big));
+        assert_eq!(m2.graph.room(big).unwrap().label(), "Your Bunk");
+    }
 
     #[test]
     fn round_trips_layers() {
@@ -126,6 +156,141 @@ mod tests {
         );
         assert_eq!(m2.graph.layer_view_choice(0), None, "an unchosen layer stays unchosen");
         assert_eq!(m2.graph.self_loops(1), vec![Direction::W], "the self-loop edge survives");
+    }
+
+    /// SQ-1257: a random-exit mark must survive the map file, or every restore would forget which
+    /// directions the story randomises and start minting false edges for them again.
+    #[test]
+    fn round_trips_random_exit_marks() {
+        let mut m = Mapper::default();
+        m.observe(1, "Windy Cave", None);
+        assert!(m.record_random_exit(1, Direction::N));
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        assert!(m2.graph.is_random_exit(1, Direction::N), "the random mark survives");
+        assert!(m2.graph.is_tried(1, Direction::N), "and it still counts as tried");
+        assert_eq!(
+            crate::matrix::classify(&m2.graph, 1, Direction::N),
+            crate::matrix::MatrixCell::Random { destinations: 0 },
+            "so a reload reads the cell exactly as the live session did"
+        );
+    }
+
+    /// A map file saved before SQ-1257 has no `random_exits` field at all; it must load as an
+    /// empty list rather than fail to parse.
+    #[test]
+    fn a_pre_sq1257_map_file_has_no_random_exits_field_and_loads_fine() {
+        let old = r#"{"version":1,"rooms":[{"id":1,"name":"Hall","label_override":null,"notes":"","pos":[0,0]}],"connections":[],"current":1}"#;
+        let m = from_json(old).unwrap();
+        assert!(m.graph.room(1).unwrap().random_exits.is_empty());
+    }
+
+    /// SQ-1261: the destinations a random exit has been seen to land in must survive the map
+    /// file too, or every restore would forget where Lost Pig's gnome tunnels have sent the
+    /// player and the room card would go back to saying only "destination varies".
+    #[test]
+    fn round_trips_random_exit_destinations() {
+        let mut m = Mapper::default();
+        m.observe(1, "Windy Cave", None);
+        assert!(m.record_random_exit(1, Direction::N));
+        m.graph.note_random_destination(1, Direction::N, 2);
+        m.graph.note_random_destination(1, Direction::N, 3);
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        assert_eq!(m2.graph.random_destinations(1, Direction::N), &[2, 3], "order and membership survive");
+        assert_eq!(
+            crate::matrix::classify(&m2.graph, 1, Direction::N),
+            crate::matrix::MatrixCell::Random { destinations: 2 },
+            "and the matrix cell's count agrees after reload"
+        );
+    }
+
+    /// A map file saved before SQ-1261 has no `random_destinations` field at all; it must load
+    /// as an empty list rather than fail to parse — the same back-compat shape `random_exits`
+    /// itself needed when it was new.
+    #[test]
+    fn a_pre_sq1261_map_file_has_no_random_destinations_field_and_loads_fine() {
+        let old = r#"{"version":1,"rooms":[{"id":1,"name":"Windy Cave","label_override":null,"notes":"","pos":[0,0],"random_exits":["N"]}],"connections":[],"current":1}"#;
+        let m = from_json(old).unwrap();
+        assert!(m.graph.room(1).unwrap().random_destinations.is_empty());
+        assert!(m.graph.random_destinations(1, Direction::N).is_empty());
+        assert!(m.graph.is_random_exit(1, Direction::N), "the older field still loads fine");
+    }
+
+    /// SQ-1257 Phase 3: a room's aliases must survive the map file, or every restore would
+    /// forget every OTHER name the story ever printed for a room like Lost Pig's gnome tunnels
+    /// and start the alias list over from whatever it happens to be called at reload time.
+    #[test]
+    fn round_trips_room_aliases() {
+        let mut m = Mapper::default();
+        m.observe_moved(183, "Twisty Cave", None);
+        m.observe_moved(183, "Confusing Passage", Some(Direction::N));
+        m.observe_moved(183, "Strange Place", Some(Direction::E));
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        assert_eq!(m2.graph.room(183).unwrap().name, "Strange Place", "the current label survives");
+        assert_eq!(
+            m2.graph.room(183).unwrap().aliases,
+            vec!["Twisty Cave", "Confusing Passage"],
+            "every other name survives, in first-seen order"
+        );
+        assert!(m2.graph.is_random_exit(183, Direction::N));
+        assert!(m2.graph.is_random_exit(183, Direction::E));
+    }
+
+    /// A map file saved before SQ-1257 Phase 3 has no `aliases` field at all; it must load as an
+    /// empty list rather than fail to parse — the same back-compat shape as `random_exits` above.
+    #[test]
+    fn a_pre_phase3_map_file_has_no_aliases_field_and_loads_fine() {
+        let old = r#"{"version":1,"rooms":[{"id":1,"name":"Hall","label_override":null,"notes":"","pos":[0,0]}],"connections":[],"current":1}"#;
+        let m = from_json(old).unwrap();
+        assert!(m.graph.room(1).unwrap().aliases.is_empty());
+    }
+
+    /// SQ-1625: the most recently captured room description, and the turn it was captured on,
+    /// survive a save/load round trip.
+    #[test]
+    fn round_trips_room_description() {
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        m.graph.set_description(1, Some("You are standing in an open field.".to_string()), 3);
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        assert_eq!(
+            m2.graph.room(1).unwrap().description.as_deref(),
+            Some("You are standing in an open field.")
+        );
+        assert_eq!(m2.graph.room(1).unwrap().description_turn, Some(3));
+    }
+
+    /// The map keeps only the MOST RECENT description per room — never an accumulating log — so
+    /// a second capture (a LOOK after something in the room changed) replaces the first outright
+    /// rather than appending to it.
+    #[test]
+    fn setting_a_new_description_overwrites_the_old_one_not_accumulates() {
+        let mut m = Mapper::default();
+        m.observe(1, "Kitchen", None);
+        m.graph.set_description(1, Some("A dark kitchen.".to_string()), 1);
+        m.graph.set_description(1, Some("A now-lit kitchen. There is a lamp here.".to_string()), 5);
+
+        let room = m.graph.room(1).unwrap();
+        assert_eq!(room.description.as_deref(), Some("A now-lit kitchen. There is a lamp here."));
+        assert_eq!(room.description_turn, Some(5));
+        assert!(
+            !room.description.as_ref().unwrap().contains("A dark kitchen"),
+            "the old text must not survive alongside the new one"
+        );
+    }
+
+    /// A map file saved before SQ-1625 has no `description`/`description_turn` fields at all; it
+    /// must load fine with both `None`, the same back-compat shape as `aliases` above.
+    #[test]
+    fn a_pre_sq1625_map_file_has_no_description_field_and_loads_fine() {
+        let old = r#"{"version":1,"rooms":[{"id":1,"name":"Hall","label_override":null,"notes":"","pos":[0,0]}],"connections":[],"current":1}"#;
+        let m = from_json(old).unwrap();
+        let room = m.graph.room(1).unwrap();
+        assert!(room.description.is_none());
+        assert!(room.description_turn.is_none());
     }
 
     /// SQ-0672: the per-layer "last room visited" memory must survive a save/load round trip, or
@@ -215,9 +380,9 @@ mod tests {
                 {"id":2,"name":"B","label_override":null,"notes":"","pos":[0,-1]},
                 {"id":3,"name":"C","label_override":null,"notes":"","pos":[1,0]}],
             "connections":[
-                {"origin":1,"dir":"Unknown","dest":2,"distorted":false},
-                {"origin":1,"dir":"N","dest":2,"distorted":false},
-                {"origin":2,"dir":"Unknown","dest":3,"distorted":false}],
+                {"origin":1,"dir":"Unknown","dest":2,"distorted":false,"weight":"Hard"},
+                {"origin":1,"dir":"N","dest":2,"distorted":false,"weight":"Hard"},
+                {"origin":2,"dir":"Unknown","dest":3,"distorted":false,"weight":"Hard"}],
             "current":1}"#;
         let m = from_json(json).unwrap();
         assert!(
@@ -242,9 +407,9 @@ mod tests {
                 {"id":1,"name":"A","label_override":null,"notes":"","pos":[0,0]},
                 {"id":2,"name":"B","label_override":null,"notes":"","pos":[1,0]}],
             "connections":[
-                {"origin":1,"dir":"E","dest":2,"distorted":false},
-                {"origin":1,"dir":"N","dest":99,"distorted":false},
-                {"origin":98,"dir":"S","dest":1,"distorted":false}],
+                {"origin":1,"dir":"E","dest":2,"distorted":false,"weight":"Hard"},
+                {"origin":1,"dir":"N","dest":99,"distorted":false,"weight":"Hard"},
+                {"origin":98,"dir":"S","dest":1,"distorted":false,"weight":"Hard"}],
             "current":42}"#;
         let m = from_json(json).unwrap();
         assert_eq!(
@@ -292,6 +457,41 @@ mod tests {
         assert_eq!(lbl.row_of(2), "Maze 3", "the newcomer is numbered after both, not before");
     }
 
+    /// SQ-1300: `Room::ordinal` (`seq + 1`, the small per-map number a synthetic room shows a
+    /// player instead of its raw hex id) is not a separate field — it rides on `seq`, which the
+    /// test above already proves round-trips and resumes correctly. Pinned here too, by the
+    /// public name a caller actually reads, so a future refactor that DID split them apart would
+    /// have to keep both round-tripping, not just one.
+    #[test]
+    fn ordinal_round_trips_via_seq() {
+        let mut m = Mapper::default();
+        m.observe(5, "Alley", None);
+        m.observe(7, "Street", Some(Direction::N));
+        assert_eq!(m.graph.room(5).unwrap().ordinal(), 1);
+        assert_eq!(m.graph.room(7).unwrap().ordinal(), 2);
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        assert_eq!(m2.graph.room(5).unwrap().ordinal(), 1, "ordinal survives the round trip");
+        assert_eq!(m2.graph.room(7).unwrap().ordinal(), 2);
+    }
+
+    /// SQ-1300: a save written before `seq` existed (SQ-0685) has no counter to resume either —
+    /// `from_parts` backfills both from the rooms' array position, so the very first room loaded
+    /// from such a file still reads ordinal 1, not 0 or something derived from its (irrelevant)
+    /// room id.
+    #[test]
+    fn ordinal_re_derives_the_counter_on_a_save_with_no_seq_field_at_all() {
+        // id 2147488308 = 0x8000_1234, a synthetic id (high bit set) spelled decimal for JSON —
+        // the same id `round_trips_a_room_id_above_u16_max` above uses.
+        let old = r#"{"version":1,"rooms":[
+            {"id":2147488308,"name":"Alley","label_override":null,"notes":"","pos":[0,0]},
+            {"id":42,"name":"Street","label_override":null,"notes":"","pos":[1,0]}],
+            "connections":[],"current":null}"#;
+        let m = from_json(old).unwrap();
+        assert_eq!(m.graph.room(2147488308).unwrap().ordinal(), 1, "array position 0");
+        assert_eq!(m.graph.room(42).unwrap().ordinal(), 2, "array position 1");
+    }
+
     #[test]
     fn round_trips_full_state() {
         let mut m = Mapper::default();
@@ -306,5 +506,122 @@ mod tests {
         assert_eq!(m2.graph.current(), Some(2));
         assert_eq!(m2.graph.connections(), m.graph.connections());
         assert_eq!(m2.graph.room(2).unwrap().pos, m.graph.room(2).unwrap().pos);
+    }
+
+    /// SQ-1312: a passage's WEIGHT survives a save/load round trip, all three levels of it.
+    ///
+    /// The weight decides which constraint the layout gives up when a cycle closes, and whether
+    /// a room may stand in a run's gap, so a save that lost it would relayout into a different
+    /// map. It is an ORDERING, not a flag: `Hard` beats `Door` beats `Conditional`, and the two
+    /// gated levels must come back distinct — a door is a real walkable way through the
+    /// geography, a conditional exit is usually a secret and yields first.
+    #[test]
+    fn a_passage_weight_survives_the_round_trip() {
+        use crate::graph::PassageWeight;
+        let mut m = Mapper::default();
+        m.graph.upsert_room(1, "Kitchen".into());
+        m.graph.upsert_room(2, "Behind House".into());
+        m.graph.upsert_room(3, "Living Room".into());
+        m.graph.upsert_room(4, "Strange Passage".into());
+        m.graph.add_edge_weighted(1, Direction::E, 2, PassageWeight::Door); // the kitchen window
+        m.graph.add_edge(1, Direction::W, 3); // an ordinary open passage
+        m.graph.add_edge_weighted(3, Direction::N, 4, PassageWeight::Conditional); // magic word
+
+        let json = to_json(&m);
+        assert!(json.contains("\"weight\": \"Door\""), "the weight is written: {json}");
+        assert!(json.contains("\"weight\": \"Conditional\""), "all of it: {json}");
+        let m2 = from_json(&json).unwrap();
+
+        let weight_of = |g: &crate::graph::MapGraph, origin, dir| {
+            g.connections().iter().find(|c| c.origin == origin && c.dir == dir).unwrap().weight
+        };
+        assert_eq!(weight_of(&m2.graph, 1, Direction::E), PassageWeight::Door);
+        assert_eq!(weight_of(&m2.graph, 1, Direction::W), PassageWeight::Hard);
+        assert_eq!(weight_of(&m2.graph, 3, Direction::N), PassageWeight::Conditional);
+        assert!(
+            PassageWeight::Hard < PassageWeight::Door
+                && PassageWeight::Door < PassageWeight::Conditional,
+            "the ordering the layout sorts by: surrender the later one first",
+        );
+        assert_eq!(m2.graph.connections(), m.graph.connections());
+    }
+
+    /// SQ-1627: an item's whole record — origin, current location and the fixed-in-place flag —
+    /// survives a save/load round trip.
+    #[test]
+    fn round_trips_item_records() {
+        use crate::graph::ItemLocation;
+
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        m.graph.note_item_seen(10, "a small mailbox".into(), 1, true, None, 1);
+        m.graph.note_item_fixed_in_place(10);
+        m.graph.note_item_seen(11, "a leaflet".into(), 1, false, Some(10), 2);
+        m.graph.note_item_carried(12, "a lamp".into(), 1, 3);
+
+        let m2 = from_json(&to_json(&m)).unwrap();
+        let mailbox = m2.graph.item(10).unwrap();
+        assert_eq!(mailbox.name, "a small mailbox");
+        assert_eq!(mailbox.origin_room, 1);
+        assert_eq!(mailbox.origin_turn, 1);
+        assert_eq!(mailbox.last_seen, ItemLocation::Room { room: 1, direct: true, container: None });
+        assert!(mailbox.fixed_in_place, "the fixed-in-place flag survives");
+
+        let leaflet = m2.graph.item(11).unwrap();
+        assert_eq!(
+            leaflet.last_seen,
+            ItemLocation::Room { room: 1, direct: false, container: Some(10) },
+            "the nested flag AND its container (SQ-1632 Fix 1) survive"
+        );
+        assert!(!leaflet.fixed_in_place);
+
+        let lamp = m2.graph.item(12).unwrap();
+        assert_eq!(lamp.last_seen, ItemLocation::Carried);
+        assert_eq!(lamp.origin_room, 1, "carried-from-first-sighting still names an origin room");
+        assert_eq!(lamp.carried_since_turn, Some(3), "SQ-1632 Fix 3: the pick-up turn survives too");
+    }
+
+    /// A map file saved before SQ-1627 has no `items` field at all; it must load with an empty
+    /// item registry rather than fail to parse — the same back-compat shape `description` (SQ-1625)
+    /// and every other `#[serde(default)]` addition above needed when it was new.
+    #[test]
+    fn a_pre_sq1627_map_file_has_no_items_field_and_loads_fine() {
+        let old = r#"{"version":1,"rooms":[{"id":1,"name":"Hall","label_override":null,"notes":"","pos":[0,0]}],"connections":[],"current":1}"#;
+        let m = from_json(old).unwrap();
+        assert!(m.graph.items().next().is_none());
+        assert!(m.graph.item(1).is_none());
+    }
+
+    /// SQ-1632: a map file saved before Fix 1/Fix 3 has an item's `Room` variant with no
+    /// `container` field, and no `carried_since_turn` field on the record at all — both must load
+    /// as `None` rather than fail to parse, the same `#[serde(default)]` back-compat shape every
+    /// addition to `ItemRecord`/`ItemLocation` has needed when it was new (see the test just
+    /// above, for `description`/the whole `items` field). Built by round-tripping a REAL record
+    /// through `to_json`, then removing the two new fields as JSON KEYS (not merely nulling their
+    /// values) via `serde_json::Value`, so this test cannot drift from whatever the wire format
+    /// actually is and does not depend on `to_json`'s exact whitespace/indentation.
+    #[test]
+    fn a_pre_sq1632_item_record_has_no_container_or_carried_since_turn_and_loads_fine() {
+        use crate::graph::ItemLocation;
+
+        let mut m = Mapper::default();
+        m.observe(1, "West of House", None);
+        m.graph.note_item_seen(11, "a leaflet".into(), 1, false, Some(10), 2);
+        let mut value: serde_json::Value = serde_json::from_str(&to_json(&m)).unwrap();
+        let rec = value.get_mut("items").unwrap().get_mut("11").unwrap().as_object_mut().unwrap();
+        assert!(rec.contains_key("carried_since_turn"), "premise: the fresh save DOES carry the field");
+        rec.remove("carried_since_turn");
+        let room = rec.get_mut("last_seen").unwrap().get_mut("Room").unwrap().as_object_mut().unwrap();
+        assert!(room.contains_key("container"), "premise: and the nested field too");
+        room.remove("container");
+
+        let m2 = from_json(&value.to_string()).unwrap();
+        let leaflet = m2.graph.item(11).unwrap();
+        assert_eq!(
+            leaflet.last_seen,
+            ItemLocation::Room { room: 1, direct: false, container: None },
+            "a missing container field must default to None, not fail to parse"
+        );
+        assert_eq!(leaflet.carried_since_turn, None, "a missing carried_since_turn field defaults to None too");
     }
 }

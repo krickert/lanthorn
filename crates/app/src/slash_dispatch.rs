@@ -14,11 +14,11 @@ use app::state::{AppState, ExitTarget, Focus, SavesState, TranscriptFilter, Tran
 use mapper::mapper::Mapper;
 use ratatui::layout::Rect;
 
-use crate::engine_helpers::{apply_archive_state, restore_from_file, zvm_session_opt, RestoreOutcome};
+use app::engine_helpers::zvm_session_opt;
 use crate::reset::reset_game;
 use crate::{
-    combined_saves, format_rfc3339, handle_map_export, open_hints, reobserve_location,
-    scroll_for_match, should_prompt_save_on_quit, toggle_style_watch,
+    combined_saves, format_rfc3339, handle_map_export, map_view, open_hints, scroll_for_match,
+    should_prompt_save_on_quit, toggle_style_watch,
 };
 
 /// Handle a parsed `SlashOutcome` from either typed input or a key dispatch.
@@ -37,6 +37,7 @@ pub(crate) fn dispatch_slash_outcome(
     game_dir: &std::path::Path,
     ifid: &str,
     arc_file: &std::path::Path,
+    quick_save_file: &std::path::Path,
     story_bytes: &[u8],
     story_path: &std::path::Path,
     map_rect: Rect,
@@ -53,7 +54,7 @@ pub(crate) fn dispatch_slash_outcome(
                 let entries = combined_saves(game_dir);
                 apply_action(Action::OpenSaves, state, mapper);
                 state.overlays.saves = Some(SavesState { entries, scroll: Default::default() });
-            } else if handle_map_export(&a, game_dir, mapper, state) {
+            } else if handle_map_export(&a, game_dir, mapper, state, &*session, story_bytes, story_path) {
                 // handled
             } else if matches!(a, Action::ToggleWatch) {
                 toggle_style_watch(state, style_watcher);
@@ -87,6 +88,29 @@ pub(crate) fn dispatch_slash_outcome(
                 &format!("terminal defaults (OSC 10/11 probe): fg {} · bg {}", fmt(td.fg), fmt(td.bg)),
                 TranscriptKind::Meta,
             );
+        }
+        SlashOutcome::SetTranscript(on) => {
+            // ZMSD §7.4 gives a story two ways to start a transcript — the
+            // `output_stream 2` opcode and `Flags 2` bit 0 — and both are the
+            // GAME's. Most modern stories offer no SCRIPT verb at all, so this
+            // throws the same switch on the player's behalf; the engine writes
+            // the header bit with it, so a story that DOES have the verb still
+            // agrees about the state.
+            //
+            // Styled as a Meta line, the register every other host announcement
+            // uses (`transcript.meta` in style.toml) — a notice about a file,
+            // not story prose.
+            let was = session.transcript_on();
+            let path = session.set_transcript(on);
+            let msg = match (on, was, path) {
+                (true, false, Some(p)) => format!("Transcript started — writing to {}", p.display()),
+                (true, false, None) => "Transcript started.".to_string(),
+                (true, true, _) => "Transcript is already running.".to_string(),
+                (false, true, _) => "Transcript stopped.".to_string(),
+                (false, false, _) => "No transcript is running.".to_string(),
+            };
+            state.push_transcript_internal(&msg, TranscriptKind::Meta);
+            state.set_status(msg);
         }
         SlashOutcome::DumpWindows => {
             // A v6 story reports one block per window, merging the game's window
@@ -289,11 +313,22 @@ pub(crate) fn dispatch_slash_outcome(
             if let Some((bytes, kind, from_medium)) = picked {
                 report.resource = Some((kind, bytes.len()));
                 report.from_medium = from_medium;
-                if let Some(fmt) = app::state::sound_kind_to_format(kind) {
-                    report.format = Some(fmt);
-                    if let Some(backend) = state.audio.as_mut() {
-                        report.sound_id = backend.play_sample(&bytes, fmt, 8, 1);
-                    }
+                if let Some(format) = app::state::sound_kind_to_format(kind) {
+                    report.format = Some(format);
+                    // `/play-sound` is an explicit request to play something, so
+                    // it opens the (otherwise lazy, SQ-1423) device itself rather
+                    // than silently doing nothing the first time it's run.
+                    let volume = state.config.volume;
+                    let sink = state
+                        .audio
+                        .get_or_insert_with(|| app::host::sound::default_sound_sink(volume));
+                    report.sound_id = sink.play(app::host::sound::SampleStart {
+                        resource: n,
+                        bytes: &bytes,
+                        format,
+                        level: app::host::sound::SampleLevel::ZVolume(8),
+                        repeats: 1,
+                    });
                 }
             }
             for line in app::state::format_play_sound_report(&report) {
@@ -323,19 +358,23 @@ pub(crate) fn dispatch_slash_outcome(
                 Err(e) => state.set_status(format!("save failed: {}", e)),
             },
             None => {
-                // The default archive slot is the auto/quick-save equivalent —
-                // never a name the player typed — so it never prompts (SQ-0648).
+                // The quick-save slot (`quick-save.lanthorn`) is the manual
+                // Ctrl+S / bare `/save-state` equivalent — never a name the
+                // player typed — so it never prompts (SQ-0648). Kept apart
+                // from the per-turn/exit auto-save's `default.lanthorn`
+                // (SQ-1624) so this explicit save is never immediately
+                // overwritten by the next turn's auto-save.
                 // SQ-0588: the display list travels with this save too — this is
                 // the interactive Save State path, and an archive written
                 // without it restores art that can never be recoloured.
-                // Land any in-flight background per-turn auto-save first (SQ-1184):
-                // this writes the same default slot, so an explicit /save that
-                // reports "saved" must not race a background write for an
-                // earlier turn onto the same file.
+                // Land any in-flight background per-turn auto-save first
+                // (SQ-1184): it writes a different file now, but this still
+                // orders the explicit save after anything already queued this
+                // turn, so "saved" is reported only once this write itself lands.
                 state.archive_worker.flush();
-                let (v6_pics, v6_display, v6_ground, v6_diags) = crate::engine_helpers::v6_save_payload(&mut *session);
+                let (v6_pics, v6_display, v6_ground, v6_diags) = app::engine_helpers::v6_save_payload(&mut *session);
                 for d in &v6_diags { state.note_v6_save(d); }
-                let (location, score) = crate::engine_helpers::save_summary(&*session, state);
+                let (location, score) = app::engine_helpers::save_summary(&*session, state);
                 let meta = app::archive::Meta {
                     format_version: app::archive::CURRENT_FORMAT_VERSION,
                     ifid: Some(ifid.to_string()),
@@ -350,8 +389,9 @@ pub(crate) fn dispatch_slash_outcome(
                     location,
                     score,
                     trigger: app::archive::SaveTrigger::HostState,
+                    source: state.source.clone(),
                 };
-                let result = save_archive_meta_pics(arc_file, &*mapper, &session.save_state(), zvm_session_opt(&*session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref())
+                let result = save_archive_meta_pics(quick_save_file, &*mapper, &session.save_state(), zvm_session_opt(&*session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref())
                     .map(|()| "saved".to_string())
                     .map_err(|e| format!("save failed: {}", e));
                 apply_slash_save_result(result, session, state);
@@ -375,24 +415,13 @@ pub(crate) fn dispatch_slash_outcome(
                     state.set_status("load failed: no save found with that name");
                 }
                 Some(ref path) => {
-                    let restore_outcome = restore_from_file(path, &mut *session);
+                    // The restore and everything the archive carries back is the
+                    // library's (`host::persist::restore_file`, SQ-1539).
+                    let restored = app::host::persist::restore_file(&mut *session, mapper, state, path, map_view(map_rect));
                     app::trace::hostio(&state.config.user_dir, state.config.trace.hostio, format!("restore_state({})", path.display()));
-                    match restore_outcome {
-                        Ok(RestoreOutcome::DescriptorCompleted(ac)) => {
-                            // An in-game @save archive carries the whole session
-                            // alongside its game bytes (SQ-0531); a bare .qzl has
-                            // nothing but the bytes.
-                            if let Some(ac) = ac {
-                                apply_archive_state(*ac, &mut *session, mapper, state);
-                            }
-                            reobserve_location(state, mapper, &*session, map_rect);
-                            state.set_status("restored");
-                        }
-                        Ok(RestoreOutcome::Resumed(ac)) => {
-                            apply_archive_state(*ac, &mut *session, mapper, state);
-                            reobserve_location(state, mapper, &*session, map_rect);
-                            state.set_status("loaded");
-                        }
+                    match restored {
+                        Ok(app::host::persist::Restored::GameSave { .. }) => state.set_status("restored"),
+                        Ok(app::host::persist::Restored::Resumed) => state.set_status("loaded"),
                         Err(e) => state.set_status(format!("load failed: {}", e)),
                     }
                 }
@@ -403,7 +432,10 @@ pub(crate) fn dispatch_slash_outcome(
             match load_map(&full) {
                 Some(m) => {
                     *mapper = m;
-                    state.bump_graph_gen(); // imported map replaced the graph → invalidate memo (SQ-0305)
+                    // A wholesale graph replacement: the new graph's `struct_gen` starts back at
+                    // 0, so a generation-number check alone could coincidentally match the stale
+                    // cache's — drop it outright instead (SQ-0305, SQ-1544).
+                    state.invalidate_map_render();
                     state.set_viewed_layer(None);
                     // A whole new graph switches the active layer to whatever the loaded map's
                     // current room sits on — route it through the same layer-switch recenter as
@@ -430,10 +462,12 @@ pub(crate) fn dispatch_slash_outcome(
             }
         }
         SlashOutcome::Quit => {
-            // A plain quit resolves the loop to Exit. Set it explicitly so a
-            // prior `/quit-to-library` that opened (then was superseded by) this
-            // path can't leave the target pointing at the library. (SQ-0435)
-            state.exit_target = ExitTarget::Exit;
+            // A plain quit resolves like every other way the run can end: back
+            // to the library when the story was launched from one, Exit
+            // otherwise (SQ-1258). Set it explicitly so a prior
+            // `/quit-to-library` that opened (then was superseded by) this path
+            // can't leave a stale target behind. (SQ-0435)
+            state.exit_target = ExitTarget::for_launch(state.launched_from_library);
             if should_prompt_save_on_quit(state) {
                 state.overlays.quit_dialog = true;
                 state.overlays.dialog_focus = 0;
@@ -461,7 +495,8 @@ pub(crate) fn dispatch_slash_outcome(
         SlashOutcome::Search(q_opt) => {
             let query_to_run: Option<String> = match q_opt {
                 Some(q) => Some(q),
-                None => state.search_query.clone(),
+                None if state.recall_mode => state.search_last_literal_query.clone(),
+                None => state.search_query.clone().or_else(|| state.search_last_literal_query.clone()),
             };
             match query_to_run {
                 None => {
@@ -486,7 +521,18 @@ pub(crate) fn dispatch_slash_outcome(
                 }
             }
         }
+        SlashOutcome::Recall(q_opt) => {
+            let query = q_opt.or_else(|| state.recall_last_query.clone());
+            match query {
+                None => state.set_status("recall: use /recall <what you remember>"),
+                Some(query) => match state.begin_recall(&query) {
+                    Ok(()) => state.set_status("recall: searching in background; first use may download a model (~90 MB)"),
+                    Err(err) => state.set_status(format!("recall: could not start search: {err}")),
+                },
+            }
+        }
         SlashOutcome::Filter(arg) => {
+            let recall_query = state.recall_mode.then(|| state.search_query.clone()).flatten();
             state.transcript_filter = match arg {
                 TranscriptFilterArg::Both  => TranscriptFilter::Both,
                 TranscriptFilterArg::Story => TranscriptFilter::Story,
@@ -499,7 +545,9 @@ pub(crate) fn dispatch_slash_outcome(
             };
             // If a search is active, recompute it against the new filter
             // so highlights and the [i/N] hint stay consistent.
-            if let Some(query) = state.search_query.clone() {
+            let recall_error = if let Some(query) = recall_query {
+                state.begin_recall(&query).err()
+            } else if let Some(query) = state.search_query.clone() {
                 let count = state.run_search(&query, state.config.search.start_backward);
                 if count > 0 {
                     let pos = state.search_matches[state.search_idx];
@@ -511,8 +559,14 @@ pub(crate) fn dispatch_slash_outcome(
                     };
                     state.transcript_scroll = scroll_for_match(pos, total_vis, pane_rows);
                 }
-            }
+                None
+            } else {
+                None
+            };
             state.set_status(format!("filter: {}", label));
+            if let Some(err) = recall_error {
+                state.set_status(format!("recall: could not refresh after filter change: {err}"));
+            }
         }
         SlashOutcome::Export(dest) => {
             // The VISIBLE transcript as a FILE should carry it: an assist
@@ -602,11 +656,14 @@ pub(crate) fn dispatch_slash_outcome(
             }
         }
         SlashOutcome::RunFontCheck => {
-            // SQ-1104: open the same modal the first run raises. Focus starts on
-            // the second button — the answer that changes nothing — matching the
-            // dialog's declared default, so Enter without reading is not a
-            // decision to install glyphs the font may not have.
+            // SQ-1104/SQ-1245: open the same modal the first run raises, on
+            // stage one. Focus starts on the second button — the answer that
+            // changes nothing — matching the dialog's declared default, so
+            // Enter without reading is not a decision to install glyphs the
+            // font may not have. `font_check_icon_answer` is reset defensively
+            // in case a previous run somehow left it set.
             state.overlays.dialog_focus = 1;
+            state.overlays.font_check_icon_answer = None;
             state.overlays.font_check = true;
         }
         SlashOutcome::SetGuidance(arg) => {
@@ -616,36 +673,31 @@ pub(crate) fn dispatch_slash_outcome(
             // heart, on for the one you just opened — so it belongs in the
             // per-game sidecar, exactly as `set-v6-pixel-lock` already does. The
             // settings screen still owns the global default new games inherit.
+            //
+            // The persistence itself — write, `state.config.guidance`, the
+            // one-run pin/release — is `app::host::set_guidance` (SQ-1549), so a
+            // non-terminal host gets the same rule without re-implementing it.
             use app::slash::GuidanceArg;
-            let want = match arg {
-                GuidanceArg::On => Some(true),
-                GuidanceArg::Off => Some(false),
-                GuidanceArg::Auto => None,
-                GuidanceArg::Toggle => Some(!state.config.guidance),
-            };
-            match app::styles::write_per_game_guidance(game_dir, want) {
-                Ok(()) => {
-                    // `auto` falls back to the global value captured at boot —
-                    // the one the sidecar overrode, and the only place it survives.
-                    state.config.guidance = want.unwrap_or(state.guidance_base);
-                    // A per-game choice must never reach the user's global
-                    // config.toml: pin it while it is in force, release on `auto`.
-                    match want {
-                        Some(v) => state.config.one_run.pin(app::config::keys::GUIDANCE, v),
-                        None => state.config.one_run.release(app::config::keys::GUIDANCE),
-                    }
-                    let label = match want {
-                        Some(true) => "on",
-                        Some(false) => "off",
-                        None => "auto",
+            match app::host::set_guidance(state, game_dir, arg) {
+                Ok(effective) => {
+                    let label = match arg {
+                        GuidanceArg::On => "on",
+                        GuidanceArg::Off => "off",
+                        GuidanceArg::Auto => "auto",
+                        GuidanceArg::Toggle => {
+                            if effective {
+                                "on"
+                            } else {
+                                "off"
+                            }
+                        }
                     };
                     // Said as META, not as an assist: this is a report of something
                     // lanthorn did, and an assist announcing that assists are now off
                     // would be the one line the switch could not silence.
                     state.push_transcript_internal(
                         &format!(
-                            "Lanthorn's Guiding Light: {label} (for this game — guidance = {})",
-                            state.config.guidance
+                            "Lanthorn's Guiding Light: {label} (for this game — guidance = {effective})"
                         ),
                         TranscriptKind::Meta,
                     );
@@ -706,14 +758,15 @@ pub(crate) fn dispatch_slash_outcome(
             // touching it.
             use app::reveal::Armed;
             match app::reveal::arm(state, &*session) {
-                Armed::Lit { .. } => {
-                    // Every reveal is a vocabulary reveal now (SQ-1135), so the
-                    // legend is unconditional: these are words the story KNOWS,
-                    // which is a weaker thing than a promise that they are here,
-                    // and the player should be told which of the two they are
-                    // looking at.
-                    state.set_status(format!("[{}]", app::reveal::CAVEAT));
-                }
+                // A lit reveal says nothing at all (user decision, SQ-1214): the
+                // words lighting up IS the answer, and the caveat legend that used
+                // to ride the status line on every press was one more thing to
+                // read over the thing being read. The claim it stated — words the
+                // story KNOWS, not necessarily things that are here — lives in
+                // the control's own description now, said once where the feature
+                // is discovered instead of on every use. The arms below still
+                // speak, because each names the reason nothing lit.
+                Armed::Lit { .. } => {}
                 Armed::Nothing => {
                     state.set_status("[nothing on screen is a word this story takes]")
                 }
@@ -915,6 +968,10 @@ fn terminal_snapshot(
             Capability::KittyCompression => {
                 "KittyCompression — the terminal can inflate an o=z transmission".to_string()
             }
+            Capability::KittySharedMemory => {
+                "KittySharedMemory — the terminal can open a t=s shared memory object we write"
+                    .to_string()
+            }
             Capability::CellSize(Some((w, h))) => format!("CellSize({w}x{h} px, from CSI 16 t)"),
             Capability::CellSize(None) => "CellSize (answered, but named no size)".to_string(),
             Capability::TextSizingProtocol => "TextSizingProtocol".to_string(),
@@ -922,6 +979,7 @@ fn terminal_snapshot(
         })
         .collect();
     let kitty_compression = caps.contains(&Capability::KittyCompression);
+    let kitty_shared_memory = caps.contains(&Capability::KittySharedMemory);
 
     let cell = picker.map(|p| {
         let f = p.font_size();
@@ -932,10 +990,12 @@ fn terminal_snapshot(
         Capability::CellSize(Some((w, h))) => Some((*w, *h)),
         _ => None,
     });
-    // …and what the tty says right NOW. Asked live rather than remembered,
-    // because `refresh_cell_size` re-derives from exactly this on every resize
-    // (SQ-0988) — so a remembered boot-time answer could be stale in a way the
-    // live one cannot.
+    // …and what the tty says right NOW. Asked live rather than remembered — a
+    // remembered boot-time answer could be stale in a way the live one cannot
+    // (both the in-game picker (SQ-1511) and the story-picker's cover preview
+    // (SQ-1520) have since moved their own resize-time cell derivation off
+    // this ioctl to a settled stdio requery; this diagnostic still reads it
+    // directly as one more data point, not as a refresh loop).
     let ioctl_cell = crate::picker_ui::terminal_cell_size().map(|f| (f.width, f.height));
     // Ordered by directness: the CSI answer if it is still the value in force,
     // then the ioctl, then the crate's hardcoded 10x20 — which is the one that
@@ -1016,6 +1076,7 @@ fn terminal_snapshot(
         ioctl_cell,
         capabilities,
         kitty_compression,
+        kitty_shared_memory,
         pane_cells: (story_rect.width, story_rect.height),
         render,
         traffic: state.term_traffic.as_ref().map(|t| TrafficStats {
@@ -1024,6 +1085,7 @@ fn terminal_snapshot(
             last_flush_bytes: t.last_flush_bytes(),
         }),
         band_encodes: gr.band_encodes,
+        encode_timings: gr.encode_timings,
         uploads: gr.uploads,
         ops,
     }
@@ -1046,14 +1108,14 @@ pub(crate) fn write_named_save(
 ) -> Result<String, String> {
     // SQ-0588: the display list travels with every host save — an archive
     // written without it restores art that can never be recoloured.
-    let (v6_pics, v6_display, v6_ground, v6_diags) = crate::engine_helpers::v6_save_payload(session);
+    let (v6_pics, v6_display, v6_ground, v6_diags) = app::engine_helpers::v6_save_payload(session);
     for d in &v6_diags { state.note_v6_save(d); }
-    let (location, score) = crate::engine_helpers::save_summary(&*session, state);
+    let (location, score) = app::engine_helpers::save_summary(&*session, state);
     save_named(
         game_dir, ifid, name, app::archive::SaveTrigger::HostState, mapper, &session.save_state(),
         zvm_session_opt(&*session).map(|z| &z.machine.screen), &v6_pics, v6_display.as_ref(),
         v6_ground.as_deref(), session.aux_data(), state.turns, location, score,
-        &app::archive::SessionRecord::of(state),
+        &app::archive::SessionRecord::of(state), &state.source,
     )
         .map(|()| format!("saved as \"{}\"", name))
         .map_err(|e| format!("save failed: {}", e))
@@ -1107,7 +1169,7 @@ fn toggle_debug(state: &mut AppState, session: &mut dyn Engine) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-input"))]
 mod debug_dispatch_tests {
     use super::*;
     use app::engine::{Debugger, EngineError, EngineSave, KeyInput, LocationInfo, ScreenModel};
@@ -1217,7 +1279,7 @@ mod debug_dispatch_tests {
         let dir = std::path::Path::new("/tmp/lanthorn-sq0435-test");
         dispatch_slash_outcome(
             outcome, state, &mut mapper, &mut engine, &mut style_watcher,
-            dir, "IFIDTEST", dir, &[], dir,
+            dir, "IFIDTEST", dir, dir, &[], dir,
             Rect::default(), Rect::default(), false,
         )
     }
@@ -1230,7 +1292,7 @@ mod debug_dispatch_tests {
         let mut style_watcher: Option<app::watch::StyleWatcher> = None;
         dispatch_slash_outcome(
             outcome, state, &mut mapper, &mut engine, &mut style_watcher,
-            dir, "IFIDTEST", dir, &[], dir,
+            dir, "IFIDTEST", dir, dir, &[], dir,
             Rect::default(), Rect::default(), false,
         );
     }
@@ -1407,10 +1469,26 @@ mod debug_dispatch_tests {
     }
 
     #[test]
-    fn quit_sets_exit_target_to_exit() {
+    fn quit_from_a_library_launch_resolves_to_library() {
+        // SQ-1258: a story reached through the picker returns to it on every way
+        // the run ends, including the player's own `quit` command — not only
+        // `/quit-to-library`.
         let mut state = AppState::default();
-        // Even after a prior quit-to-library set the target, a plain Quit resets it.
         state.launched_from_library = true;
+        state.exit_target = ExitTarget::Exit; // whatever the boot default left behind
+        state.unsaved_progress = false;
+        let should_break = dispatch_quit_like(&mut state, SlashOutcome::Quit);
+        assert!(should_break, "no unsaved progress → quit breaks immediately");
+        assert_eq!(state.exit_target, ExitTarget::Library, "quit must resolve to Library");
+    }
+
+    #[test]
+    fn quit_from_a_command_line_launch_resolves_to_exit() {
+        // No picker to return to → quit still leaves lanthorn entirely (SQ-1258).
+        let mut state = AppState::default();
+        state.launched_from_library = false;
+        // A stale Library target (left behind by a since-superseded intent) must
+        // not survive a plain Quit either.
         state.exit_target = ExitTarget::Library;
         state.unsaved_progress = false;
         let should_break = dispatch_quit_like(&mut state, SlashOutcome::Quit);
@@ -1448,10 +1526,11 @@ mod debug_dispatch_tests {
         let mut engine = MockEngine { has_debugger: false, aux: BTreeMap::new() };
         let mut style_watcher: Option<app::watch::StyleWatcher> = None;
         let arc_file = dir.join("default.lanthorn");
+        let quick_save_file = dir.join("quick-save.lanthorn");
         let should_break = dispatch_slash_outcome(
             SlashOutcome::Save(Some("before, troll!".to_string())),
             &mut state, &mut mapper, &mut engine, &mut style_watcher,
-            &dir, "IFIDTEST", &arc_file, &[], &dir,
+            &dir, "IFIDTEST", &arc_file, &quick_save_file, &[], &dir,
             Rect::default(), Rect::default(), false,
         );
         assert!(!should_break);
@@ -1500,25 +1579,39 @@ mod debug_dispatch_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The default archive slot (`/save` with no name) is the quick-save
-    /// equivalent, never a name the player typed — it must keep overwriting
-    /// silently even when the slot already holds an earlier save, exactly like
-    /// the per-turn auto-save (SQ-0648).
+    /// `/save` with no name (Ctrl+S / bare `/save-state`) writes the QUICK-SAVE
+    /// slot (`quick-save.lanthorn`), never a name the player typed — so it
+    /// never prompts (SQ-0648) — and it must keep overwriting that slot
+    /// silently even when it already holds an earlier save. SQ-1624: it must
+    /// land in `quick-save.lanthorn`, NOT the per-turn/exit auto-save's
+    /// `default.lanthorn`, which this seeds too and asserts untouched — that
+    /// separation is the whole point of the two slots existing (a manual
+    /// quick-save used to be immediately overwritten by the next auto-save,
+    /// since both wrote the same file).
     #[test]
     fn slash_save_default_archive_never_prompts_even_when_it_already_exists() {
         let dir = temp_dir("default-slot");
         let arc_file = dir.join("default.lanthorn");
+        let quick_save_file = dir.join("quick-save.lanthorn");
 
-        let seed_meta = app::archive::Meta {
+        let seed_meta = || app::archive::Meta {
             format_version: app::archive::CURRENT_FORMAT_VERSION,
             ifid: None, name: None, turns: 1, saved_at: String::new(), location: None, score: None,
             trigger: app::archive::SaveTrigger::HostState,
+            source: app::archive::SaveSource::default(),
         };
+        // Seed BOTH reserved slots so the write can be shown to land in exactly
+        // one of them.
         app::archive::save_archive_meta(
             &arc_file, &Mapper::default(), &EngineSave::new("mock", 1, vec![1, 2, 3]), None,
-            &BTreeMap::new(), seed_meta, &[], &[], &[], &[], &[], &[],
+            &BTreeMap::new(), seed_meta(), &[], &[], &[], &[], &[], &[],
         ).expect("seed default.lanthorn");
-        let before = std::fs::read(&arc_file).expect("seed archive written");
+        let before_default = std::fs::read(&arc_file).expect("seed archive written");
+        app::archive::save_archive_meta(
+            &quick_save_file, &Mapper::default(), &EngineSave::new("mock", 1, vec![4, 5, 6]), None,
+            &BTreeMap::new(), seed_meta(), &[], &[], &[], &[], &[], &[],
+        ).expect("seed quick-save.lanthorn");
+        let before_quick = std::fs::read(&quick_save_file).expect("seed archive written");
 
         let mut state = AppState::default();
         let mut mapper = Mapper::default();
@@ -1527,16 +1620,73 @@ mod debug_dispatch_tests {
         let should_break = dispatch_slash_outcome(
             SlashOutcome::Save(None),
             &mut state, &mut mapper, &mut engine, &mut style_watcher,
-            &dir, "IFIDTEST", &arc_file, &[], &dir,
+            &dir, "IFIDTEST", &arc_file, &quick_save_file, &[], &dir,
             Rect::default(), Rect::default(), false,
         );
         assert!(!should_break);
         assert!(
             state.overlays.confirm_overwrite_save.is_none(),
-            "the default archive slot must never open the overwrite-confirm overlay"
+            "the quick-save slot must never open the overwrite-confirm overlay"
         );
-        let after = std::fs::read(&arc_file).expect("archive still there");
-        assert_ne!(after, before, "it wrote silently, straight over the existing slot");
+        let after_quick = std::fs::read(&quick_save_file).expect("archive still there");
+        assert_ne!(after_quick, before_quick, "it wrote silently, straight over the existing quick-save slot");
+        let after_default = std::fs::read(&arc_file).expect("default.lanthorn still there");
+        assert_eq!(
+            after_default, before_default,
+            "a bare /save-state must NOT touch the auto-save slot (SQ-1624)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1633: the bare `/save-state` (quick-save) write builds its `Meta`
+    /// inline in this arm, a separate code path from `write_named_save` below —
+    /// it must carry the booted session's `source` too.
+    #[test]
+    fn slash_save_default_archive_names_its_own_source_sq1633() {
+        let dir = temp_dir("source-quicksave");
+        let mut state = AppState::default();
+        state.source = app::archive::SaveSource {
+            story_file: Some("Beyond Zork (1988)(Infocom).2mg".to_string()),
+            disk_entry: None,
+            machine: Some(app::archive::MachineDto::AppleII),
+        };
+        let mut mapper = Mapper::default();
+        let mut engine = MockEngine { has_debugger: false, aux: BTreeMap::new() };
+        let mut style_watcher: Option<app::watch::StyleWatcher> = None;
+        let arc_file = dir.join("default.lanthorn");
+        let quick_save_file = dir.join("quick-save.lanthorn");
+        let should_break = dispatch_slash_outcome(
+            SlashOutcome::Save(None),
+            &mut state, &mut mapper, &mut engine, &mut style_watcher,
+            &dir, "IFIDTEST", &arc_file, &quick_save_file, &[], &dir,
+            Rect::default(), Rect::default(), false,
+        );
+        assert!(!should_break);
+        let meta = app::archive::read_archive_meta(&quick_save_file).expect("archive readable");
+        assert_eq!(meta.source, state.source, "the quick-save must name the booted copy's own source");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1633: `/save <name>` (`write_named_save`) is a third, separate call
+    /// site from the quick-save arm above and `save_named` itself — it must
+    /// also carry the booted session's `source`.
+    #[test]
+    fn slash_write_named_save_names_its_own_source_sq1633() {
+        let dir = temp_dir("source-named");
+        let mapper = Mapper::default();
+        let mut engine = MockEngine { has_debugger: false, aux: BTreeMap::new() };
+        let mut state = AppState::default();
+        state.source = app::archive::SaveSource {
+            story_file: Some("zork1-r88-s840726.z3".to_string()),
+            disk_entry: None,
+            machine: None,
+        };
+        super::write_named_save(&dir, "IFIDTEST", "checkpoint", &mapper, &mut engine, &mut state)
+            .expect("write succeeds");
+        let meta = app::archive::read_archive_meta(&dir.join("checkpoint.lanthorn")).expect("archive readable");
+        assert_eq!(meta.source, state.source, "a named save must name the booted copy's own source");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1586,7 +1736,7 @@ mod debug_dispatch_tests {
         let should_break = dispatch_slash_outcome(
             SlashOutcome::DumpWindows,
             state, &mut mapper, &mut engine, &mut style_watcher,
-            dir, "IFIDTEST", dir, &[], dir,
+            dir, "IFIDTEST", dir, dir, &[], dir,
             Rect::default(), Rect::default(), true,
         );
         assert!(!should_break, "a diagnostic dump never breaks the run loop");
@@ -1689,7 +1839,7 @@ mod debug_dispatch_tests {
         let should_break = dispatch_slash_outcome(
             SlashOutcome::DumpTerminal,
             state, &mut mapper, &mut engine, &mut style_watcher,
-            dir, "IFIDTEST", dir, &[], dir,
+            dir, "IFIDTEST", dir, dir, &[], dir,
             Rect::default(), pane, true,
         );
         assert!(!should_break, "a diagnostic dump never breaks the run loop");

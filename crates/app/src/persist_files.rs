@@ -11,7 +11,7 @@ pub struct SaveInfo {
     /// Absolute path to the `.lanthorn` file.
     pub path: PathBuf,
     /// Human-readable name (slug-form for named saves, "(default)" for the
-    /// quick-save slot).
+    /// auto-save slot, "(quick save)" for the manual quick-save slot — SQ-1624).
     pub name: String,
     /// Turn counter at save time.
     pub turns: u32,
@@ -21,7 +21,10 @@ pub struct SaveInfo {
     pub location: Option<String>,
     /// Score at save time (None for v4+ Z-machine, Glulx, and legacy saves).
     pub score: Option<i32>,
-    /// True for the default (IFID-only) quick-save slot.
+    /// True for either reserved system slot — `default.lanthorn` (auto-save) or
+    /// `quick-save.lanthorn` (manual quick-save, SQ-1624) — never a name the
+    /// player typed. Sorted first by [`list_saves`] and excluded from
+    /// named-save lookup.
     pub is_default: bool,
     /// What wrote this save, and therefore whether its game bytes are portable
     /// (SQ-0531). A bare `.qzl` is always `Ingame` — it IS a standard game save;
@@ -31,10 +34,12 @@ pub struct SaveInfo {
 
 /// List all Save-State files in a game dir (SQ-0284).
 ///
-/// Discovers `default.lanthorn` (default slot) and `<slug>.lanthorn` (named
-/// slots) inside `game_dir`, reads their `Meta`, and returns sorted results:
-/// default slot first, then named saves sorted by `saved_at` descending (newest
-/// first). Files that fail to parse are silently skipped.
+/// Discovers `default.lanthorn` (auto-save slot), `quick-save.lanthorn`
+/// (manual quick-save slot, SQ-1624) and `<slug>.lanthorn` (named slots)
+/// inside `game_dir`, reads their `Meta`, and returns sorted results: the two
+/// reserved slots first (default, then quick-save), then named saves sorted
+/// by `saved_at` descending (newest first). Files that fail to parse are
+/// silently skipped.
 pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
     let entries = match std::fs::read_dir(game_dir) {
         Ok(e) => e,
@@ -50,7 +55,8 @@ pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
         if !fname.ends_with(".lanthorn") {
             continue;
         }
-        let is_default = fname == "default.lanthorn";
+        let is_quick_save = fname == "quick-save.lanthorn";
+        let is_default = fname == "default.lanthorn" || is_quick_save;
 
         // Read only meta.json; skip on failure (corrupt/unsupported → not listed).
         let meta = match crate::archive::read_archive_meta(&path) {
@@ -58,7 +64,9 @@ pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
             Err(_) => continue,
         };
 
-        let name = if is_default {
+        let name = if is_quick_save {
+            "(quick save)".to_string()
+        } else if is_default {
             "(default)".to_string()
         } else {
             // The slug is the filename stem (`<slug>.lanthorn`).
@@ -79,12 +87,19 @@ pub fn list_saves(game_dir: &Path) -> Vec<SaveInfo> {
         });
     }
 
-    // Sort: default first, then by saved_at descending (newer saves sort earlier).
+    // Sort: the two reserved slots first (default before quick-save), then
+    // named saves by saved_at descending (newer saves sort earlier).
     infos.sort_by(|a, b| {
         match (a.is_default, b.is_default) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => b.saved_at.cmp(&a.saved_at),
+            (false, false) => b.saved_at.cmp(&a.saved_at),
+            (true, true) => {
+                // "(default)" sorts before "(quick save)" among the reserved
+                // pair (ascending string order already gives this); named
+                // saves never reach this arm.
+                a.name.cmp(&b.name)
+            }
         }
     });
 
@@ -130,6 +145,10 @@ pub fn save_named(
     // and nothing else, which is how the rewind/replay history came to be dropped
     // here — see `SessionRecord` and SQ-1090.
     session: &crate::archive::SessionRecord<'_>,
+    // Which physical copy of the story release this session was booted from
+    // (SQ-1633, informational only — see `archive::SaveSource`); pass
+    // `&state.source`.
+    source: &crate::archive::SaveSource,
 ) -> io::Result<()> {
     let path = named_save_path(game_dir, name)?;
 
@@ -143,6 +162,7 @@ pub fn save_named(
         location,
         score,
         trigger,
+        source: source.clone(),
     };
     // Command history is per-game, not per-slot, so a named save deliberately
     // writes none — and says so by NAME. The rewind/replay history is not covered
@@ -190,7 +210,7 @@ pub fn named_save_path(game_dir: &Path, name: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "save name is empty after sanitization"));
     }
     if crate::storage::is_reserved_slug(&slug) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "\"default\" is a reserved save name"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("\"{slug}\" is a reserved save name")));
     }
     Ok(game_dir.join(format!("{}.lanthorn", slug)))
 }
@@ -212,6 +232,46 @@ pub fn existing_save_display_name(path: &Path) -> Option<String> {
     Some(name.unwrap_or_else(|| {
         path.file_stem().and_then(|s| s.to_str()).unwrap_or("this save").to_string()
     }))
+}
+
+/// Rename a Save State (SQ-1556): give it a new display name, and — since a
+/// named save's FILE name IS its slug (`<slug>.lanthorn`, see
+/// [`named_save_path`]) — move the file to match when the slug changes.
+///
+/// The reserved default/quick-save slot (`default.lanthorn`) is not
+/// renameable: `list_saves` always shows it as `"(default)"` regardless of
+/// what `Meta::name` says (see `list_saves` above), so a "renamed" default
+/// slot would look unchanged in the saves list — the same reservation
+/// `save_named` already enforces for a NEW save, applied here too so a
+/// caller cannot rename SOME OTHER save onto the reserved slug either
+/// (`named_save_path` rejects "default" the same way regardless of which
+/// direction produced it).
+///
+/// Refuses to clobber an unrelated existing save that already holds the
+/// destination name; renaming a save to the name it already has (a
+/// cosmetically different string that slugifies the same) is a no-op on the
+/// file and just rewrites `meta.json` in place.
+pub fn rename_save(path: &Path, new_name: &str) -> io::Result<()> {
+    if matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("default.lanthorn") | Some("quick-save.lanthorn")
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a reserved save slot cannot be renamed",
+        ));
+    }
+    let game_dir = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "save path has no parent directory")
+    })?;
+    let new_path = named_save_path(game_dir, new_name)?;
+    if new_path.as_path() != path && new_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("a save named \"{new_name}\" already exists"),
+        ));
+    }
+    crate::archive::rename_archive(path, &new_path, new_name)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -406,7 +466,7 @@ fn game_save_path(game_dir: &Path, name: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "save name is empty after sanitization"));
     }
     if crate::storage::is_reserved_slug(&slug) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "\"default\" is a reserved save name"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("\"{slug}\" is a reserved save name")));
     }
     Ok(game_dir.join(format!("{}.qzl", slug)))
 }
@@ -429,7 +489,7 @@ pub fn restore_game(path: &Path, machine: &mut zvm::cpu::exec::Machine) -> Resul
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-persist"))]
 mod tests {
     use super::*;
     use mapper::mapper::Mapper;
@@ -467,6 +527,7 @@ mod tests {
                 command_history: &commands,
                 ..crate::archive::SessionRecord::empty()
             },
+            &crate::archive::SaveSource::default(),
         )
         .expect("save_named");
 
@@ -611,7 +672,7 @@ mod tests {
         mapper.observe(1, "Foyer", None);
 
         let ifid = "ZCODE-1-TEST00-0001";
-        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, None, None, &crate::archive::SessionRecord::empty())
+        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect("save_named ok");
 
         // Path is `<slug>.lanthorn` inside the game dir (no ifid in the name).
@@ -642,7 +703,7 @@ mod tests {
         let dir = make_temp_dir("summary");
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0411";
-        super::save_named(&dir, ifid, "at-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 7, Some("The Troll Room".into()), Some(10), &crate::archive::SessionRecord::empty())
+        super::save_named(&dir, ifid, "at-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 7, Some("The Troll Room".into()), Some(10), &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect("save_named ok");
 
         let saves = super::list_saves(&dir);
@@ -665,10 +726,27 @@ mod tests {
         let ifid = "ZCODE-1-TEST00-0009";
 
         // "Default" slugifies to "default" — reserved for the auto/singleton slot.
-        let err = super::save_named(&dir, ifid, "Default", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty())
+        let err = super::save_named(&dir, ifid, "Default", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
             .expect_err("reserved slug must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(!dir.join("default.lanthorn").exists(), "must not clobber the default slot");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1624: "Quick Save" slugifies to "quick-save" — reserved for the
+    /// manual quick-save slot exactly like "default" is for the auto-save slot.
+    #[test]
+    fn save_named_rejects_reserved_quick_save_slug() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("reserved-quick-save");
+        let mapper = Mapper::default();
+        let ifid = "ZCODE-1-TEST00-0011";
+
+        let err = super::save_named(&dir, ifid, "Quick Save", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
+            .expect_err("reserved slug must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dir.join("quick-save.lanthorn").exists(), "must not clobber the quick-save slot");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -686,11 +764,11 @@ mod tests {
             .expect("default save ok");
 
         // Write two named saves.
-        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
         // Small sleep between named saves so timestamps differ, but since we
         // can't sleep in tests, we directly patch the timestamps via the archive
         // — instead, just verify ordering constraint is maintained.
-        super::save_named(&dir, ifid, "save-b", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 20, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "save-b", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 20, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
 
         let saves = super::list_saves(&dir);
         assert_eq!(saves.len(), 3, "should find 3 saves (1 default + 2 named)");
@@ -700,6 +778,33 @@ mod tests {
         let names: Vec<&str> = saves[1..].iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"save-a"), "save-a should be present");
         assert!(names.contains(&"save-b"), "save-b should be present");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1624: the manual quick-save slot is a SECOND reserved entry, labeled
+    /// distinctly from the auto-save slot and sorted right after it — ahead of
+    /// any named save regardless of timestamp.
+    #[test]
+    fn list_saves_labels_and_orders_the_quick_save_slot() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("quick-save-label");
+        let mapper = Mapper::default();
+        let ifid = "ZCODE-1-TEST00-0010";
+
+        let default_path = crate::storage::default_state_path(&dir);
+        crate::archive::save_archive(&default_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("default save ok");
+        let quick_save_path = crate::storage::quick_save_state_path(&dir);
+        crate::archive::save_archive(&quick_save_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("quick-save ok");
+        super::save_named(&dir, ifid, "save-a", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 10, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
+
+        let saves = super::list_saves(&dir);
+        assert_eq!(saves.len(), 3, "should find 3 saves (default + quick-save + 1 named)");
+        assert!(saves[0].is_default && saves[0].name == "(default)", "default slot sorts first: {saves:?}");
+        assert!(saves[1].is_default && saves[1].name == "(quick save)", "quick-save slot sorts second: {saves:?}");
+        assert!(!saves[2].is_default && saves[2].name == "save-a", "named save sorts last: {saves:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -779,7 +884,7 @@ mod tests {
         let mapper = Mapper::default();
         let ifid = "ZCODE-1-TEST00-0004";
 
-        super::save_named(&dir, ifid, "to-delete", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 5, None, None, &crate::archive::SessionRecord::empty()).unwrap();
+        super::save_named(&dir, ifid, "to-delete", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 5, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
         let saves = super::list_saves(&dir);
         assert_eq!(saves.len(), 1);
         let path = saves[0].path.clone();
@@ -787,6 +892,130 @@ mod tests {
         super::delete_save(&path).expect("delete ok");
         let saves_after = super::list_saves(&dir);
         assert!(saves_after.is_empty(), "save should be gone after delete");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── rename_save ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_save_round_trips_the_listed_name_and_keeps_the_archive_restorable() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("rename");
+        let mut mapper = Mapper::default();
+        mapper.observe(1, "Foyer", None);
+        let ifid = "ZCODE-1-TEST00-0005";
+
+        super::save_named(&dir, ifid, "before-troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 42, Some("Foyer".into()), Some(7), &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
+            .expect("save_named ok");
+        let old_path = dir.join("before-troll.lanthorn");
+        assert!(old_path.exists());
+
+        super::rename_save(&old_path, "After Troll").expect("rename ok");
+
+        // The old slug's file is gone; the new slug's file exists.
+        assert!(!old_path.exists(), "old file removed after rename");
+        let new_path = dir.join("after-troll.lanthorn");
+        assert!(new_path.exists(), "renamed file lands at the new slug");
+
+        // The listed name changed, and everything else about the row is intact.
+        let saves = super::list_saves(&dir);
+        assert_eq!(saves.len(), 1, "still exactly one save");
+        assert_eq!(saves[0].name, "After Troll");
+        assert_eq!(saves[0].turns, 42);
+        assert_eq!(saves[0].location.as_deref(), Some("Foyer"));
+        assert_eq!(saves[0].score, Some(7));
+
+        // A restore from the renamed archive still works: the archive loads and
+        // its game bytes are byte-identical to what was saved.
+        let ac = crate::archive::load_archive(&new_path).expect("load renamed archive");
+        assert_eq!(ac.meta.name.as_deref(), Some("After Troll"));
+        assert_eq!(ac.meta.ifid.as_deref(), Some(ifid), "ifid untouched by rename");
+        assert_eq!(ac.save, machine.save_quetzal(), "game bytes untouched by rename");
+        assert_eq!(ac.mapper.graph.rooms().count(), 1, "map untouched by rename");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_save_to_the_same_slug_only_rewrites_meta() {
+        // "Before Troll" and "before, troll!" both slugify to "before-troll", so
+        // this rename must not touch the filename at all — only `meta.json`'s
+        // `name` field changes.
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("rename-same-slug");
+        let mapper = Mapper::default();
+        let ifid = "ZCODE-1-TEST00-0006";
+
+        super::save_named(&dir, ifid, "Before Troll", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default())
+            .expect("save_named ok");
+        let path = dir.join("before-troll.lanthorn");
+        assert!(path.exists());
+
+        super::rename_save(&path, "before, troll!").expect("rename ok");
+        assert!(path.exists(), "same-slug rename keeps the same file");
+
+        let saves = super::list_saves(&dir);
+        assert_eq!(saves.len(), 1);
+        assert_eq!(saves[0].name, "before, troll!");
+        assert_eq!(saves[0].path, path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_save_rejects_the_default_slot() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("rename-default");
+        let mapper = Mapper::default();
+        let default_path = crate::storage::default_state_path(&dir);
+        crate::archive::save_archive(&default_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("default save ok");
+
+        let err = super::rename_save(&default_path, "My Quicksave").expect_err("default slot must refuse rename");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(default_path.exists(), "default file untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1624: the manual quick-save slot is reserved exactly like the
+    /// default/auto-save slot — renaming it would desync `list_saves`'s
+    /// hard-coded "(quick save)" label from `Meta::name`.
+    #[test]
+    fn rename_save_rejects_the_quick_save_slot() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("rename-quick-save");
+        let mapper = Mapper::default();
+        let quick_save_path = crate::storage::quick_save_state_path(&dir);
+        crate::archive::save_archive(&quick_save_path, &mapper, &es(&machine), Some(&machine.screen), &machine.aux_data, &[], &[], &[], &[], &[], &[])
+            .expect("quick-save ok");
+
+        let err = super::rename_save(&quick_save_path, "My Checkpoint").expect_err("quick-save slot must refuse rename");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(quick_save_path.exists(), "quick-save file untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_save_refuses_to_clobber_an_unrelated_save() {
+        let Some(machine) = fake_machine() else { return };
+        let dir = make_temp_dir("rename-collide");
+        let mapper = Mapper::default();
+        let ifid = "ZCODE-1-TEST00-0007";
+
+        super::save_named(&dir, ifid, "alpha", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 1, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
+        super::save_named(&dir, ifid, "beta", crate::archive::SaveTrigger::HostState, &mapper, &es(&machine), Some(&machine.screen), &[], None, None, &machine.aux_data, 2, None, None, &crate::archive::SessionRecord::empty(), &crate::archive::SaveSource::default()).unwrap();
+
+        let alpha_path = dir.join("alpha.lanthorn");
+        let err = super::rename_save(&alpha_path, "beta").expect_err("must not clobber an existing save");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // Both originals survive untouched.
+        assert!(alpha_path.exists());
+        assert!(dir.join("beta.lanthorn").exists());
+        let saves = super::list_saves(&dir);
+        assert_eq!(saves.len(), 2, "no save was lost or merged");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -918,17 +1147,17 @@ mod tests {
         let mut buf = sample_story_v4();
         buf[0x40] = 0xB5; buf[0x41] = 0x10; buf[0x42] = 0xBA; // save->G0 ; quit
         let mut m = Machine::new(Memory::new(buf).unwrap());
-        m.state.pc = 0x40;
+        m.state.set_pc(0x40);
         assert_eq!(m.step(), StepResult::SaveRequest);
         let blob = m.save_quetzal();               // descriptor PC (0x41), pending_save set
         m.complete_save(true);
         // Persist the game save and restore it via the game-save path.
         let tmp = std::env::temp_dir().join(format!("bm-gs-{}.qzl", std::process::id()));
         std::fs::write(&tmp, &blob).unwrap();
-        m.do_store(Some(0x10), 0x99); m.state.pc = 0x00AB;
+        m.set_global(0, 0x99); m.state.set_pc(0x00AB);
         super::restore_game(&tmp, &mut m).expect("restore game save");
         assert_eq!(m.global(0), 2, "game-save restore completes the @save descriptor (store 2)");
-        assert_eq!(m.state.pc, 0x42, "resumes at the post-@save address");
+        assert_eq!(m.state.pc(), 0x42, "resumes at the post-@save address");
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -941,7 +1170,7 @@ mod tests {
         let mut buf = sample_story_v4();
         buf[0x40] = 0xB5; buf[0x41] = 0x10; buf[0x42] = 0xBA; // save->G0 ; quit
         let mut m = Machine::new(Memory::new(buf).unwrap());
-        m.state.pc = 0x40;
+        m.state.set_pc(0x40);
         assert_eq!(m.step(), StepResult::SaveRequest);
 
         // Own directory, not the bare temp root: the slug fixes the FILE name, so

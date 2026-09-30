@@ -25,11 +25,11 @@ use app::session::{
 
 use crate::fixture_paths::fixture_path;
 
-fn turn(num: u16, name: &str, transcript: &str) -> TurnResult {
+fn turn(num: mapper::graph::RoomId, name: &str, transcript: &str) -> TurnResult {
     TurnResult {
         transcript: transcript.into(),
         transcript_runs: Vec::new(),
-        location: Some(zvm::ObjectSnapshot { number: num, parent: 0, name: name.into() }),
+        location: Some(app::engine::LocationInfo { number: num, parent: 0, name: name.into() }),
         quit: false,
         erase_lower: false,
         info: None,
@@ -43,6 +43,9 @@ fn turn(num: u16, name: &str, transcript: &str) -> TurnResult {
         pictures: Vec::new(),
         transcript_elems: Vec::new(),
         prose_retired: None,
+        declared_exit: None,
+    description: None,
+    items: Vec::new(),
     }
 }
 
@@ -56,7 +59,7 @@ fn play(m: &mut Mapper, death: &mut DeathWatch, cmd: &str, r: &TurnResult) {
 
 /// Every connection in the graph, as `(origin, direction, destination)` — the whole map's edges,
 /// so a test can assert that a turn minted NOTHING rather than merely nothing it thought to name.
-fn edges(m: &Mapper) -> Vec<(u16, Direction, u16)> {
+fn edges(m: &Mapper) -> Vec<(mapper::graph::RoomId, Direction, mapper::graph::RoomId)> {
     m.graph.connections().iter().map(|c| (c.origin, c.dir, c.dest)).collect()
 }
 
@@ -348,7 +351,7 @@ fn adventure_at_the_pit() -> Option<(app::glulx_session::GlulxSession, Mapper, D
     };
     let blorb = blorb::Blorb::parse(bytes).expect("advent.blb parses as a Blorb");
     let (_k, exec) = blorb.executable().expect("advent.blb carries an executable chunk");
-    let mut s = GlulxSession::new(exec.to_vec(), 80, 24, true, false, false, (1, 1), None, &[])
+    let mut s = GlulxSession::new(exec.to_vec(), 80, 24, true, false, false, (1.0, 1.0), None, &[])
         .expect("Adventure (Glulx) boots");
 
     let mut m = Mapper::default();

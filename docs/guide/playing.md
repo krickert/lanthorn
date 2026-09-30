@@ -1,0 +1,177 @@
+# Playing
+
+For anyone with a story open who wants to know what lanthorn adds on top of
+typing commands.
+
+## Typing, and what fills in around it
+
+The prompt is the story's own — type a command and press `Enter`, exactly as
+in any interpreter. What lanthorn adds sits *around* that line and never
+steals it: **Tab** completes from the things actually in front of you first
+(standing in the Living Room, `lan` offers `lantern`), then words the story
+has just used, then its whole dictionary — checked against the story's own
+parser, so you're never offered a word it would refuse. The rest of the
+match ghosts in dim text right after the caret; `Tab`/`Shift-Tab` cycle
+candidates, `→` at the end of the line takes the one on offer — and so does a
+click anywhere in the story pane, if you'd rather reach for the mouse.
+
+Type `/` on an empty line and a fuzzy palette opens over every command
+lanthorn knows — the fastest way to find out what's there without
+memorizing anything. `↑`/`↓` at the prompt recall earlier commands,
+shell-style. See [keys](../reference/keys.md) and
+[commands](../reference/commands.md) for the full lists.
+
+## The command panel
+
+Press the `▲` control on the story pane's bottom border (or
+`/open-command-band`) and a dock opens along the bottom that builds a command
+by pointing instead of typing. It reads the running story's own grammar — every verb it
+actually accepts, alphabetically — and fills in object columns for what
+you can see and what you're carrying, live, as you play. Click a verb, then
+an object, and the words land on your prompt; **Enter** still sends
+whatever's actually written there, so nothing fires on its own except the
+one-click quick actions.
+
+Those quick actions draw as a compass rose when the band is wide enough, with
+the map's own portal glyphs — `↑` `◉` `◎` `↓` for up, in, out and down —
+clustered beside it. Each is a single click that submits at once, no `Enter`
+needed. Typing always wins over the band: letters and Backspace go straight
+to the prompt whether the band is open or not, and the band only claims
+column navigation (`Tab`/`Shift-Tab` to move between columns, `↑`/`↓` to
+highlight a row).
+
+The same bottom border cycles through to an inventory panel — a plain strip
+of what you're carrying — and an item there clicks onto the prompt exactly
+the way a command panel object does.
+
+## The word reveal
+
+Press the `◈` control (or `/reveal-words`) and every word already on screen
+that this story's parser would accept lights up for a few seconds, right
+over the prose, without moving a line of it. It's the answer to the oldest
+frustration in the genre — a room description names a dozen things and the
+game only implements two — and it's telling you what the *dictionary*
+knows, not a promise that any of it is within reach.
+
+The command panel carries the same idea as a running list: under what's
+actually here, dimmed, sit the nouns the story has *printed* this session —
+things a room describes rather than things it hands you directly. Newest
+first, and it keeps accumulating, so something named forty turns ago is
+still one click away.
+
+## Reading back
+
+**Left-drag** across the story pane selects transcript text; let go and it
+lands on your system clipboard, even over SSH — lanthorn copies through the
+terminal's own OSC 52 escape rather than a clipboard library, so it works
+wherever your terminal does. In an illustrated v6 game the two gestures share
+the pane and never collide: a plain click goes to the game — Zork Zero's
+banner compass, a hint topic — while a drag selects text, exactly as it does
+anywhere else.
+
+`/search-transcript <query>` highlights every match and jumps to the most
+recent; `n`/`N` step through the rest. `/filter-transcript` narrows the view
+to just the game's own output, just lanthorn's, or both. `/export-transcript`
+writes what's on screen out to a text file in the story's own save
+directory.
+
+### Recall something you have seen
+
+Use `/recall what can light a dark room` to search your playthrough by meaning
+as well as words. Exact names still matter: `/recall brass lantern` combines
+keyword ranking with sentence similarity. A panel shows the original passage;
+`n` selects the next ranked result, `N` the previous one, and arrows or
+PageUp/PageDown scroll the full excerpt. `Esc` closes the panel and leaves the
+transcript positioned at the source paragraph. A bare
+`/recall` repeats your last recall query. No command is sent to the game and no
+turn is spent.
+
+Recall searches the story text and player commands in the current transcript
+view. It excludes lanthorn's messages, assistance output, hidden game data and
+external walkthroughs. Command context is included when the transcript records
+it; unusual game prompts remain searchable as original text. Failed actions
+retain the game's refusal. Results are evidence of what happened, not
+instructions about what to do next.
+Restoring or restarting invalidates results, and a new search uses the restored
+transcript. It does not retain a separate history of abandoned timelines.
+
+The Docker image includes the pinned **all-MiniLM-L6-v2** model and loads it
+locally, including when the container has no network access. For native installs,
+the first query downloads the model (about 91 MB)
+from Hugging Face into `$XDG_CACHE_HOME/lanthorn/recall/` or
+`~/.cache/lanthorn/recall/` (`%LOCALAPPDATA%/lanthorn/recall/` on Windows).
+Model loading and search run in the background. Later searches use the cached
+model; the transcript and query stay on your machine. The vectors and keyword
+index are kept in memory for this session. A 384-component float vector uses
+1,536 bytes, so 10,000 vectors use about 15 MB, plus text/index storage and the
+model's own memory.
+
+For offline setup, set `LANTHORN_RECALL_MODEL_DIR` to a directory containing
+`config.json`, `tokenizer.json`, and `model.safetensors` from model revision
+`1110a243fdf4706b3f48f1d95db1a4f5529b4d41`. Files are checked against pinned
+SHA-256 digests. An explicit directory never downloads replacements. If the
+model cannot load, recall reports **keyword-only** results and explains why;
+it does not present that fallback as semantic search.
+
+Similarity is a ranking aid, not proof that a passage answers a question.
+Read the returned game text in context. The initial model is intended for
+English; lexical matching still helps with exact names in other languages.
+Indirect references can be missed: in Mini-Zork, "what was written on the
+paper" does not reliably find the leaflet text. Including the observed name,
+such as `leaflet`, helps. Recall does not generate an answer when it finds a
+similar passage; it shows the original text for you to judge.
+
+When a turn prints more than fits the pane — a long room description, a
+hint page — lanthorn stops at the first full screen with a `[MORE]` bar
+instead of scrolling straight past it, exactly like the original Infocom
+interpreters. Any key pages onward, and nothing reaches the game until
+you've caught up.
+
+## Keeping a transcript
+
+Many games have a `SCRIPT` command (`TRANSCRIPT` in some, `UNSCRIPT` or
+`NOSCRIPT` to stop). Type it and the story starts writing everything it
+prints — and everything you type — to `script.txt` in the game's own
+folder, alongside its saves. It's plain text: read it, mail it, diff two
+playthroughs, paste a puzzle into a hint request.
+
+Plenty of games offer no such command. `/set-transcript on` throws the same
+switch from lanthorn's side, and tells you which file it landed in;
+`/set-transcript off` stops it. Turning it on again later adds to the same
+file rather than starting over, so a game played across a week is one
+document.
+
+That's the *story's* transcript, and it's a different thing from
+`/export-transcript`, which writes out the scrollback in front of you —
+lanthorn's own lines and images included.
+
+And there's a third option, for following along rather than looking back:
+launch with `--transcript-file <path>` and lanthorn appends every line — the
+game's, your own typed commands, lanthorn's own warnings — to that file
+live, as it happens. It's built for accessibility tooling: point a screen
+reader or a second terminal's `tail -f` at the file and it reads each turn
+the moment it lands, engine-neutral across the Z-machine, Glulx and Scott
+Adams games alike (unlike `/set-transcript`, which is the Z-machine's own
+`SCRIPT` stream and only ever carries what the game itself chose to write).
+
+Games can also record the commands you type, to `commands.txt` in the same
+folder, and play a recorded file back in place of the keyboard. It's the
+format other interpreters use, so a script recorded elsewhere replays here.
+
+## Hints
+
+`/open-hints` lays a companion *InvisiClues* file over the story pane — its
+own topic menu on top, the clue text below, driven with the arrow keys and
+whatever it prompts for. lanthorn finds a hint file sitting beside the
+story automatically, or you can fetch one for free from the story picker
+before you even start playing (see [Getting started](getting-started.md)).
+
+## Going deeper
+
+The full key bindings and command list are in
+[keys](../reference/keys.md) and [commands](../reference/commands.md).
+Everything on the pane borders — what each glyph means, how the toggles
+remember your choices per game — is in
+[the interface notes](../internals/interface.md), and the Guiding Light's
+suggestions and the font-icon setup are in
+[customization](../internals/customization.md).

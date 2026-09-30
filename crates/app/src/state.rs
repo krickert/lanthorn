@@ -157,9 +157,73 @@ impl RoomDockView {
     }
 }
 
+// ── Side panel cycle (SQ-1237) ──────────────────────────────────────────────
+
+/// Which of the two mutually-exclusive panels the story pane's border control
+/// summons is open: the command panel, the inventory panel, or neither.
+///
+/// The two panels never show at once — opening one closes the other — so one
+/// value, not two independent booleans, describes the pair. `/cycle-panel`
+/// (and a click on the border control) walks [`SidePanel::next`]; the value is
+/// what the per-game sidecar persists (`styles::PerGameConfig::panel`), the
+/// same single mechanism the command band's on/off state already used before
+/// the inventory panel joined the cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidePanel {
+    Command,
+    Inventory,
+    None,
+}
+
+impl SidePanel {
+    /// The next state in the cycle: Command → Inventory → None → Command.
+    pub fn next(self) -> SidePanel {
+        match self {
+            SidePanel::Command => SidePanel::Inventory,
+            SidePanel::Inventory => SidePanel::None,
+            SidePanel::None => SidePanel::Command,
+        }
+    }
+
+    /// The sidecar's own spelling, read by [`SidePanel::from_key`].
+    pub fn key(self) -> &'static str {
+        match self {
+            SidePanel::Command => "command",
+            SidePanel::Inventory => "inventory",
+            SidePanel::None => "none",
+        }
+    }
+
+    /// Parse the sidecar's spelling. An unrecognised token is `None` — the same
+    /// "a corrupt sidecar inherits the default" rule every other per-game key
+    /// follows (`styles::PerGameConfig::read`).
+    pub fn from_key(s: &str) -> Option<SidePanel> {
+        match s {
+            "command" => Some(SidePanel::Command),
+            "inventory" => Some(SidePanel::Inventory),
+            "none" => Some(SidePanel::None),
+            _ => Option::None,
+        }
+    }
+}
+
 // ── Drag-pan state ────────────────────────────────────────────────────────────
 
-/// Middle-button drag-pan accumulator state.
+/// What a map press-release WITHOUT any drag motion should resolve to once the
+/// drag ends (SQ-1325) — the plain-click target, resolved once at Down and
+/// replayed by `EndDragPan` only when the pointer never moved in between.
+/// `Room` and `Empty` mirror exactly what the old unconditional
+/// `Down(Left) if in_map` arm used to decide immediately; deferring the
+/// decision to Up is what lets the SAME press turn into a drag-to-pan instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapClick {
+    /// The press landed on this room's box.
+    Room(RoomId),
+    /// The press landed on empty map space.
+    Empty,
+}
+
+/// Middle-button and left-button-on-map drag-pan accumulator state.
 #[derive(Debug, Clone, Copy)]
 pub struct DragState {
     /// Terminal cell position of the last drag event.
@@ -168,6 +232,53 @@ pub struct DragState {
     pub acc_x: i32,
     /// Sub-cell accumulator for y (in terminal rows).
     pub acc_y: i32,
+    /// Set once a `Drag` event has moved the pointer since `Down` (SQ-1325) —
+    /// distinguishes a plain click from a genuine drag-to-pan gesture. Always
+    /// `false` at rest between events; irrelevant to the middle-button pan,
+    /// which has no click meaning to defer.
+    pub moved: bool,
+    /// The deferred click target for a left-button map press (SQ-1325), or
+    /// `None` for the middle-button pan (which is never a click).
+    pub map_click: Option<MapClick>,
+}
+
+// ── Deferred v6 game click (SQ-1378) ──────────────────────────────────────────
+
+/// Which read a deferred v6 click was recorded against (SQ-1378), and therefore
+/// how it must be delivered when the button comes up. Kept with the click rather
+/// than re-derived at the release, so a read that has moved on in between is
+/// visible as a mismatch instead of being answered with the wrong call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V6ClickRead {
+    /// `read_char` was pending: deliver ZSCII 254 (ZMSD §3.8) with `submit_char`.
+    Char,
+    /// A LINE read whose terminating-characters table accepts a click (SQ-0566):
+    /// deliver whatever is typed with this terminator.
+    Line { terminator: u8 },
+}
+
+/// A left-press inside the drawn v6 image that the GAME may want — held from the
+/// Down until the release (SQ-1378), exactly as [`DragState::map_click`] holds a
+/// map click.
+///
+/// SQ-0566 delivers a click to the VM the instant the button goes down, so that
+/// Zork Zero's border compass works during ordinary play. But `map_click` covers
+/// the story text as well as the artwork, so on Zork Zero, Shogun and Arthur
+/// EVERY press in the pane ended the line read as a click and `StartSelection`
+/// never ran: mouse text selection did nothing at all in a v6 game. Deferring the
+/// delivery to the Up lets the same press be either gesture — a drag cancels the
+/// click and selects text; a release with no motion in between delivers the click
+/// to the VM exactly as the Down used to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingV6Click {
+    /// The click's GAME pixel (x, y), from `V6ClickMap::map_click`. Reported to
+    /// the engine y-first (`set_mouse(y, x)`, ZMSD §11).
+    pub game_px: (u16, u16),
+    /// The terminal cell the press landed on — the gesture's anchor, kept so a
+    /// release somewhere else is still recognisably the same press.
+    pub cell: (u16, u16),
+    /// The read this click was recorded against.
+    pub read: V6ClickRead,
 }
 
 // ── Command band state ────────────────────────────────────────────────────────
@@ -272,6 +383,10 @@ pub struct CommandBandState {
     /// there is; without this a story with no readable grammar would re-ask on
     /// every tick forever. (`render::command_band::refresh_verbs`.)
     pub verbs_read: bool,
+    /// The `turn_epoch` the story's column was last RANKED at (SQ-1554). The
+    /// grammar is static, but which verbs the player has typed is not, so a
+    /// story column is re-tiered once per turn — never per tick.
+    pub verbs_epoch: Option<u64>,
     /// The one-click quick-action row.
     pub quick: Vec<String>,
     /// Tokens picked so far, in order.
@@ -382,7 +497,9 @@ impl CommandBandState {
     /// The table entry for `word`, matched case-insensitively (the player types
     /// the prompt now, and `Take` is the same verb as `take`).
     pub fn verb_by_word(&self, word: &str) -> Option<&VerbEntry> {
-        self.verbs.iter().find(|v| v.word.eq_ignore_ascii_case(word))
+        // A row's folded synonyms name it too (SQ-1554): `carry` is the `take`
+        // row's, and typing it must open the same columns.
+        self.verbs.iter().find(|v| v.answers_to(word))
     }
 
     /// The picked verb's table entry (grammar for everything downstream).
@@ -649,8 +766,17 @@ impl CommandBandState {
         let (max_nouns, joiners) = (entry.max_nouns(), entry.joiners());
         // Store the TABLE's spelling, so downstream lookups (`prep`,
         // `max_nouns`) and `phrase_text` are canonical regardless of how it was
-        // typed.
-        let mut picks = vec![BandPick { slot: BandSlot::Verb, text: entry.word.clone() }];
+        // typed — unless the player typed one of the row's folded SYNONYMS
+        // (SQ-1554). That word stays: `phrase_text` must still end the prompt
+        // the player wrote, or a click appends `take` after their `carry`
+        // instead of replacing the phrase, and the synonym resolves to the
+        // same row anyway.
+        let verb_text = if entry.word.eq_ignore_ascii_case(toks[vi]) {
+            entry.word.clone()
+        } else {
+            toks[vi].to_string()
+        };
+        let mut picks = vec![BandPick { slot: BandSlot::Verb, text: verb_text }];
         let rest = &toks[vi + 1..];
         let push = |picks: &mut Vec<BandPick>, slot, text: String| {
             if !text.is_empty() {
@@ -952,6 +1078,50 @@ pub enum TranscriptKind {
     Assist,
 }
 
+// ── Live transcript file sink (SQ-0410) ────────────────────────────────────────
+
+/// An open `--transcript-file` destination: the app's own engine-neutral
+/// transcript, appended to as it is played, for accessibility tooling (a screen
+/// reader, or a second terminal running `tail -f`).
+///
+/// Distinct from two things that sound similar and are not this:
+/// - `/set-transcript` (Z-machine output stream 2) is the STORY's own
+///   transcript, Z-machine only, and records only what the game chooses to
+///   write to it — a game that turns the stream off stops being logged.
+/// - `/export-transcript` writes the visible transcript once, on request.
+///
+/// This sink is engine-neutral (it hooks the app's transcript, not an engine
+/// stream) and live (it grows every turn, for every engine).
+#[derive(Debug)]
+pub(crate) struct TranscriptSink {
+    file: std::fs::File,
+    /// Whether an entry has been written yet — the first one gets no leading
+    /// blank line.
+    wrote_any: bool,
+}
+
+impl TranscriptSink {
+    fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self { file, wrote_any: false })
+    }
+
+    /// Write one entry and flush. A blank line separates it from what came
+    /// before when `kind` is [`TranscriptKind::Input`] — the player's command,
+    /// which is what opens a turn in this stream — so `tail -f` reads as one
+    /// paragraph block per turn rather than one block per transcript push.
+    fn write_entry(&mut self, text: &str, kind: TranscriptKind) -> std::io::Result<()> {
+        use std::io::Write;
+        if self.wrote_any && matches!(kind, TranscriptKind::Input) {
+            writeln!(self.file)?;
+        }
+        writeln!(self.file, "{text}")?;
+        self.file.flush()?;
+        self.wrote_any = true;
+        Ok(())
+    }
+}
+
 /// Push a turn's ordered elements into the transcript: text runs via
 /// `push_transcript_runs`, images via `push_transcript_image`, in order. The
 /// Glulx run-loop path uses this when a `TurnResult` carries interleaved inline
@@ -1033,6 +1203,7 @@ pub fn pack_zcolour(c: zvm::screen::ZColour) -> u32 {
         ZColour::Standard(n) => (1 << 24) | n as u32,
         ZColour::True(v)    => (2 << 24) | v as u32,
         ZColour::True24(v)  => (3 << 24) | (v & 0x00FF_FFFF),
+        _ => 0,
     }
 }
 
@@ -1277,10 +1448,40 @@ pub enum TranscriptEdit {
     /// wrapped rows for `[..old_len]` are still exactly right, so the cache wraps
     /// the new lines and appends them.
     Appended,
-    /// An existing line was edited, inserted before, merged, removed, truncated
-    /// away, or the whole buffer was replaced. Everything wrapped so far is
-    /// suspect; the cache rebuilds.
+    /// An existing line was edited, merged, removed, truncated away, or the
+    /// whole buffer was replaced. Everything wrapped so far is suspect; the
+    /// cache rebuilds.
     Rewrote,
+    /// `count` lines were inserted starting at raw transcript index `at`,
+    /// pushing everything from `at` onward later without touching it —
+    /// `push_transcript_internal`/`_styled`'s insert-above-the-prompt
+    /// (SQ-0270), the only mutator that does this. Distinct from `Rewrote`
+    /// because the wrap cache can REPAIR through it (SQ-1179): re-wrap only
+    /// the disturbed tail rather than rebuild from line zero, since every line
+    /// before `at` provably did not move. See
+    /// [`crate::render::wrap_cache::WrapKey::plan`].
+    Inserted { at: usize, count: usize },
+}
+
+/// One unbroken run of [`TranscriptEdit::Inserted`] edits since the last
+/// opaque [`TranscriptEdit::Rewrote`] (SQ-1179).
+///
+/// `min_at` only ever needs to be the SMALLEST `at` seen: within an unbroken
+/// run the transcript only grows (an opaque rewrite — the only thing that can
+/// shrink or otherwise disturb it — resets the run), so every later insert's
+/// `at` is at or past the run's start. That means the earliest one is also the
+/// only one the wrap cache needs to compare against its own `content.len` —
+/// see `WrapKey::plan`, which resumes any repair from there regardless of how
+/// many inserts or plain appends followed it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TailInsertRun {
+    /// `transcript_edits` value the run started from — i.e. right after the
+    /// last opaque rewrite. A repair is only offered when this matches the
+    /// wrap cache's OWN synced `content.edits`; otherwise some rewrite the run
+    /// doesn't account for happened after the cache was last built.
+    pub since_edits: u64,
+    /// Smallest raw transcript index any insert in this run targeted.
+    pub min_at: usize,
 }
 
 // ── Transcript filter ─────────────────────────────────────────────────────────
@@ -1295,6 +1496,22 @@ pub enum TranscriptFilter {
     Both,
     Story,
     Meta,
+}
+
+/// Does `kind` pass `filter`? The one predicate
+/// [`AppState::visible_transcript_indices_from`] filters the transcript with,
+/// pulled out so the wrap cache's SQ-1179 repair can ask the same question of
+/// a single line (whether the transcript's cached tail passed the filter at
+/// its last sync) without re-deriving the rule.
+pub(crate) fn transcript_filter_matches(filter: TranscriptFilter, kind: TranscriptKind) -> bool {
+    match filter {
+        TranscriptFilter::Both => true,
+        TranscriptFilter::Story => matches!(kind, TranscriptKind::Story | TranscriptKind::Input),
+        // Assist joins the META bucket, not the story one: `/filter story` is
+        // the player asking for 1982, and an assist is exactly what 1982 did
+        // not have (SQ-1045).
+        TranscriptFilter::Meta => matches!(kind, TranscriptKind::Meta | TranscriptKind::Warning | TranscriptKind::Assist),
+    }
 }
 
 // ── Tidy animation ────────────────────────────────────────────────────────────
@@ -1455,6 +1672,22 @@ pub struct SoundPulse {
 /// `to` over the tween. Driven by the run loop, which snaps to `to` and clears
 /// this once the tween is `done()`. The single animated-offset type, reused by
 /// the transcript and by `ListScroll`.
+/// Which rule armed a [`ScrollAnim`] (SQ-1597) — so a host driving its own copy
+/// of the ease (e.g. a raster host that draws the story pane itself) can run
+/// the SAME ease the library decided on, instead of re-deriving SQ-1595's own
+/// "when does a follow apply" rule (at bottom, clamped to `[more]`, cancelled
+/// by input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAnimKind {
+    /// An ordinary, reader-driven scroll — wheel, page/half-page keys, the
+    /// `[more]` pager's own advance/dismiss, selection-drag autoscroll, or a
+    /// `HintSession` scroll — timed off `config.animation.scroll_ms`.
+    Scroll,
+    /// New output arriving while the reader was already at the bottom
+    /// (SQ-1595) — timed off `config.animation.follow_ms` instead.
+    Follow,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScrollAnim {
     /// Displayed offset (rows) when the animation was armed.
@@ -1463,22 +1696,38 @@ pub struct ScrollAnim {
     pub to: usize,
     /// The timing curve.
     pub tween: crate::anim::Tween,
+    /// Which rule armed this animation (SQ-1597).
+    pub kind: ScrollAnimKind,
 }
 
 impl ScrollAnim {
     /// Arm an animation easing the displayed offset from `from` to `to` per the
     /// `[animation]` config. Returns `None` when animation is disabled or
     /// `scroll_ms == 0` (the caller should jump instantly and clear any anim) —
-    /// the byte-for-byte instant path.
+    /// the byte-for-byte instant path. Always tags [`ScrollAnimKind::Scroll`] —
+    /// every caller of `to` (the transcript's reader-driven scroll, `ListScroll`,
+    /// the hint panel) is an ordinary scroll, never a follow.
     pub fn to(from: usize, to: usize, cfg: &crate::config::AnimationConfig) -> Option<Self> {
-        if !cfg.enabled || cfg.scroll_ms == 0 {
+        Self::over(from, to, cfg.enabled, cfg.scroll_ms, cfg.easing, ScrollAnimKind::Scroll)
+    }
+
+    /// Same as [`Self::to`], but with an explicit duration and an explicit
+    /// [`ScrollAnimKind`] instead of always reading `cfg.scroll_ms` and tagging
+    /// `Scroll` — used by the transcript follow-ease (SQ-1595), which times off
+    /// `cfg.follow_ms` while still honoring the master switch and the shared
+    /// easing curve.
+    pub fn over(
+        from: usize,
+        to: usize,
+        enabled: bool,
+        ms: u64,
+        easing: crate::anim::Easing,
+        kind: ScrollAnimKind,
+    ) -> Option<Self> {
+        if !enabled || ms == 0 {
             return None;
         }
-        Some(Self {
-            from,
-            to,
-            tween: crate::anim::Tween::new(Duration::from_millis(cfg.scroll_ms), cfg.easing),
-        })
+        Some(Self { from, to, tween: crate::anim::Tween::new(Duration::from_millis(ms), easing), kind })
     }
 
     /// The current displayed offset: `lerp(from, to, tween.progress())`.
@@ -1929,10 +2178,10 @@ impl RegionPrompt {
         self.options.len() + self.buttons()
     }
 
-    /// How many buttons this prompt shows — three outcomes for a suggestion, Move/Cancel for a
-    /// pick.
+    /// How many buttons this prompt shows — four declining outcomes for a suggestion (SQ-1298:
+    /// Not now / Not this passage / Never for this story, plus Separate), Move/Cancel for a pick.
     pub fn buttons(&self) -> usize {
-        if matches!(self.kind, RegionPromptKind::Suggest { .. }) { 3 } else { 2 }
+        if matches!(self.kind, RegionPromptKind::Suggest { .. }) { 4 } else { 2 }
     }
 
     /// The chosen option, or `None` when the list is somehow empty.
@@ -1949,8 +2198,12 @@ pub enum RegionPromptAct {
     /// Put it off: re-arm this seam for the next crossing. Also what Esc means on a suggestion,
     /// because declining to answer is not the same as saying no.
     Defer,
-    /// Never ask about this passage again.
+    /// Never ask about this passage again. Labelled "Not this passage" in the prompt (SQ-1298) —
+    /// the variant name stays, only the wording changed.
     Never,
+    /// "Never for this story" (SQ-1298): stop the layer-suggestion prompt entirely on this map,
+    /// every trigger and every passage, not just the one that was open.
+    NeverForStory,
     /// Close a manual pick without moving anything.
     Dismiss,
 }
@@ -2116,6 +2369,20 @@ pub enum ExitTarget {
     Library,
 }
 
+impl ExitTarget {
+    /// The target a launch resolves to absent any other signal: `Library` when a
+    /// picker exists to return to, `Exit` otherwise. Every way a run can end —
+    /// the game's own quit, the player's `quit` command, Ctrl-Q — shares this
+    /// answer, since a story reached through the list always goes back to the
+    /// list; the CLI's single-file launch has no list to return to, so it always
+    /// leaves lanthorn (SQ-1258). Set once at boot and restored whenever a quit
+    /// intent (`quit_dialog` cancel) is abandoned, so nothing has to remember to
+    /// pick `Exit` by hand at each of those sites.
+    pub fn for_launch(launched_from_library: bool) -> ExitTarget {
+        if launched_from_library { ExitTarget::Library } else { ExitTarget::Exit }
+    }
+}
+
 /// Percentage-based pane sizes, seeded from `Config` at startup and mirrored
 /// here for the layout code to consume. `config` stays the persisted source
 /// of truth; this is the runtime-facing copy.
@@ -2192,12 +2459,13 @@ pub type LoadedTranscript = Option<(
 /// viewed layer. `render_layer` re-runs chain detection + edge routing every call,
 /// so re-doing it on an animation / transcript / mouse-move redraw of an otherwise
 /// unchanged map is pure waste. The live graph only changes on a turn / tidy apply /
-/// map edit — each bumps `graph_gen` — so an unchanged `(gen, layer)` reuses this.
-/// Only the live map is cached; replay and tidy-animation graphs are not tracked by
-/// `graph_gen` and are rebuilt per frame (see `AppState::cached_map_render`). (SQ-0305)
+/// map edit — each bumps [`mapper::mapper::Mapper::struct_gen`] (SQ-1540) — so an
+/// unchanged `(gen, layer)` reuses this. Only the live map is cached; replay and
+/// tidy-animation graphs are not tracked by `struct_gen` and are rebuilt per frame
+/// (see `AppState::cached_map_render`). (SQ-0305, SQ-1544)
 #[derive(Debug)]
 pub(crate) struct MapRenderCache {
-    /// Graph generation (`AppState::graph_gen`) this model was routed for.
+    /// The live graph's [`mapper::mapper::Mapper::struct_gen`] this model was routed for.
     pub gen: u64,
     /// Viewed layer this model was routed for.
     pub layer: LayerId,
@@ -2275,6 +2543,12 @@ pub struct OverlayState {
     /// `startup::ask_font_check`, and both drive the same
     /// `render::font_check_dialog`.
     pub font_check: bool,
+    /// `None` while the font check is showing stage one (the icon glyphs, or
+    /// not open at all); `Some(nerdfont)` once stage one is answered and the
+    /// check has moved on to stage two, the diagonal corner stubs (SQ-1245) —
+    /// carrying stage one's answer until stage two closes and both are written
+    /// together. Reset to `None` whenever `font_check` closes.
+    pub font_check_icon_answer: Option<bool>,
     /// When true, the first-use aux-storage prompt is open.
     pub aux_prompt: bool,
     /// When true, the "Save state before quitting?" confirmation dialog is open.
@@ -2290,6 +2564,11 @@ pub struct OverlayState {
     /// Index of the currently focused button in an open modal dialog. Reset to
     /// a button index when a modal opens; cycled by Tab/Shift-Tab.
     pub dialog_focus: usize,
+    /// The room panel's right-click context menu (SQ-1265), or `None` when
+    /// closed. Opened by `Action::OpenRoomMenu`, which also pins the dock on
+    /// the same room — the menu and the panel underneath always agree on
+    /// which room is meant.
+    pub room_menu: Option<crate::room_menu::RoomMenu>,
 }
 
 /// Where the last v6 frame put one thing on the terminal, for `/dump-windows`
@@ -2368,6 +2647,26 @@ pub struct AppState {
     /// persisted: a restore into a fresh run should introduce the voice again,
     /// because the player of that run may never have seen it.
     pub assist_preamble_shown: bool,
+    /// The structured half of the last assist [`push_assist`](Self::push_assist)
+    /// pushed, if guidance is on (SQ-1552) — what a headless host needs to build
+    /// UI for it (clickable offered words) without re-deriving the shape by
+    /// parsing the transcript text. Reset to `None` at the head of every turn
+    /// ([`Self::begin_turn`]), the same way [`Self::reveal`] is: an answer about
+    /// one moment, stale the moment the next one starts. Session state, never
+    /// persisted, for the same reason.
+    pub assist_offer: Option<crate::assist::Offer>,
+    /// The transcript line [`push_assist`](Self::push_assist) printed the
+    /// once-per-session intro block onto THIS call, if any (SQ-1557) — the
+    /// host-visible signal that identifies the intro structurally instead of
+    /// matching a line's text against [`crate::assist::preamble`], which
+    /// silently breaks the moment the wording or gutter mark changes. `None`
+    /// on a call that didn't print the intro (already shown this session, or
+    /// guidance off) and on every call before the first. Reset at the head of
+    /// every turn ([`Self::begin_turn`]), the same way [`Self::assist_offer`]
+    /// is — an answer about one call, stale the moment the next turn starts.
+    /// See [`Self::assist_intro_offer`] for the structured
+    /// [`crate::assist::OfferKind::Intro`] this line carries.
+    pub assist_intro_line: Option<usize>,
     /// The story's own vocabulary, and which unknown words this session has
     /// already answered (SQ-1041). Read from the engine the first time an offer
     /// is considered and cached — the tables are static — and deliberately not
@@ -2395,6 +2694,40 @@ pub struct AppState {
     /// a new move ends whatever was in flight, because the move may itself be the
     /// walk back. See [`crate::return_probe`].
     pub return_search: Option<crate::return_probe::ReturnSearch>,
+    /// A Phase-2 randomness search running right now, if any (SQ-1257): after a move Phase 1
+    /// could not classify statically (`DeclaredExit::Absent`/`Code`), a reseeded shadow walk
+    /// asked whether the story is deciding this direction at random. Session state, never
+    /// persisted — what it LEARNS is persisted, as [`mapper::graph::MapGraph::mark_random_exit`]
+    /// or nothing at all. At most one, like [`Self::return_search`].
+    pub random_exit_search: Option<crate::random_exit_probe::RandomExitSearch>,
+    /// The engine snapshot from the END of the previous turn, and the room it was taken in
+    /// (SQ-1257 Phase 2) — the moment just before whatever command produced THIS turn's move was
+    /// typed, which is the state a Phase-2 probe has to restart from to ask "what if the story
+    /// rolled different dice here". Kept only for an engine [`crate::engine::Engine::rng_seed`]
+    /// answers `Some` for (Z-machine today); `None` for every other engine and for a session that
+    /// has not finished a turn yet. The room is the correctness guard: a stale snapshot from
+    /// before a restore/reset is useless data about a room the player is not standing in any
+    /// more, and is discarded rather than trusted the moment it disagrees with the room this
+    /// turn's move was actually taken from.
+    pub random_exit_pre_move_save:
+        Option<(mapper::graph::RoomId, std::sync::Arc<crate::engine::EngineSave>)>,
+    /// How many Upgrade answers IN A ROW have agreed with the live landing for one marked
+    /// direction (SQ-1370) — `(room, direction, count)`, the streak the mark is currently being
+    /// judged on, or `None` when nothing is being counted.
+    ///
+    /// A re-walk of a random direction with two destinations comes back "both reseeded attempts
+    /// agree" one time in four by pure luck, and the user reported exactly what that looks like
+    /// from the outside: play a forest whose pool has only ever named one room, get the same
+    /// forest a few times running, and watch the `?` turn back into an arrow. So an upgrade a
+    /// pool cannot outweigh (see `random_exit_probe::deliver_upgrade`) is no longer acted on the
+    /// first time — it has to happen on [`crate::random_exit_probe::AGREEING_WALKS_TO_UPGRADE`]
+    /// consecutive walks, which for a two-destination exit is one chance in sixty-four, and any
+    /// disagreement in between both resets this and pools a second room.
+    ///
+    /// One slot rather than a table, and session state, never persisted: this counts consecutive
+    /// evidence, and every way of losing it — walking a different marked direction, a restore, a
+    /// restart — resolves the same conservative way, by leaving the `?` in place.
+    pub random_exit_agreements: Option<(mapper::graph::RoomId, mapper::direction::Direction, u8)>,
     /// A vocabulary offer that has been asked of the shadow and not yet answered
     /// (SQ-1124). At most one: a second question while this is outstanding is not
     /// asked at all, and that offer falls back to what it can say unvetted.
@@ -2450,12 +2783,21 @@ pub struct AppState {
     /// transcript wrap cache. (SQ-0305)
     pub transcript_gen: u64,
     /// Monotonic count of transcript mutations that were NOT pure appends —
-    /// every [`TranscriptEdit::Rewrote`] (in-place edit, insert-above-prompt,
-    /// merge, truncate, wholesale replacement). `transcript_gen` moves on every
-    /// mutation and so can only say "something changed"; this says "something
-    /// that was already WRAPPED changed", which is the difference between the
-    /// wrap cache appending and rebuilding. (SQ-1034)
+    /// every [`TranscriptEdit::Rewrote`] or [`TranscriptEdit::Inserted`]
+    /// (in-place edit, insert-above-prompt, merge, truncate, wholesale
+    /// replacement). `transcript_gen` moves on every mutation and so can only
+    /// say "something changed"; this says "something that was already WRAPPED
+    /// changed", which is the difference between the wrap cache appending and
+    /// rebuilding. (SQ-1034)
     pub transcript_edits: u64,
+    /// The current unbroken run of [`TranscriptEdit::Inserted`] edits, if any
+    /// (SQ-1179) — what lets the wrap cache REPAIR through an
+    /// insert-above-the-prompt instead of rebuilding. A `Cell` because the
+    /// render path only holds `&AppState`: it clears this once a sync (of
+    /// whichever kind) has caught the wrap cache up to the current
+    /// `transcript_edits`, so the NEXT insert starts a fresh run correctly
+    /// anchored at that new baseline rather than extending a stale one.
+    pub(crate) transcript_tail_insert: std::cell::Cell<Option<TailInsertRun>>,
     /// Cache of the fully wrapped transcript rows, keyed by
     /// [`crate::render::wrap_cache::WrapKey`],
     /// so an unchanged transcript (idle redraw / scroll) is not re-wrapped and the
@@ -2483,7 +2825,7 @@ pub struct AppState {
     pub(crate) map_derived:
         std::cell::RefCell<Option<(u64, LayerId, crate::render::map::MapDerived)>>,
     /// In-flight background map-render job (SQ-0379): rebuilds `map_render` for a
-    /// new `(graph_gen, layer)` off the main thread so a re-route never blocks the
+    /// new `(struct_gen, layer)` off the main thread so a re-route never blocks the
     /// interpreter. `RefCell` so it can be spawned from within the draw closure
     /// (which holds only `&self`); polled/installed from the loop body.
     pub(crate) render_job: std::cell::RefCell<Option<RenderJob>>,
@@ -2563,9 +2905,14 @@ pub struct AppState {
     pub anim_build_job: Option<AnimBuildJob>,
     /// In-flight one-shot story-border flash, if any. Armed by a beep event; expires after SOUND_PULSE_MS.
     pub sound_pulse: Option<SoundPulse>,
-    /// Host audio backend, present when audio was enabled at launch. `None` when
-    /// disabled or when construction was skipped.
-    pub audio: Option<audio::AudioBackend>,
+    /// Where this story's sounds go (SQ-1538): the host's [`SoundSink`]. `None`
+    /// until the first sound actually plays, when the TUI opens its output device
+    /// ([`default_sound_sink`], SQ-1423); a host that delivers sound elsewhere
+    /// installs its own sink here before the first turn, and it is never replaced.
+    ///
+    /// [`SoundSink`]: crate::host::sound::SoundSink
+    /// [`default_sound_sink`]: crate::host::sound::default_sound_sink
+    pub audio: Option<Box<dyn crate::host::sound::SoundSink>>,
     /// The Blorb holding this story's `Snd ` resources, resolved at launch.
     pub sound_blorb: Option<blorb::Blorb>,
     /// Sounds the story's own MEDIUM carries, by effect number (SQ-0907). Populated
@@ -2612,9 +2959,15 @@ pub struct AppState {
     /// the bar has never been shown. New game text deliberately does NOT set
     /// this: the bar would flash on every turn.
     pub scrollbar_shown_at: Option<Instant>,
-    /// Monotonically increasing generation counter. Bumped each time the real graph is mutated
-    /// by an applied turn. Used to detect stale tidy results (job's gen vs current gen).
-    pub graph_gen: u64,
+    /// When the transcript viewport last moved — wheel, `PageUp`/`PageDown`, or a
+    /// selection auto-scroll at an edge, all funneled through
+    /// [`AppState::scroll_transcript_to`] exactly like `scrollbar_shown_at` above.
+    /// Used only to gate the sixel-backend scroll-settle debounce (SQ-1198): while
+    /// [`AppState::transcript_scroll_in_motion`] reads true, an inline sixel image
+    /// renders as a background-filled footprint instead of re-emitting its full
+    /// payload, so a scroll past it does not re-send hundreds of KB per step.
+    /// `None` = never scrolled this session.
+    pub sixel_scroll_motion_at: Option<Instant>,
     /// Explicit layer override for the map view. `None` means follow the current room's layer.
     pub viewed_layer: Option<LayerId>,
     /// Which body the room dock draws (SQ-0692). Meaningful only while
@@ -2623,6 +2976,11 @@ pub struct AppState {
     pub room_dock_view: RoomDockView,
     /// Middle-button drag-pan state. `Some` while a drag gesture is in progress.
     pub drag: Option<DragState>,
+    /// A left-press over the drawn v6 image that the game may want (SQ-1378).
+    /// `Some` between that Down and whatever ends the gesture — a drag (which
+    /// makes it a text selection instead), the release (which delivers it), or
+    /// any non-mouse event.
+    pub pending_v6_click: Option<PendingV6Click>,
     /// Story-pane text selection (left-drag). `Some` while selecting; the
     /// highlight is shown during the drag and copied on release.
     pub selection: Option<crate::clipboard::Selection>,
@@ -2988,8 +3346,25 @@ pub struct AppState {
     /// from `Moved` events and never claims one, because typing always wins.
     pub control_hover: Option<crate::render::controls::BorderControl>,
 
+    /// The matrix-view room the pointer is on, if any (SQ-1246), paired with
+    /// the exact rect it was found under — a row label or a destination cell.
+    /// Set from `Moved` events, only while the active layer is drawn as a
+    /// matrix; the drawn map view has no equivalent and must not populate
+    /// this. Carrying the rect alongside the room (rather than re-resolving
+    /// it against a fresh hit-list at draw time, as `control_hover` does)
+    /// sidesteps the ambiguity a `BorderControl` never has: one room can be
+    /// the destination of several cells, so an id alone would not say which
+    /// occurrence the pointer was actually over.
+    pub matrix_hover: Option<(RoomId, ratatui::layout::Rect)>,
 
-
+    /// The room-box marker the pointer is on, if any (SQ-1273): the alias-count superscript or
+    /// a `?` random-exit stub, paired with its kind and the exact rect it was found under —
+    /// `render::map::MapHits::marker_rects` from the last drawn frame. Set from `Moved` events
+    /// only at Boxes zoom (the only zoom that draws a marker at all); the matrix and drawn-only
+    /// hovers below never populate this and it never populates them. Same reasoning as
+    /// `matrix_hover` for carrying the rect alongside the id: one room can own more than one
+    /// marker (an alias count AND a `?` stub), so the id alone would not say which.
+    pub map_hover: Option<(RoomId, crate::render::map::MarkerKind, ratatui::layout::Rect)>,
 
     /// Session turn counter; incremented on each non-empty `SubmitCommand`.
     /// Written into `Meta` on every save (quick-save and named).
@@ -3139,6 +3514,14 @@ pub struct AppState {
     /// title/hint lookup. Empty until set.
     pub ifid: String,
 
+    /// Which physical copy of this story's release this session was booted
+    /// from — the file (and disk-image entry/machine, if any), set once at
+    /// startup alongside `ifid` (SQ-1633). Informational only, for display
+    /// (e.g. "Continue on the Amiga version"): `storage::game_dir`'s
+    /// IFID-keyed grouping of every copy of one release into a single shared
+    /// save folder, and which slot a boot resumes from, never read this.
+    pub source: crate::archive::SaveSource,
+
     /// The per-game storage directory (`<data_base>/<story-key>.save/`) holding
     /// this story's saves and sidecars, including the per-game `style.toml` and
     /// `config.toml` overrides. Set once at startup; empty until then (no
@@ -3155,8 +3538,29 @@ pub struct AppState {
     /// Last parsed output from an inventory command (parse fallback when player_obj
     /// is not yet locked).
     pub inventory_fallback: Vec<String>,
+    /// The word a click on each inventory dock row composes into the prompt,
+    /// in the SAME order as the dock's own display list
+    /// (`render::transcript::inventory_items`) — refreshed once per loop tick
+    /// by `render::inventory_dock::refresh_inventory_click_words` (SQ-1244).
+    /// Empty whenever the panel is neither shown nor sliding.
+    pub inventory_click_words: Vec<String>,
+    /// An active `filter-items` query (SQ-1630), or `None` to show every
+    /// tracked item. Applied by `render::inventory_dock::build_inventory_dock_rows`
+    /// to both the "Carrying" and "Elsewhere" sections independently.
+    pub inv_dock_filter: Option<String>,
+    /// The inventory dock's own [`crate::list_scroll::ListScroll`] (SQ-1630) —
+    /// the dock's counterpart to [`Self::room_dock_info_scroll`]. One scroll,
+    /// not two, since the dock has a single body (unlike the room dock's two
+    /// tabs); `selected`/keyboard nav are never driven (the dock has no
+    /// keyboard focus), only [`crate::list_scroll::ListScroll::scroll_by`],
+    /// from the wheel.
+    pub inv_dock_scroll: crate::list_scroll::ListScroll,
+    /// The dock's viewport height (rows) as of the last render, so a wheel
+    /// action between frames has something to clamp `scroll_by` against —
+    /// the dock's own analogue of [`Self::room_dock_body_viewport`].
+    pub inv_dock_body_viewport: u16,
     /// The player's previous room (global 0 value from the previous turn).
-    pub prev_location: Option<u16>,
+    pub prev_location: Option<mapper::graph::RoomId>,
     /// Objects whose parent was prev_location at the end of the previous turn.
     pub prev_objects_here: std::collections::BTreeSet<u16>,
 
@@ -3198,10 +3602,39 @@ pub struct AppState {
 
     /// The active search query, if any. `None` means no search is active.
     pub search_query: Option<String>,
+    /// The literal search to repeat if recall temporarily occupies the search
+    /// controls. Recall never becomes `/search-transcript`'s previous query.
+    pub search_last_literal_query: Option<String>,
     /// Positions (0-based) within the visible-index list of lines that match the query.
     pub search_matches: Vec<usize>,
     /// Index into `search_matches` of the current match.
     pub search_idx: usize,
+    /// True while the search controls are showing ranked recall passages.
+    /// The renderer uses this to mark the selected passage without requiring
+    /// literal query words to appear in a semantic match.
+    pub recall_mode: bool,
+    /// A recall is pending while its worker loads/indexes the model and ranks.
+    pub recall_pending_id: Option<u64>,
+    /// Last recall query, kept after Esc for bare `/recall`.
+    pub recall_last_query: Option<String>,
+    /// Excerpts in exactly the same rank order as `search_matches`.
+    pub recall_excerpts: Vec<String>,
+    /// First visible row of the selected recall excerpt's preview panel.
+    pub recall_preview_scroll: usize,
+    /// The exact area used to paint the recall panel in the latest frame.
+    /// Kept outside pane layout because graphics can reduce the dialog area.
+    pub recall_panel_area: std::cell::Cell<ratatui::layout::Rect>,
+    /// Kept while navigating so a model failure remains visible after the
+    /// first result notification has expired.
+    pub recall_keyword_only_reason: Option<String>,
+    /// The worker had no searchable passage or query; no model ran.
+    pub recall_empty: bool,
+    /// Cheap guard against a result landing after transcript edits or appends.
+    pub recall_scope_edits: u64,
+    pub recall_scope_len: usize,
+    pub recall_scope_game_dir: std::path::PathBuf,
+    /// Lazily starts the model worker on the first recall request.
+    pub recall_worker: crate::recall::RecallWorker,
 
     // ── Dialog focus state ────────────────────────────────────────────────────
 
@@ -3247,6 +3680,79 @@ pub struct AppState {
 
     /// The in-game graphics Picker (None when images are disabled or unbuilt).
     pub game_picker: Option<ratatui_image::picker::Picker>,
+    /// Whether `game_picker`'s LAUNCH-time build got any answer at all from a
+    /// real stdio query (SQ-1511). `false` when `--image-protocol halfblocks`
+    /// forced a picker that never queried (`Picker::halfblocks()` touches no
+    /// stdio) and `false` when a query ran but the terminal answered nothing —
+    /// both read the same way here, and both mean a later resize's requery
+    /// would only pay a stdio round trip (up to the query's own timeout) for
+    /// the same nothing. Set once at launch (`startup.rs`) and never revised
+    /// afterward — see `loop_tick::poll_picker_requery`, the only reader.
+    pub game_picker_query_answered: bool,
+    /// The host's own stated Glk cell pixel size, carried from
+    /// `TerminalFacts::glk_cell_px` (SQ-1598) — `None` when the host left the
+    /// `game_picker`/8×16 cascade to decide. Not itself read for anything past
+    /// boot; kept so an `@restart` (`host::reset`) re-derives the SAME Glulx
+    /// `char_px` the launch used rather than silently reverting to the
+    /// picker/8×16 fallback, mirroring why `game_picker` above is carried the
+    /// same way.
+    ///
+    /// Fractional (SQ-1603): a host's real text cell is not always a whole
+    /// device pixel (e.g. 10.2×22.95 at a 17px font), and rounding it to an
+    /// integer HERE — before it ever reaches a graphics window — would force
+    /// every window's canvas to share one pre-rounded ratio, drifting further
+    /// from the host's true cell the more windows of different sizes a game
+    /// opens. The fractional value is carried as-is all the way to
+    /// [`crate::glk_backend::AppGlk::canvas_size`], which multiplies and
+    /// rounds PER WINDOW; only `AppGlk`'s `GlkBackend::char_pixels` impl (the
+    /// boundary a game's own bytecode can observe, e.g. `glk_window_get_size`)
+    /// rounds once, since gvm's own layout model is integer pixels.
+    pub glk_cell_px: Option<(f64, f64)>,
+    /// The host's own stated floor on the story pane, carried from
+    /// `TerminalFacts::min_story_screen` (SQ-1596) — `None` when the host left
+    /// no floor in force. Kept so an `@restart` (`host::reset`) re-applies the
+    /// SAME floor the launch used rather than silently reverting to the real
+    /// terminal size, which for a story below its own minimum (Bureaucracy's
+    /// 40x19) means hitting `[Screen too small.]` again on a restart the host
+    /// already worked around once (SQ-1602). Mirrors `glk_cell_px` just above.
+    ///
+    /// Also read at every LIVE resize (SQ-1606): `host::screen::set_story_pane`
+    /// consults this before either engine call, via
+    /// `host::screen::min_story_pane_for_floor`'s pane-space search, so a
+    /// resize honors the same floor with no extra work from the host beyond
+    /// setting this once at launch.
+    pub min_story_screen: Option<(u16, u16)>,
+    /// A host opt-in (SQ-1623), unrelated to anything `TerminalFacts` carries at
+    /// boot — set directly on an already-built `AppState`, not derived from a
+    /// boot-time probe. `false` (every constructor's default, including
+    /// `AppState::default()`) reproduces today's SQ-1620 behaviour exactly: when
+    /// a v6 story-slot `Grid` is wider, in its own native columns, than the
+    /// Hybrid ring's viewport, [`crate::render::screen::hybrid_chrome_layout`]
+    /// and [`crate::render::screen::hybrid_story_slot_grid`] both answer `None`
+    /// — no ring, no grid placement — exactly as they did before this field
+    /// existed, and the TERMINAL's own render path
+    /// (`crate::render::screen::render_story_pane_frame`) is unconditionally
+    /// unaffected either way, because it never reads this field and always
+    /// falls back to the raster composite for that case (a real terminal
+    /// cannot draw one window's text at a smaller per-glyph size than the rest
+    /// of the screen).
+    ///
+    /// Set this `true` when the host draws its OWN text (a browser or native
+    /// UI, never a terminal) and can shrink that one grid's glyphs to fit —
+    /// unlike a terminal, such a host is not committed to one glyph size for
+    /// the whole frame. With it `true`, `hybrid_chrome_layout` and
+    /// `hybrid_story_slot_grid` answer `Some` for this case instead of `None`,
+    /// on the understanding that the CALLER will do the shrinking:
+    /// `hybrid_story_slot_grid`'s [`crate::render::screen::V6HybridStorySlotGrid::grid_cols`]/
+    /// [`crate::render::screen::V6HybridStorySlotGrid::grid_rows`] carry the
+    /// grid's true native size for the host to compare against its own
+    /// `viewport.width`/`viewport.height` and derive a shrink ratio from.
+    ///
+    /// A host taking this opt-in must also remap clicks itself — see
+    /// `V6HybridStorySlotGrid`'s own doc for why lanthorn's built-in
+    /// `V6ClickMap::map_click` (an assumed fixed native-8px-per-column grid)
+    /// does not apply once the host is drawing this grid's glyphs smaller.
+    pub host_shrinks_story_grid_text: bool,
     /// Bytes and frame flushes the ratatui backend has written to the terminal,
     /// for `/dump-terminal` (SQ-0994). `None` in every headless harness, which
     /// builds no terminal at all — and the report says "unavailable" rather than
@@ -3275,6 +3781,16 @@ pub struct AppState {
     /// deliberately. Reset to `false` on game restart.
     pub vm_halted: bool,
 
+    /// Set exactly where `should_exit_on_turn` answers true — a CLEAN, game-driven
+    /// exit (the story's own `@quit`/`glk_exit`/Scott win-or-loss quit), never a
+    /// host-driven one (`/quit`, Ctrl+Q, "Save State & quit", a signal, a VM
+    /// fault). The exit path (`main.rs` §6) reads this to decide whether to leave
+    /// a resumable auto-save or clear it (SQ-1342): finishing the story should not
+    /// hand the player back the turn before they typed `quit`. Reset to `false` on
+    /// game restart and on any restore (`apply_archive_state`), so it never
+    /// outlives the turn it describes.
+    pub game_ended: bool,
+
     /// Slide-in inventory dock (bottom). Session-only; starts closed.
     pub inv_dock: crate::anim::PanelSlide,
     /// Slide-in command band (bottom). Session-only; starts closed.
@@ -3284,11 +3800,41 @@ pub struct AppState {
     /// it stays fully interactive and the story prompt keeps the keyboard.
     pub room_dock: crate::anim::PanelSlide,
 
+    /// The room dock's two bodies scroll independently (SQ-1280), each sharing
+    /// [`crate::list_scroll::ListScroll`] with every other scrollable list in the
+    /// app rather than a bespoke offset — one dock body row is one "item";
+    /// `selected`/keyboard nav are never driven (the dock has no keyboard focus),
+    /// only [`crate::list_scroll::ListScroll::scroll_by`], from the wheel.
+    pub room_dock_info_scroll: crate::list_scroll::ListScroll,
+    /// The Diagnostics body's counterpart to [`Self::room_dock_info_scroll`].
+    pub room_dock_diag_scroll: crate::list_scroll::ListScroll,
+    /// Which room the two scrolls above currently describe. The render pass
+    /// (which alone discovers the body's true row count each frame) resets
+    /// BOTH to the top the moment this stops matching the room the dock is
+    /// actually showing — a pin, an unpin-and-follow, a walk while following,
+    /// or the dock closing (which reads as the room going to `None`) all
+    /// count, since every one of them changes what `room_dock::dock_room`
+    /// resolves to.
+    pub room_dock_scroll_room: Option<RoomId>,
+    /// The active body's viewport height (rows) as of the last render, so a
+    /// wheel action between frames has something to clamp `scroll_by` against
+    /// — the dock's own analogue of [`Self::modal_list_viewport`].
+    pub room_dock_body_viewport: u16,
+
     /// Background archive writer (SQ-1184): the per-turn auto-save builds and
     /// writes the `.lanthorn` archive off the main thread. Lazily spawns its
     /// thread on first use, so the hundreds of tests that build `AppState`
     /// and never touch persistence pay nothing for it.
     pub archive_worker: crate::archive_worker::ArchiveWorker,
+
+    /// Live accessibility transcript file (SQ-0410): `--transcript-file <PATH>`
+    /// opens this at launch and every Story/Input/Warning/Assist transcript
+    /// entry is appended to it in plain text as it lands, for a screen reader
+    /// or a second terminal running `tail -f`. `None` when the flag was not
+    /// given, or when the path could not be opened (a Warning is pushed to the
+    /// visible transcript instead — see [`Self::attach_transcript_sink`]).
+    /// Never persisted: a save/restore carries no file handles.
+    pub(crate) transcript_sink: Option<TranscriptSink>,
 }
 
 impl Default for AppState {
@@ -3317,7 +3863,7 @@ impl Default for AppState {
         // `TEST_SILENCE` only skips opening the device — so nothing about the
         // production path goes untested. Invisible to the shipped binary,
         // which is built without `cfg(test)`.
-        #[cfg(test)]
+        #[cfg(all(test, feature = "playback"))]
         audio::disable_output_for_tests();
 
         Self {
@@ -3335,10 +3881,15 @@ impl Default for AppState {
             transcript: Vec::new(),
             transcript_kinds: Vec::new(),
             assist_preamble_shown: false,
+            assist_offer: None,
+            assist_intro_line: None,
             vocab: crate::vocab::VocabState::default(),
             reveal: None,
             probe: crate::probe::ShadowProbe::default(),
             return_search: None,
+            random_exit_search: None,
+            random_exit_pre_move_save: None,
+            random_exit_agreements: None,
             vocab_pending: None,
             turn_epoch: 0,
             transcript_styles: Vec::new(),
@@ -3363,6 +3914,7 @@ impl Default for AppState {
             clear_anchor: None,
             transcript_gen: 0,
             transcript_edits: 0,
+            transcript_tail_insert: std::cell::Cell::new(None),
             transcript_wrap: std::cell::RefCell::new(None),
             raster_wrap: std::cell::RefCell::new(None),
             map_render: std::cell::RefCell::new(None),
@@ -3396,10 +3948,11 @@ impl Default for AppState {
             pending_watch_style: None,
             scroll_anim: None,
             scrollbar_shown_at: None,
-            graph_gen: 0,
+            sixel_scroll_motion_at: None,
             viewed_layer: None,
             room_dock_view: RoomDockView::Info,
             drag: None,
+            pending_v6_click: None,
             selection: None,
             selection_edge: 0,
             transcript_geom: std::cell::Cell::new(None),
@@ -3442,6 +3995,8 @@ impl Default for AppState {
             pane_drag: None,
             pane_hover: None,
             control_hover: None,
+            matrix_hover: None,
+            map_hover: None,
             turns: 0,
             unsaved_progress: false,
             exit_target: ExitTarget::Exit,
@@ -3464,10 +4019,15 @@ impl Default for AppState {
             title: String::new(),
             pane_title: String::new(),
             ifid: String::new(),
+            source: crate::archive::SaveSource::default(),
             game_dir: std::path::PathBuf::new(),
             show_inventory: false,
             player_obj: None,
             inventory_fallback: Vec::new(),
+            inventory_click_words: Vec::new(),
+            inv_dock_filter: None,
+            inv_dock_scroll: crate::list_scroll::ListScroll::new(),
+            inv_dock_body_viewport: 0,
             prev_location: None,
             prev_objects_here: std::collections::BTreeSet::new(),
             pending_resume: None,
@@ -3476,24 +4036,47 @@ impl Default for AppState {
             current_room_name: None,
             show_status_bar: true,
             search_query: None,
+            search_last_literal_query: None,
             search_matches: Vec::new(),
             search_idx: 0,
+            recall_mode: false,
+            recall_pending_id: None,
+            recall_last_query: None,
+            recall_excerpts: Vec::new(),
+            recall_preview_scroll: 0,
+            recall_panel_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            recall_keyword_only_reason: None,
+            recall_empty: false,
+            recall_scope_edits: 0,
+            recall_scope_len: 0,
+            recall_scope_game_dir: std::path::PathBuf::new(),
+            recall_worker: crate::recall::RecallWorker::default(),
             char_mode: false,
             event_wait: false,
             input_deadline: None,
             glulx_timer_next_fire: None,
             picture_pace_next: None,
             game_picker: None,
+            game_picker_query_answered: false,
+            glk_cell_px: None,
+            min_story_screen: None,
+            host_shrinks_story_grid_text: false,
             term_traffic: None,
             term_default_colors: crate::term_colors::TermDefaultColors::default(),
             query_sweep: crate::query_sweep::QuerySweep::default(),
             graphics_render: std::cell::RefCell::new(Default::default()),
             inline_image_render: std::cell::RefCell::new(Default::default()),
             vm_halted: false,
+            game_ended: false,
             inv_dock: crate::anim::PanelSlide::closed(),
             band_dock: crate::anim::PanelSlide::closed(),
             room_dock: crate::anim::PanelSlide::closed(),
+            room_dock_info_scroll: crate::list_scroll::ListScroll::new(),
+            room_dock_diag_scroll: crate::list_scroll::ListScroll::new(),
+            room_dock_scroll_room: None,
+            room_dock_body_viewport: 0,
             archive_worker: crate::archive_worker::ArchiveWorker::new(),
+            transcript_sink: None,
         }
     }
 }
@@ -3509,6 +4092,7 @@ impl AppState {
             || self.sound_pulse.is_some()
             || self.scroll_anim.is_some()
             || self.transcript_scrollbar_animating()
+            || self.transcript_scroll_in_motion()
             || self.overlays.saves.as_ref().is_some_and(|s| s.scroll.has_active_animation())
             || self.overlays.file_browser.as_ref().is_some_and(|fb| fb.scroll.has_active_animation())
             || self.overlays.config_screen.as_ref().is_some_and(|cs| cs.scroll.has_active_animation())
@@ -3535,6 +4119,30 @@ impl AppState {
     /// True while the command band is on screen (open, or still sliding).
     pub fn command_band_visible(&self) -> bool {
         self.overlays.command_band.is_some() || self.band_dock.active()
+    }
+
+    /// Which of the two mutually-exclusive panels is open right now (SQ-1237).
+    ///
+    /// Reads `band_dock.open` rather than `command_band_visible()` DELIBERATELY:
+    /// the dock's `open` flag is the TARGET the last click/command set, set
+    /// synchronously; `command_band_visible()` also answers true while a closed
+    /// band's content is still sliding out (`settle_command_band` has not yet
+    /// trimmed it), which is right for deciding whether to draw the band at all
+    /// but wrong for deciding what the player's next click on the cycle control
+    /// should do — a click mid-slide-out must not re-open the band it just
+    /// asked to close. `show_inventory` has no such lag (it is set directly, no
+    /// drawer-content field to trim), so both halves read the same kind of
+    /// fact: intent, not on-screen visibility. `Command` wins over `Inventory`
+    /// on the (should-not-happen) case both are somehow set, since the command
+    /// panel is the cycle's first stop.
+    pub fn current_side_panel(&self) -> SidePanel {
+        if self.band_dock.open {
+            SidePanel::Command
+        } else if self.show_inventory {
+            SidePanel::Inventory
+        } else {
+            SidePanel::None
+        }
     }
 
     /// True while the room dock is on screen — open, or still sliding out
@@ -3577,20 +4185,48 @@ impl AppState {
         if !self.config.enable_sound {
             return;
         }
-        let Some(backend) = self.audio.as_mut() else { return };
+        // Read once, outside the loop, so each lazy open below borrows only
+        // `self.audio` — disjoint from the `self.disk_sounds` / `self.sound_blorb`
+        // borrow `resolve_sound` hands back further down (SQ-1423: the device
+        // opens on first *actual* play, not at boot; see `startup.rs`'s note on
+        // why `state.audio` starts `None`).
+        let volume = self.config.volume;
         for ev in sounds {
             match ev.number {
-                0 => {}
-                1 | 2 => {
-                    if ev.effect == 0 || ev.effect == 2 {
-                        let freq = if ev.number == 1 { 800.0 } else { 400.0 };
-                        backend.play_tone(freq, 150, ev.volume);
+                // ZMSD §15 "To clarify": "@sound_effect 0 3/4 will stop (and
+                // unload) all sounds" — number 0 refers to every currently
+                // playing sound, not "no sound"; zvm now delivers this rather
+                // than dropping it (SQ-1419), so stop every sound we started.
+                // Stop-all must NOT open a device (SQ-1423): if `self.audio`
+                // is still `None`, nothing was ever started, so `sound_ids`
+                // is empty and there is nothing to stop.
+                0 => {
+                    if matches!(ev.effect, 3 | 4) {
+                        if let Some(sink) = self.audio.as_mut() {
+                            for (_, id) in self.sound_ids.drain() {
+                                sink.stop(id);
+                            }
+                        }
                     }
+                }
+                // Bleeps (§15: "the other operands must be omitted") always
+                // sound when called — `effect` is meaningless for them, so
+                // this no longer gates on it (that gate used to compensate
+                // for zvm always emitting `effect == 0` on an omitted
+                // operand; zvm now defaults a real sound's omitted effect to
+                // 2 = play, so the compensation is gone with it).
+                1 | 2 => {
+                    let freq = if ev.number == 1 { audio::HIGH_BLEEP_HZ } else { audio::LOW_BLEEP_HZ };
+                    self.audio
+                        .get_or_insert_with(|| crate::host::sound::default_sound_sink(volume))
+                        .tone(freq, audio::BLEEP_MS, ev.volume);
                 }
                 n => match ev.effect {
                     3 => {
                         if let Some(id) = self.sound_ids.remove(&n) {
-                            backend.stop(id);
+                            self.audio
+                                .get_or_insert_with(|| crate::host::sound::default_sound_sink(volume))
+                                .stop(id);
                         }
                     }
                     1 => {} // prepare: decode on start
@@ -3599,8 +4235,17 @@ impl AppState {
                         // `/play-sound` diagnostic — see `resolve_sound`.
                         let played = resolve_sound(&self.disk_sounds, self.sound_blorb.as_ref(), n)
                             .and_then(|(bytes, kind, _)| {
-                                sound_kind_to_format(kind)
-                                    .and_then(|fmt| backend.play_sample(bytes, fmt, ev.volume, ev.repeats))
+                                sound_kind_to_format(kind).and_then(|format| {
+                                    self.audio
+                                        .get_or_insert_with(|| crate::host::sound::default_sound_sink(volume))
+                                        .play(crate::host::sound::SampleStart {
+                                            resource: u32::from(n),
+                                            bytes,
+                                            format,
+                                            level: crate::host::sound::SampleLevel::ZVolume(ev.volume),
+                                            repeats: ev.repeats,
+                                        })
+                                })
                             });
                         if let Some(id) = played {
                             self.sound_ids.insert(n, id);
@@ -3623,22 +4268,38 @@ impl AppState {
         if !self.config.enable_sound {
             return;
         }
-        let Some(backend) = self.audio.as_mut() else { return };
+        // No early bail on a missing backend any more (SQ-1423): the device
+        // opens lazily, on the first op that actually starts a sound
+        // (`SchannelOp::Play`'s successful decode below), not at boot — every
+        // other op either targets an existing channel (which can only exist
+        // once a sound has actually played, so the device is already open) or
+        // is pure bookkeeping (ramps/notifies) that must still happen with no
+        // device at all.
+        let volume = self.config.volume;
         for op in ops {
             match *op {
-                SchannelOp::Play { chan, snd, repeats, notify, volume, paused } => {
+                SchannelOp::Play { chan, snd, repeats, notify, volume: vol, paused } => {
                     // Playing on a busy channel stops the old sound first; the
                     // replaced sound fires no notify.
                     if let Some(old) = self.glulx_channels.remove(&chan) {
-                        backend.stop(old);
+                        if let Some(sink) = self.audio.as_mut() { sink.stop(old); }
                         self.glulx_sound_notify.remove(&old);
                     }
                     let Some(reps) = glk_repeats_to_audio(repeats) else { continue };
                     if let Some(blorb) = &self.sound_blorb {
                         if let Some((bytes, kind)) = blorb.sound(snd) {
-                            if let Some(fmt) = sound_kind_to_format(kind) {
-                                let gain = glk_volume_to_gain(volume);
-                                if let Some(id) = backend.play_sample_gain(bytes, fmt, gain, reps) {
+                            if let Some(format) = sound_kind_to_format(kind) {
+                                let gain = glk_volume_to_gain(vol);
+                                let sink = self
+                                    .audio
+                                    .get_or_insert_with(|| crate::host::sound::default_sound_sink(volume));
+                                if let Some(id) = sink.play(crate::host::sound::SampleStart {
+                                    resource: snd,
+                                    bytes,
+                                    format,
+                                    level: crate::host::sound::SampleLevel::Gain(gain),
+                                    repeats: reps,
+                                }) {
                                     self.glulx_channels.insert(chan, id);
                                     // A fresh sound starts at the channel's snapshot
                                     // volume; cancel any ramp left over from a prior
@@ -3653,7 +4314,7 @@ impl AppState {
                                     // not "empty", so no finish-notify fires until it
                                     // is unpaused and actually plays out.
                                     if paused {
-                                        backend.pause(id);
+                                        if let Some(sink) = self.audio.as_mut() { sink.pause(id); }
                                     }
                                 }
                             }
@@ -3662,13 +4323,13 @@ impl AppState {
                 }
                 SchannelOp::Stop { chan } => {
                     if let Some(id) = self.glulx_channels.remove(&chan) {
-                        backend.stop(id);
+                        if let Some(sink) = self.audio.as_mut() { sink.stop(id); }
                         self.glulx_sound_notify.remove(&id);
                     }
                 }
                 SchannelOp::Destroy { chan } => {
                     if let Some(id) = self.glulx_channels.remove(&chan) {
-                        backend.stop(id);
+                        if let Some(sink) = self.audio.as_mut() { sink.stop(id); }
                         self.glulx_sound_notify.remove(&id);
                     }
                     // A destroyed channel can never complete a pending ramp.
@@ -3679,7 +4340,7 @@ impl AppState {
                 SchannelOp::SetVolume { chan, vol } => {
                     let gain = glk_volume_to_gain(vol);
                     if let Some(&id) = self.glulx_channels.get(&chan) {
-                        backend.set_sample_gain(id, gain);
+                        if let Some(sink) = self.audio.as_mut() { sink.set_gain(id, gain); }
                     }
                     // A plain set_volume is an immediate change; it interrupts any
                     // in-progress ramp (whose notify is then dropped, per spec §8.3).
@@ -3689,12 +4350,12 @@ impl AppState {
                 }
                 SchannelOp::Pause { chan } => {
                     if let Some(&id) = self.glulx_channels.get(&chan) {
-                        backend.pause(id);
+                        if let Some(sink) = self.audio.as_mut() { sink.pause(id); }
                     }
                 }
                 SchannelOp::Unpause { chan } => {
                     if let Some(&id) = self.glulx_channels.get(&chan) {
-                        backend.unpause(id);
+                        if let Some(sink) = self.audio.as_mut() { sink.unpause(id); }
                     }
                 }
                 SchannelOp::SetVolumeExt { chan, vol, duration_ms, notify } => {
@@ -3706,7 +4367,7 @@ impl AppState {
                     if duration_ms == 0 {
                         // Immediate change: jump the sink and current gain to target.
                         if let Some(&id) = self.glulx_channels.get(&chan) {
-                            backend.set_sample_gain(id, target);
+                            if let Some(sink) = self.audio.as_mut() { sink.set_gain(id, target); }
                         }
                         self.glulx_gain.insert(chan, target);
                     } else {
@@ -3766,7 +4427,7 @@ impl AppState {
             self.glulx_gain.insert(chan, gain);
             if let Some(&id) = self.glulx_channels.get(&chan) {
                 if let Some(b) = self.audio.as_mut() {
-                    b.set_sample_gain(id, gain);
+                    b.set_gain(id, gain);
                 }
             }
             if elapsed >= ramp.duration_ms {
@@ -3791,6 +4452,85 @@ impl AppState {
         // nothing else does, which is exactly the auto-hide trigger set the bar
         // wants (SQ-0782). New game text sets `transcript_scroll` directly.
         self.scrollbar_shown_at = Some(Instant::now());
+        // Same funnel, for the sixel scroll-settle debounce (SQ-1198): every real
+        // scroll motion — wheel, page, drag-autoscroll — restarts the window.
+        self.sixel_scroll_motion_at = Some(Instant::now());
+    }
+
+    /// Arm (or replace) the transcript's smooth-scroll animation for new output
+    /// arriving while the reader was already at the bottom (SQ-1595), easing
+    /// over `config.animation.follow_ms` rather than `scroll_ms`. Sets the
+    /// logical target immediately, exactly like [`Self::scroll_transcript_to`],
+    /// but the displayed offset starts from `from` — the pre-turn bottom's
+    /// equivalent offset now that the transcript has grown — rather than from
+    /// the current display, and this deliberately does NOT touch
+    /// `scrollbar_shown_at` / `sixel_scroll_motion_at`: this is autoscroll
+    /// follow, not a reader-initiated scroll, and the scrollbar must not flash
+    /// on every turn of new text (see `scrollbar_shown_at`'s own docs).
+    pub fn arm_transcript_follow_ease(&mut self, from: u16, target: u16) {
+        self.transcript_scroll = target;
+        let anim = &self.config.animation;
+        self.scroll_anim = ScrollAnim::over(
+            from as usize,
+            target as usize,
+            anim.enabled,
+            anim.follow_ms,
+            anim.easing,
+            ScrollAnimKind::Follow,
+        );
+    }
+
+    /// Snap the transcript's displayed scroll offset to its animation's target
+    /// and drop the animation, right now — regardless of whether its tween has
+    /// finished. No-op if none is in flight. Returns `true` iff one was.
+    ///
+    /// Used two ways: the run loop's own natural finish still checks `done()`
+    /// itself before calling this (so a still-tweening anim is left alone), and
+    /// the cancellation hook that ends an in-flight follow-ease the moment the
+    /// player acts calls it unconditionally (SQ-1595) — a keypress or mouse
+    /// event outranks paced output, the same principle `settle_picture_pacing`
+    /// applies to the v6 picture pacer. Both share this one finalize path
+    /// rather than forking a second copy of it.
+    pub fn finalize_transcript_scroll_anim_now(&mut self) -> bool {
+        let Some(a) = self.scroll_anim.take() else { return false };
+        self.transcript_scroll = a.target() as u16;
+        true
+    }
+
+    /// How long the transcript viewport is considered "in motion" after the last
+    /// scroll (SQ-1198), for [`AppState::transcript_scroll_in_motion`].
+    ///
+    /// `default_scroll_ms()` (120ms, `config.animation.scroll_ms`) is the length
+    /// of ONE smooth-scroll tween — so a lone wheel notch is still tweening for
+    /// the whole of it — plus one `TIDY_POLL_MS` tick (33ms, the fast-poll cadence
+    /// `has_active_animation()` already earns) as margin, so the tween's own
+    /// settle frame is never mistaken for the debounce's. A flurry of scroll
+    /// steps each restarts the window before it closes, so it stays open for the
+    /// whole flurry and only opens the settle frame once the wheel actually stops.
+    const SIXEL_SCROLL_SETTLE_MS: u64 = 150;
+
+    /// True while the transcript viewport is still "in motion" from a recent
+    /// scroll (SQ-1198) — see [`Self::SIXEL_SCROLL_SETTLE_MS`]. Read by the sixel
+    /// backend only: kitty re-places by id and half-blocks are ordinary cells, so
+    /// neither needs this.
+    pub fn transcript_scroll_in_motion(&self) -> bool {
+        self.sixel_scroll_motion_at
+            .is_some_and(|t| t.elapsed().as_millis() < Self::SIXEL_SCROLL_SETTLE_MS as u128)
+    }
+
+    /// Drop a fully-elapsed scroll-motion window (called from the run loop,
+    /// mirroring [`Self::finalize_scrollbar_if_done`]). Returns `true` iff this
+    /// call just closed the window, so the loop forces the one redraw where a
+    /// sixel image goes from its footprint back to its full payload at the
+    /// now-settled position — the frame `transcript_scroll_in_motion` flipping
+    /// false is itself the content change, so it needs its own settle frame
+    /// exactly as the scrollbar fade does.
+    pub fn finalize_sixel_scroll_motion_if_done(&mut self) -> bool {
+        if self.sixel_scroll_motion_at.is_some() && !self.transcript_scroll_in_motion() {
+            self.sixel_scroll_motion_at = None;
+            return true;
+        }
+        false
     }
 
     /// How opaque the story pane's scrollbar is this frame, in `[0,1]`
@@ -3884,6 +4624,12 @@ impl AppState {
     /// doing so hid a half-typed command with no sign it was still buffered, and
     /// Enter would then run something the player could not see.
     pub fn any_modal_overlay_open(&self) -> bool {
+        self.recall_mode || self.any_modal_overlay_open_except_recall()
+    }
+
+    /// The ordinary dialogs stay above recall if one is opened while a
+    /// background query is still running.
+    pub fn any_modal_overlay_open_except_recall(&self) -> bool {
         self.overlays.saves.is_some()
             || self.overlays.file_browser.is_some()
             || self.overlays.file_picker.is_some()
@@ -3910,6 +4656,7 @@ impl AppState {
             || self.overlays.hints.is_some()
             || self.overlays.replay.is_some()
             || self.overlays.region_prompt.is_some()
+            || self.overlays.room_menu.is_some()
             || self.resize_mode
     }
 
@@ -4053,6 +4800,7 @@ impl AppState {
     /// not run" is only half an answer.
     pub fn open_modal_overlays(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
+        if self.recall_mode { v.push("recall"); }
         if self.overlays.saves.is_some() { v.push("saves"); }
         if self.overlays.file_browser.is_some() { v.push("file_browser"); }
         if self.overlays.file_picker.is_some() { v.push("file_picker"); }
@@ -4116,19 +4864,20 @@ impl AppState {
     /// Borrow the live map's routed render model for `layer`. The routing in
     /// `render_layer` is the dominant map cost, so it is kept OFF the main thread
     /// (SQ-0379): the very first model is built synchronously (small, at game
-    /// start), but every later rebuild — triggered by a `graph_gen` change —
+    /// start), but every later rebuild — triggered by a `struct_gen` change —
     /// happens on a background worker while this keeps returning the last-ready
     /// model. Only the current-room highlight and labels are refreshed here, live
     /// and cheaply, so the highlight follows the player with no re-route (SQ-0378).
     ///
     /// Only the live map uses this — replay and tidy-animation graphs are not
-    /// tracked by `graph_gen`, so their models are built fresh each frame. (SQ-0305)
+    /// tracked by `struct_gen`, so their models are built fresh each frame. (SQ-0305,
+    /// SQ-1544)
     pub fn cached_map_render(
         &self,
         layer: LayerId,
         graph: &mapper::graph::MapGraph,
     ) -> std::cell::Ref<'_, mapper::render::RenderMap> {
-        let gen = self.graph_gen;
+        let gen = graph.struct_gen();
         let fresh = matches!(self.map_render.borrow().as_ref(), Some(c) if c.gen == gen && c.layer == layer);
         if !fresh {
             // No routing ever runs on the main thread (SQ-0379). If there is no
@@ -4179,8 +4928,8 @@ impl AppState {
     /// matrix and there is no map to route (SQ-0671).
     ///
     /// This is the churn the player saw as a cycling map pane: [`AppState::cached_map_render`]
-    /// re-routes whenever `graph_gen` moves, and every arriving tidy result bumps that generation,
-    /// so a background job for ANY layer spawned a render worker whose in-flight pulse restyled
+    /// re-routes whenever `struct_gen` moves, and every arriving tidy result bumps that
+    /// generation, so a background job for ANY layer spawned a render worker whose in-flight pulse restyled
     /// the border of a pane drawing a table it never touched. Asking for no model at all is what
     /// makes the matrix independent of the layout pipeline, rather than merely ignoring its
     /// output.
@@ -4223,9 +4972,14 @@ impl AppState {
 
     /// Poll the background map-render worker: if it has finished, install its
     /// model as the new last-ready render (when its generation still matches) or
-    /// discard it as stale (a fresh job then spawns on the next draw). Returns
-    /// true when a completed job was handled (the caller should redraw). (SQ-0379)
-    pub fn poll_render_job(&mut self) -> bool {
+    /// discard it as stale (a fresh job then spawns on the next draw). `graph` is
+    /// the LIVE graph the job's captured generation is checked against — the same
+    /// object `spawn_render_job` was called with, never a freshly loaded one (a
+    /// wholesale replacement goes through [`AppState::invalidate_map_render`]
+    /// instead, which drops this job outright rather than let a stale result race a
+    /// coincidentally-matching generation on the new object). Returns true when a
+    /// completed job was handled (the caller should redraw). (SQ-0379, SQ-1544)
+    pub fn poll_render_job(&mut self, graph: &mapper::graph::MapGraph) -> bool {
         let done = self
             .render_job
             .borrow()
@@ -4237,7 +4991,7 @@ impl AppState {
         let job = self.render_job.borrow_mut().take().expect("checked above");
         match job.handle.join() {
             Ok(rm) => {
-                if job.gen == self.graph_gen {
+                if job.gen == graph.struct_gen() {
                     if self.config.trace.map {
                         let steps = self.render_steps_snapshot();
                         write_map_trace(&self.config.user_dir, &steps, true);
@@ -4555,16 +5309,7 @@ impl AppState {
         (from.min(self.transcript.len())..self.transcript.len())
             .filter(|&i| {
                 let kind = self.transcript_kinds.get(i).copied().unwrap_or(TranscriptKind::Story);
-                match self.transcript_filter {
-                    TranscriptFilter::Both => true,
-                    TranscriptFilter::Story => matches!(kind, TranscriptKind::Story | TranscriptKind::Input),
-                    // Assist joins the META bucket, not the story one: `/filter
-                    // story` is the player asking for 1982, and an assist is
-                    // exactly what 1982 did not have (SQ-1045).
-                    TranscriptFilter::Meta => {
-                        matches!(kind, TranscriptKind::Meta | TranscriptKind::Warning | TranscriptKind::Assist)
-                    }
-                }
+                transcript_filter_matches(self.transcript_filter, kind)
             })
             .collect()
     }
@@ -4576,10 +5321,18 @@ impl AppState {
     /// everything above the boundary stays reachable by scrolling up — a
     /// scrollback-preserving "clear" rather than a destructive wipe. Also snaps
     /// the view to the bottom so the cleared screen is what's shown.
+    ///
+    /// Also flags [`Pager::screen_cleared_this_turn`](crate::pager::Pager::
+    /// screen_cleared_this_turn) so the next `pager::apply_frame` — which the
+    /// caller arms for AFTER this runs — knows the `at_bottom` it's about to
+    /// observe (unconditionally true, from the snap above) came from a clear
+    /// rather than an organically-followed reader, and takes the instant-jump
+    /// path instead of arming a follow-ease (SQ-1607).
     pub fn mark_screen_clear(&mut self) {
         self.clear_anchor = Some(self.transcript.len());
         self.transcript_scroll = 0;
         self.scroll_anim = None;
+        self.pager.screen_cleared_this_turn = true;
     }
 
     /// Truncate the transcript — and every parallel sidecar vec — back to `len`,
@@ -4601,6 +5354,56 @@ impl AppState {
 
     pub fn push_transcript(&mut self, text: &str) {
         self.push_transcript_kind(text, TranscriptKind::Story);
+    }
+
+    /// Attach the live `--transcript-file` sink (SQ-0410). Call once, at boot,
+    /// before anything is pushed to the transcript, so the opening banner is
+    /// captured too.
+    ///
+    /// Never fails loudly: a path that cannot be opened for append (a
+    /// directory, a permission error, a missing parent) reports once as a
+    /// [`TranscriptKind::Warning`] transcript entry instead of aborting the
+    /// launch — the player still gets to play, just without the live stream.
+    pub fn attach_transcript_sink(&mut self, path: &std::path::Path) {
+        match TranscriptSink::open(path) {
+            Ok(sink) => self.transcript_sink = Some(sink),
+            Err(e) => self.push_transcript_kind(
+                &format!(
+                    "[accessibility] could not open transcript file {} ({e}); live transcript stream disabled",
+                    path.display()
+                ),
+                TranscriptKind::Warning,
+            ),
+        }
+    }
+
+    /// Mirror one transcript entry to the live `--transcript-file` sink, if
+    /// one is attached (SQ-0410). Called from every `push_transcript_*`
+    /// variant with the exact text/kind it was given — never derived from the
+    /// transcript Vecs, because `push_transcript_internal`/`_styled` can
+    /// INSERT above a trailing prompt rather than append, and the file wants
+    /// arrival order, not final vector position.
+    ///
+    /// Only lines a sighted player would read reach the file: game text, the
+    /// player's echoed command, VM diagnostics (`Warning`), and Lanthorn's own
+    /// Guiding Light (`Assist`) — never app-chrome `Meta` output (`/help`,
+    /// `/filter`, a config dump), which would flood an accessibility stream
+    /// with UI rather than story.
+    ///
+    /// A write error disables the sink and reports once, rather than
+    /// crashing or spamming a Warning on every subsequent turn.
+    fn stream_transcript(&mut self, text: &str, kind: TranscriptKind) {
+        if !matches!(kind, TranscriptKind::Story | TranscriptKind::Input | TranscriptKind::Warning | TranscriptKind::Assist) {
+            return;
+        }
+        let Some(mut sink) = self.transcript_sink.take() else { return };
+        match sink.write_entry(text, kind) {
+            Ok(()) => self.transcript_sink = Some(sink),
+            Err(_) => self.push_transcript_kind(
+                "[accessibility] transcript file write failed; live transcript stream disabled",
+                TranscriptKind::Warning,
+            ),
+        }
     }
 
     /// Whether app-internal transcript output (status/slash/save-restore messages,
@@ -4629,18 +5432,49 @@ impl AppState {
     /// here touches that line.
     fn touch_transcript(&mut self, edit: TranscriptEdit) {
         self.transcript_gen = self.transcript_gen.wrapping_add(1);
-        if matches!(edit, TranscriptEdit::Rewrote) {
-            self.transcript_edits = self.transcript_edits.wrapping_add(1);
+        match edit {
+            TranscriptEdit::Appended => {}
+            TranscriptEdit::Rewrote => {
+                self.transcript_edits = self.transcript_edits.wrapping_add(1);
+                // An opaque rewrite is exactly what a repair cannot see through
+                // (SQ-1179): whatever run of inserts preceded it no longer
+                // accounts for everything that moved.
+                self.transcript_tail_insert.set(None);
+            }
+            TranscriptEdit::Inserted { at, count } => {
+                debug_assert!(count > 0, "an insert of zero lines is a no-op mischaracterized as Inserted");
+                self.transcript_edits = self.transcript_edits.wrapping_add(1);
+                let since_edits = self.transcript_edits - 1;
+                let run = match self.transcript_tail_insert.take() {
+                    Some(prev) => TailInsertRun { since_edits: prev.since_edits, min_at: prev.min_at.min(at) },
+                    None => TailInsertRun { since_edits, min_at: at },
+                };
+                self.transcript_tail_insert.set(Some(run));
+            }
         }
     }
 
-    /// Bump the graph generation, invalidating the map render memo. Call after ANY
-    /// mutation of the mapper graph or its layout/labels — rename/notes/relabel/nudge,
-    /// tidy applies, room reassignment (restore/import/reset). The map render memo is
-    /// keyed on this (`cached_map_render`), so a missed bump paints a STALE MAP.
-    /// Double-bumping is harmless (`wrapping_add`); a missing bump is a wrong map. (SQ-0305)
-    pub fn bump_graph_gen(&mut self) {
-        self.graph_gen = self.graph_gen.wrapping_add(1);
+    /// Force the live map's render memo to rebuild from scratch on the next draw, and
+    /// drop any in-flight background map job (tidy/anim/render worker) rather than let
+    /// it land later (SQ-1544).
+    ///
+    /// Call whenever the mapper's graph OBJECT is replaced wholesale — a restore, a
+    /// resume, an imported map, `/reset map` — rather than edited in place. In-place
+    /// edits need no call here at all: `cached_map_render` reads
+    /// [`mapper::mapper::Mapper::struct_gen`] straight off the live graph, and that
+    /// counter already bumps itself for exactly the mutations that change what the map
+    /// draws (SQ-1540). But `struct_gen` is scoped to ONE graph object's lifetime — a
+    /// freshly loaded map starts back at generation 0 (see its own doc comment) — so a
+    /// generation number alone cannot tell a genuinely unchanged map apart from a
+    /// stale cache or in-flight job whose captured generation happens to match the
+    /// new object's by coincidence after the swap. An unconditional clear sidesteps
+    /// that question entirely instead of risking the collision.
+    pub fn invalidate_map_render(&mut self) {
+        *self.map_render.borrow_mut() = None;
+        *self.map_derived.borrow_mut() = None;
+        *self.render_job.borrow_mut() = None;
+        self.tidy_job = None;
+        self.anim_build_job = None;
     }
 
     /// Split `text` on `'\n'` and append each line to the transcript with the given kind tag.
@@ -4658,6 +5492,7 @@ impl AppState {
             self.transcript_para.push(ParaFmt::default());
             self.transcript_images.push(None);
         }
+        self.stream_transcript(text, kind);
     }
 
     /// Add app-internal output (a `[…]` status line, a slash-command dump, a
@@ -4667,8 +5502,14 @@ impl AppState {
     pub fn push_transcript_internal(&mut self, text: &str, kind: TranscriptKind) {
         let base = self.insert_above_prompt_at();
         // Inline-prompt mode INSERTS above the trailing prompt, which moves a line
-        // the wrap cache has already wrapped; every other frame appends (SQ-1034).
-        self.touch_transcript(if base.is_some() { TranscriptEdit::Rewrote } else { TranscriptEdit::Appended });
+        // the wrap cache has already wrapped — but every line before that prompt
+        // provably did not move, so this is `Inserted`, not the opaque `Rewrote`,
+        // and the cache can repair through it instead of rebuilding (SQ-1179).
+        let count = text.split('\n').count();
+        self.touch_transcript(match base {
+            Some(b) => TranscriptEdit::Inserted { at: b, count },
+            None => TranscriptEdit::Appended,
+        });
         self.transcript_styles.resize(self.transcript.len(), None);
         self.transcript_runs.resize(self.transcript.len(), Vec::new());
         self.transcript_para.resize(self.transcript.len(), ParaFmt::default());
@@ -4694,6 +5535,7 @@ impl AppState {
                 }
             }
         }
+        self.stream_transcript(text, kind);
     }
 
     /// The visible transcript as a FILE should carry it (SQ-1045).
@@ -4747,6 +5589,13 @@ impl AppState {
         // the words on screen would otherwise stay lit against a world that had
         // moved on.
         self.reveal = None;
+        // Same reasoning, for the same shape of fact (SQ-1552): the structured
+        // offer describes the assist line the PREVIOUS turn printed, and a new
+        // turn starting is what makes it stale.
+        self.assist_offer = None;
+        // Same again, for the intro line's own signal (SQ-1557): it describes a
+        // call the previous turn made, and is stale the moment this one starts.
+        self.assist_intro_line = None;
     }
 
     pub fn push_assist(&mut self, assist: &crate::assist::Assist) {
@@ -4756,16 +5605,51 @@ impl AppState {
         if !self.config.guidance {
             return;
         }
+        // Reset for THIS call, mirroring `assist_offer` below: a call that
+        // doesn't print the intro (already shown) must say so, not carry a
+        // stale line number from whichever earlier call last set it.
+        self.assist_intro_line = None;
         if !self.assist_preamble_shown {
             self.assist_preamble_shown = true;
             let intro = self.colors.theme.get(crate::assist::AssistTone::Help.selector()).style;
             let line = crate::assist::preamble(self.symbols.assist_gutter);
+            // Capture where the line will land BEFORE pushing it, not
+            // `len() - 1` after: in inline-prompt mode (`command_bar = false`)
+            // `push_transcript_internal_styled` INSERTS above the trailing
+            // game `>` prompt rather than appending (SQ-0270), so the prompt
+            // — not the intro — ends up last, and `len() - 1` afterward names
+            // the wrong line (SQ-1587). Nothing mutates `self` between this
+            // call and the one below, so it agrees with the index
+            // `push_transcript_internal_styled`'s own `insert_above_prompt_at()`
+            // call computes internally.
+            let intro_at = self.insert_above_prompt_at().unwrap_or(self.transcript.len());
             self.push_transcript_internal_styled(&line, TranscriptKind::Assist, intro);
+            self.assist_intro_line = Some(intro_at);
         }
         let style = self.colors.theme.get(assist.tone().selector()).style;
         for line in assist.lines() {
             self.push_transcript_internal_styled(&line, TranscriptKind::Assist, style);
         }
+        // The structured half of THIS line (SQ-1552) — what the turn's own
+        // assist said, not the once-per-session chrome above it. The intro's
+        // own structured half lives in `assist_intro_line` (SQ-1557), set
+        // above, and is not folded in here so this stays "the last real
+        // assist", exactly as before.
+        self.assist_offer = Some(assist.offer());
+    }
+
+    /// The structured [`crate::assist::OfferKind::Intro`] offer for the
+    /// intro line THIS call to [`push_assist`](Self::push_assist) printed, if
+    /// any (SQ-1557) — the same shape as [`Self::assist_offer`], derived from
+    /// [`Self::assist_intro_line`] so a host reads one type either way rather
+    /// than a bare line number for this signal and a full [`crate::assist::Offer`]
+    /// for the other.
+    pub fn assist_intro_offer(&self) -> Option<crate::assist::Offer> {
+        self.assist_intro_line.map(|_| crate::assist::Offer {
+            kind: crate::assist::OfferKind::Intro,
+            word: None,
+            picks: Vec::new(),
+        })
     }
 
     /// Surface an app-internal `[…]` bracketed notice as a top-right toast
@@ -4801,6 +5685,11 @@ impl AppState {
                 }
             }
         }
+        // The only caller (`finish_command_turn`, inline-prompt mode) joins the
+        // bare command onto the game's own `>` line already in `transcript`; the
+        // sink has no such line to join, so it gets the same `> ` prefix the
+        // command-bar path writes via `push_transcript_kind` (SQ-0410).
+        self.stream_transcript(&format!("> {text}"), TranscriptKind::Input);
     }
 
     /// Merge transcript line `idx` into line `idx - 1`, concatenating the text and
@@ -4932,14 +5821,20 @@ impl AppState {
             self.transcript_para.push(ParaFmt::default());
             self.transcript_images.push(None);
         }
+        self.stream_transcript(text, kind);
     }
 
     /// Like [`push_transcript_styled`], but inserts app-internal styled output
     /// above a trailing game prompt in inline-prompt mode (SQ-0270).
     pub fn push_transcript_internal_styled(&mut self, text: &str, kind: TranscriptKind, style: ratatui::style::Style) {
         let base = self.insert_above_prompt_at();
-        // See `push_transcript_internal`: an insert above the prompt rewrites.
-        self.touch_transcript(if base.is_some() { TranscriptEdit::Rewrote } else { TranscriptEdit::Appended });
+        // See `push_transcript_internal`: an insert above the prompt is a
+        // repairable `Inserted`, not the opaque `Rewrote` (SQ-1179).
+        let count = text.split('\n').count();
+        self.touch_transcript(match base {
+            Some(b) => TranscriptEdit::Inserted { at: b, count },
+            None => TranscriptEdit::Appended,
+        });
         self.transcript_styles.resize(self.transcript.len(), None);
         self.transcript_runs.resize(self.transcript.len(), Vec::new());
         self.transcript_para.resize(self.transcript.len(), ParaFmt::default());
@@ -4965,6 +5860,7 @@ impl AppState {
                 }
             }
         }
+        self.stream_transcript(text, kind);
     }
 
     /// Split `text` on `'\n'` and append each line tagged with `kind`, deriving a
@@ -5093,6 +5989,7 @@ impl AppState {
             self.transcript_para.push(ParaFmt { nowrap_from: line_nowrap, ..line_para.unwrap_or_default() });
             self.transcript_images.push(None);
         }
+        self.stream_transcript(text, kind);
     }
 
     /// [`push_transcript_runs`](Self::push_transcript_runs) for a `read_char` turn,
@@ -5187,6 +6084,10 @@ impl AppState {
     /// `Some(..)` at retained head indices (e.g. an inline image a Glulx game drew
     /// before the load, now indexing a different, shorter transcript).
     pub fn reset_transcript_sidecars(&mut self) {
+        // A restore or restart replaces the source of recall's ranked line
+        // positions. Drop both the in-flight request and the prior query.
+        self.clear_search();
+        self.recall_last_query = None;
         self.touch_transcript(TranscriptEdit::Rewrote);
         self.transcript_styles = vec![None; self.transcript.len()];
         self.transcript_images = vec![None; self.transcript.len()];
@@ -5201,6 +6102,18 @@ impl AppState {
         self.seen_words.clear();
         self.seen_nouns.clear();
         self.seen_scanned = 0;
+        // The [more] pager's baseline (`last_transcript_total_rows`) is a
+        // sidecar too, and a stale one is the SQ-1411 defect: it still
+        // describes the transcript this call just replaced, so the next arm
+        // measures the WHOLE new transcript as "output since the last frame"
+        // and pages the reader through scrollback they already read (worst
+        // when the resumed frame is a v6 picture takeover with no transcript
+        // surface, which leaves the stale baseline live until the story
+        // returns to text). Marking it stale here — the one place transcript
+        // replacement is funneled through — lets `pager::apply_frame`
+        // calibrate instead of measure on the first surfaced frame after.
+        self.pager.baseline_stale = true;
+        self.pager.disarm();
     }
 
     /// Surface a transient message as a top-right notification toast (SQ-0176).
@@ -5366,6 +6279,7 @@ impl AppState {
     /// whether matches were found (so the status line can show "no matches").
     /// Returns the number of matches.
     pub fn run_search(&mut self, query: &str, start_backward: bool) -> usize {
+        self.clear_search();
         let query_lower = query.to_lowercase();
         let visible = self.visible_transcript_indices();
         self.search_matches = visible
@@ -5379,6 +6293,7 @@ impl AppState {
         let count = self.search_matches.len();
         self.search_idx = if start_backward && count > 0 { count - 1 } else { 0 };
         self.search_query = Some(query.to_string());
+        self.search_last_literal_query = Some(query.to_string());
         count
     }
 
@@ -5397,15 +6312,148 @@ impl AppState {
         } else {
             self.search_idx = self.search_idx.checked_sub(1).unwrap_or(count - 1);
         }
+        if self.recall_mode {
+            self.set_status(self.recall_selected_status());
+            self.recall_preview_scroll = 0;
+        }
         Some(self.search_matches[self.search_idx])
+    }
+
+    /// Queue a ranked recall over the player-visible transcript. Submitting only
+    /// copies the observed passages; model loading, indexing and ranking run in
+    /// the worker. The request ID prevents an older query from replacing a newer
+    /// one when replies arrive out of order.
+    pub fn begin_recall(&mut self, query: &str) -> Result<(), String> {
+        let query = query.trim();
+        let literal_query = if self.recall_mode {
+            self.search_last_literal_query.clone()
+        } else {
+            self.search_query.clone().or_else(|| self.search_last_literal_query.clone())
+        };
+        self.clear_search();
+        self.search_last_literal_query = literal_query;
+        let snapshot = crate::recall::RecallSnapshot::from_state(self);
+        let request_id = self.recall_worker.submit(snapshot, query)?;
+        self.recall_last_query = Some(query.to_string());
+        self.recall_mode = true;
+        self.search_query = Some(query.to_string());
+        self.recall_pending_id = Some(request_id);
+        self.recall_scope_edits = self.transcript_edits;
+        self.recall_scope_len = self.transcript.len();
+        self.recall_scope_game_dir = self.game_dir.clone();
+        Ok(())
+    }
+
+    /// A cheap invalidation check for a pending or displayed recall. The worker
+    /// also checks its exact snapshot before results are accepted.
+    pub fn recall_scope_current(&mut self) -> bool {
+        if self.recall_scope_game_dir != self.game_dir
+            || self.recall_scope_edits != self.transcript_edits
+            || self.recall_scope_len > self.transcript.len()
+        {
+            return false;
+        }
+        // A Meta/Warning/Assist append cannot change the observed passages or
+        // move an existing visible position. In particular, a slash-command
+        // notice must not restart a model download already in progress.
+        let added = self.recall_scope_len..self.transcript.len();
+        if added.clone().any(|i| matches!(self.transcript_kinds.get(i).copied().unwrap_or(TranscriptKind::Story), TranscriptKind::Story | TranscriptKind::Input)) {
+            return false;
+        }
+        self.recall_scope_len = self.transcript.len();
+        true
+    }
+
+    /// Scroll to a ranked passage using the renderer's current wrapped rows.
+    /// Returns None until the first transcript frame has built its wrap cache.
+    pub fn recall_scroll_for_match(&self, visible_pos: usize, viewport: usize) -> Option<u16> {
+        let wrap = self.transcript_wrap.borrow();
+        let cache = wrap.as_ref()?;
+        if cache.key.content.len != self.transcript.len()
+            || cache.starts.len() != self.visible_transcript_indices().len()
+        {
+            return None;
+        }
+        scroll_for_wrapped_recall(&cache.starts, cache.rows.len(), visible_pos, viewport, cache.anchor_row)
+    }
+
+    /// The selected result remains the game's original text, with enough
+    /// context in `recall_excerpts` to explain why it ranked.
+    pub fn recall_selected_status(&self) -> String {
+        let count = self.search_matches.len();
+        if count == 0 {
+            return "recall: no passages found in what you have seen".to_string();
+        }
+        let excerpt = self.recall_excerpts.get(self.search_idx).map(String::as_str).unwrap_or("");
+        let mode = if self.recall_keyword_only_reason.is_some() { "word search only" } else { "hybrid" };
+        format!("recall [{}/{}] ({mode}): {}", self.search_idx + 1, count, one_line_status(excerpt, 120))
+    }
+
+    /// Return from the text preview to the source in a pixel-rendered game.
+    /// The modal uses terminal rows, while raster play uses the native prose
+    /// box. Rebuild that cache before translating the selected source line.
+    pub fn close_recall(&mut self) {
+        if self.recall_mode && self.config.v6_render != crate::config::V6RenderMode::Hybrid {
+            let raw_line = self.search_matches.get(self.search_idx)
+                .and_then(|&pos| self.visible_transcript_indices().get(pos).copied());
+            let width = self.raster_wrap.borrow().as_ref().map(|cache| cache.key.shape.width);
+            if let (Some(raw_line), Some(width), Some(metrics)) = (raw_line, width, self.v6_raster_metrics.get()) {
+                crate::render::wrap_cache::raster_wrap_refresh(self, width);
+                let scroll = {
+                    let wrap = self.raster_wrap.borrow();
+                    let cache = wrap.as_ref().expect("refreshed above");
+                    let anchor = crate::render::transcript::anchor_row_at(&cache.starts, cache.rows.len(), self.clear_anchor);
+                    scroll_for_wrapped_recall(&cache.starts, cache.rows.len(), raw_line, metrics.viewport_rows as usize, anchor)
+                };
+                if let Some(scroll) = scroll {
+                    self.transcript_scroll = scroll;
+                    self.scroll_anim = None;
+                }
+            }
+        }
+        self.clear_search();
     }
 
     /// Clear all search state: query, matches, and index.
     pub fn clear_search(&mut self) {
+        if self.recall_mode || self.recall_pending_id.is_some() {
+            self.recall_worker.cancel();
+        } else {
+            self.search_last_literal_query = None;
+        }
         self.search_query = None;
         self.search_matches.clear();
         self.search_idx = 0;
+        self.recall_mode = false;
+        self.recall_pending_id = None;
+        self.recall_excerpts.clear();
+        self.recall_preview_scroll = 0;
+        self.recall_keyword_only_reason = None;
+        self.recall_empty = false;
     }
+}
+
+fn one_line_status(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+}
+
+fn scroll_for_wrapped_recall(starts: &[usize], total_rows: usize, visible_pos: usize, viewport: usize, anchor_row: Option<usize>) -> Option<u16> {
+    let start = *starts.get(visible_pos)?;
+    if viewport == 0 {
+        return None;
+    }
+    let desired_start = start.saturating_sub(viewport / 3);
+    let mut scroll = total_rows.saturating_sub(desired_start.saturating_add(viewport));
+    // A fresh screen clear pins post-clear lines at scroll=0. A recalled line
+    // before that boundary needs nonzero scroll even when all rows fit: the
+    // renderer checks the requested scroll before clamping to its maximum.
+    if scroll == 0 && anchor_row.is_some_and(|anchor| start < anchor) {
+        scroll = 1;
+    }
+    Some(scroll.min(u16::MAX as usize) as u16)
 }
 
 /// Append this render pass's pipeline stage labels to trace.log when `on`. (trace feature)
@@ -5415,7 +6463,7 @@ pub(crate) fn write_map_trace(user_dir: &std::path::Path, steps: &[String], on: 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-state"))]
 mod tests {
     use super::*;
 
@@ -5423,6 +6471,15 @@ mod tests {
     fn appstate_history_defaults_empty() {
         let s = AppState::default();
         assert!(s.history.is_empty(), "history starts empty");
+    }
+
+    /// SQ-1258: a picker-launched run always resolves back to the library, a
+    /// command-line launch always leaves lanthorn — the ONE fact every quit
+    /// path (game-driven, `quit`, Ctrl-Q, `/quit-to-library`) is meant to agree on.
+    #[test]
+    fn exit_target_for_launch_follows_whether_a_library_exists() {
+        assert_eq!(ExitTarget::for_launch(true), ExitTarget::Library);
+        assert_eq!(ExitTarget::for_launch(false), ExitTarget::Exit);
     }
 
     #[test]
@@ -5489,8 +6546,7 @@ mod tests {
         use crate::session::SchannelOp;
         let mut state = AppState::default();
         state.config.enable_sound = true;
-        audio::disable_output_for_tests(); // silent backend: no real device to open/tear down
-        state.audio = Some(audio::AudioBackend::new(50));
+        state.audio = Some(crate::host::sound::default_sound_sink(50)); // silent in tests: no device
         // Seed the channel's current gain (as a prior play/set_volume would).
         state.glulx_gain.insert(1, 1.0);
         // A ramped set_volume_ext installs a ramp from the current gain to target
@@ -5529,8 +6585,7 @@ mod tests {
         use crate::session::SchannelOp;
         let mut state = AppState::default();
         state.config.enable_sound = true;
-        audio::disable_output_for_tests(); // silent backend: no real device to open/tear down
-        state.audio = Some(audio::AudioBackend::new(50));
+        state.audio = Some(crate::host::sound::default_sound_sink(50)); // silent in tests: no device
         // A ramped set_volume_ext with a nonzero notify schedules a pending
         // volume-notify keyed by channel (no live sound needed).
         state.play_glulx_sound_ops(&[SchannelOp::SetVolumeExt { chan: 1, vol: 0x8000, duration_ms: 1000, notify: 7 }]);
@@ -5558,6 +6613,7 @@ mod tests {
             pixels: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
             align: crate::inline_image::ImageAlign::InlineUp,
             scaled: None, margin_px: None,
+            rule: None, link: 0, resource: None,
         };
         let elems = vec![
             TranscriptElem::Text { text: "a".into(), runs: vec![(1, 0, zvm::screen::ZColour::Default, zvm::screen::ZColour::Default, 0, ParaFmt::default(), 0, false)] },
@@ -5712,6 +6768,59 @@ mod tests {
         assert_eq!(s.transcript_kinds.len(), 2);
         assert!(matches!(s.transcript_kinds[0], TranscriptKind::Story));
         assert!(matches!(s.transcript_kinds[1], TranscriptKind::Meta));
+    }
+
+    #[test]
+    fn transcript_sink_streams_two_turns_flushed_and_plain_text() {
+        let dir = crate::scratch_dir("sq0410");
+        let path = dir.join("transcript.txt");
+        let mut s = AppState::default();
+        s.attach_transcript_sink(&path);
+        assert!(s.transcript_kinds.is_empty(), "attach itself must not write to the visible transcript");
+
+        // Turn 1: the player's command, then the game's reply.
+        s.push_transcript_kind("> look", TranscriptKind::Input);
+        s.push_transcript_runs("West of House\nYou are standing in an open field.", TranscriptKind::Story, &[]);
+
+        // Flushed after the first turn, before the second is even typed.
+        let after_turn_one = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after_turn_one, "> look\nWest of House\nYou are standing in an open field.\n");
+
+        // Turn 2: a blank line separates it, and a Meta line (a `/help` dump)
+        // must not reach the file at all.
+        s.push_transcript_kind("/help dump", TranscriptKind::Meta);
+        s.push_transcript_kind("> north", TranscriptKind::Input);
+        s.push_transcript_runs("North of House\nYou can't go that way.", TranscriptKind::Story, &[]);
+
+        let after_turn_two = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_turn_two,
+            "> look\nWest of House\nYou are standing in an open field.\n\
+             \n> north\nNorth of House\nYou can't go that way.\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_sink_open_failure_yields_one_warning_and_no_panic() {
+        let dir = crate::scratch_dir("sq0410-badpath");
+        // A directory cannot be opened for append; this must not panic, and
+        // must not silently do nothing either.
+        let mut s = AppState::default();
+        s.attach_transcript_sink(&dir);
+        assert!(s.transcript_sink.is_none(), "a path that cannot be opened must not leave a sink attached");
+        assert_eq!(s.transcript_kinds.len(), 1);
+        assert!(matches!(s.transcript_kinds[0], TranscriptKind::Warning));
+
+        // And it stays quiet from here on: pushing more turns raises no further
+        // warnings, since there is no sink left to fail.
+        s.push_transcript_kind("> look", TranscriptKind::Input);
+        s.push_transcript_runs("West of House", TranscriptKind::Story, &[]);
+        let warnings = s.transcript_kinds.iter().filter(|k| matches!(k, TranscriptKind::Warning)).count();
+        assert_eq!(warnings, 1, "no spam: exactly one warning for the whole session");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5947,6 +7056,7 @@ mod tests {
             pixels: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
             align: crate::inline_image::ImageAlign::InlineUp,
             scaled: None, margin_px: None,
+            rule: None, link: 0, resource: None,
         };
         st.push_transcript_image(dummy);
         st.push_transcript("world");
@@ -6023,6 +7133,7 @@ mod tests {
             pixels: std::sync::Arc::new(image::RgbaImage::new(4, 4)),
             align: crate::inline_image::ImageAlign::InlineUp,
             scaled: None, margin_px: None,
+            rule: None, link: 0, resource: None,
         };
         s.push_transcript_image(dummy); // transcript_images[0] = Some, len 1
         s.push_transcript("a\nb"); // grow to len 3
@@ -6172,10 +7283,10 @@ mod tests {
         let mut s = AppState::default();       // audio = None, sound_blorb = None
         s.config.enable_sound = true;
         // A #1 bleep event: play_turn_sounds must not panic with no backend.
-        let ev = SoundEvent { number: 1, effect: 2, volume: 8, repeats: 0, routine: 0 };
+        let ev = SoundEvent::new(1, 2, 8, 0, 0);
         s.play_turn_sounds(&[ev]);             // no device -> silent, no panic
         // A #3 sampled start with no blorb loaded: no id remembered, no panic.
-        let ev3 = SoundEvent { number: 3, effect: 2, volume: 8, repeats: 1, routine: 0 };
+        let ev3 = SoundEvent::new(3, 2, 8, 1, 0);
         s.play_turn_sounds(&[ev3]);
         assert!(s.sound_ids.is_empty(), "no sound id remembered without a blorb");
     }
@@ -6223,6 +7334,7 @@ mod tests {
                 std::time::Duration::from_millis(100),
                 crate::anim::Easing::EaseOut,
             ),
+            kind: ScrollAnimKind::Scroll,
         });
         assert!(s.has_active_animation(), "scroll anim counts as active");
         s.scroll_anim = None;
@@ -6274,6 +7386,117 @@ mod tests {
         assert_eq!(a.target(), 8, "to = new target");
     }
 
+    /// `scroll_transcript_to` is the ordinary, reader-driven scroll path
+    /// (wheel, page keys, the pager's own advance/dismiss, drag-autoscroll —
+    /// see its own doc comment) — its `ScrollAnim` must always be tagged
+    /// `Scroll`, never `Follow`, and time off `scroll_ms` (SQ-1597).
+    #[test]
+    fn scroll_transcript_to_produces_scroll_kind_timed_off_scroll_ms() {
+        let mut s = AppState::default();
+        s.config.animation.scroll_ms = 250;
+        s.config.animation.follow_ms = 999_000; // if this leaked in, the duration below would betray it
+        s.scroll_transcript_to(8);
+        let a = s.scroll_anim.as_ref().expect("animation armed when enabled");
+        assert_eq!(a.kind, ScrollAnimKind::Scroll, "reader-driven scroll must tag Scroll, not Follow");
+        assert_eq!(
+            a.tween.duration(),
+            Duration::from_millis(250),
+            "must time off scroll_ms, not follow_ms"
+        );
+        assert_eq!(a.tween.easing(), s.config.animation.easing);
+    }
+
+    /// The transcript follow-ease (SQ-1595) must tag its `ScrollAnim` `Follow`
+    /// and time off `follow_ms`, so a host can tell it apart from an ordinary
+    /// scroll without re-deriving the "at bottom" rule itself (SQ-1597).
+    #[test]
+    fn arm_transcript_follow_ease_produces_follow_kind_timed_off_follow_ms() {
+        let mut s = AppState::default();
+        s.config.animation.scroll_ms = 999_000; // if this leaked in, the duration below would betray it
+        s.config.animation.follow_ms = 250;
+        s.arm_transcript_follow_ease(30, 12);
+        let a = s.scroll_anim.as_ref().expect("follow-ease armed");
+        assert_eq!(a.kind, ScrollAnimKind::Follow, "follow-ease must tag Follow, not Scroll");
+        assert_eq!(
+            a.tween.duration(),
+            Duration::from_millis(250),
+            "must time off follow_ms, not scroll_ms"
+        );
+        assert_eq!(a.tween.easing(), s.config.animation.easing);
+    }
+
+    // ── Transcript follow-ease (SQ-1595) ─────────────────────────────────────
+
+    /// `ScrollAnim::over` is what the follow-ease uses instead of `to` — same
+    /// enabled/zero-duration instant-path rules, but the caller supplies its own
+    /// duration rather than reading `cfg.scroll_ms`.
+    #[test]
+    fn scroll_anim_over_honors_enabled_and_zero_duration() {
+        use crate::anim::Easing;
+        assert!(
+            ScrollAnim::over(0, 10, false, 200, Easing::EaseOut, ScrollAnimKind::Follow).is_none(),
+            "disabled arms nothing"
+        );
+        assert!(
+            ScrollAnim::over(0, 10, true, 0, Easing::EaseOut, ScrollAnimKind::Follow).is_none(),
+            "0ms arms nothing"
+        );
+        let a = ScrollAnim::over(5, 10, true, 200, Easing::EaseOut, ScrollAnimKind::Follow).expect("armed");
+        assert_eq!(a.from, 5);
+        assert_eq!(a.target(), 10);
+        assert_eq!(a.kind, ScrollAnimKind::Follow, "caller-supplied kind is carried through");
+    }
+
+    /// `arm_transcript_follow_ease` sets the logical target immediately (same
+    /// contract as `scroll_transcript_to`) but starts the display from the
+    /// caller's `from`, not from the current displayed offset, and it must use
+    /// `follow_ms` — a value nothing else on `AppState` reads — not `scroll_ms`.
+    #[test]
+    fn arm_transcript_follow_ease_uses_follow_ms_not_scroll_ms() {
+        let mut s = AppState::default();
+        s.config.animation.scroll_ms = 999_000; // if this were used, done() would never be true
+        s.config.animation.follow_ms = 1; // 1ms: settles almost immediately
+        s.transcript_scroll = 0;
+        s.arm_transcript_follow_ease(30, 12);
+        assert_eq!(s.transcript_scroll, 12, "logical target set immediately");
+        let a = s.scroll_anim.as_ref().expect("follow-ease armed");
+        assert_eq!(a.from, 30, "display starts from the pre-growth equivalent offset, not 0");
+        assert_eq!(a.target(), 12);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(a.done(), "a 1ms follow_ms tween must have settled by now — proves follow_ms drove it, not the 999s scroll_ms");
+    }
+
+    /// `enabled = false` makes the follow-ease instant too, exactly like
+    /// `scroll_transcript_to`.
+    #[test]
+    fn arm_transcript_follow_ease_instant_when_disabled() {
+        let mut s = AppState::default();
+        s.config.animation.enabled = false;
+        s.arm_transcript_follow_ease(30, 12);
+        assert_eq!(s.transcript_scroll, 12);
+        assert!(s.scroll_anim.is_none(), "disabled = instant, no animation");
+    }
+
+    /// The cancellation hook's underlying finalize: it must work regardless of
+    /// whether the tween has finished — that is the whole point (ending one
+    /// EARLY) — and it is the same path the run loop's natural on-`done()`
+    /// finalize reuses (see `main.rs`'s run loop, SQ-1595).
+    #[test]
+    fn finalize_transcript_scroll_anim_now_ends_an_in_flight_tween_early() {
+        let mut s = AppState::default();
+        s.config.animation.follow_ms = 999_000; // long enough that it is still mid-flight
+        s.arm_transcript_follow_ease(30, 12);
+        assert!(!s.scroll_anim.as_ref().unwrap().done(), "premise: still mid-tween");
+        assert_ne!(s.effective_transcript_scroll(), 12, "premise: display has not caught up yet");
+
+        assert!(s.finalize_transcript_scroll_anim_now(), "an animation was in flight to finalize");
+        assert!(s.scroll_anim.is_none(), "the animation is cleared");
+        assert_eq!(s.transcript_scroll, 12, "snapped straight to the target, not reverted");
+        assert_eq!(s.effective_transcript_scroll(), 12, "the display reads settled immediately");
+
+        assert!(!s.finalize_transcript_scroll_anim_now(), "nothing left to finalize");
+    }
+
     // ── Story-pane scrollbar auto-hide (SQ-0782) ─────────────────────────────
 
     #[test]
@@ -6319,6 +7542,43 @@ mod tests {
         s.config.animation.scrollbar_hide_ms = 0;
         s.scrollbar_shown_at = Some(Instant::now() - Duration::from_secs(60));
         assert!(!s.finalize_scrollbar_if_done());
+    }
+
+    /// SQ-1198: `transcript_scroll_in_motion` is what the sixel backend reads to
+    /// decide footprint-vs-payload. It must be true immediately after a scroll
+    /// (so the render suppresses), keep the run loop fast-polling while it is
+    /// (`has_active_animation`), and read false once the settle window elapses.
+    #[test]
+    fn transcript_scroll_in_motion_follows_the_settle_window() {
+        let mut s = AppState::default();
+        assert!(!s.transcript_scroll_in_motion(), "never scrolled = not in motion");
+        assert!(!s.has_active_animation());
+
+        s.scroll_transcript_to(5);
+        assert!(s.transcript_scroll_in_motion(), "a fresh scroll is in motion");
+        assert!(s.has_active_animation(), "in-motion state keeps the run loop polling without input");
+
+        // Past the settle window (mirrors how the scrollbar tests fake elapsed
+        // time above, since neither test can literally sleep for it).
+        s.sixel_scroll_motion_at = Some(Instant::now() - Duration::from_millis(200));
+        assert!(!s.transcript_scroll_in_motion(), "past the settle window");
+    }
+
+    /// The window closing is itself the content change (a suppressed sixel band
+    /// goes back to its full payload at the same offset), so it needs the same
+    /// one-settle-frame treatment as the scrollbar fade above.
+    #[test]
+    fn finalize_sixel_scroll_motion_forces_exactly_one_settle_frame() {
+        let mut s = AppState::default();
+        assert!(!s.finalize_sixel_scroll_motion_if_done(), "nothing to settle when never scrolled");
+
+        s.scroll_transcript_to(5);
+        assert!(!s.finalize_sixel_scroll_motion_if_done(), "still in motion: not done yet");
+
+        s.sixel_scroll_motion_at = Some(Instant::now() - Duration::from_millis(200));
+        assert!(s.finalize_sixel_scroll_motion_if_done(), "an elapsed window asks for the settle frame");
+        assert!(s.sixel_scroll_motion_at.is_none(), "the window is cleared, mirroring finalize_scrollbar_if_done");
+        assert!(!s.finalize_sixel_scroll_motion_if_done(), "and only ever asks once");
     }
 
     #[test]
@@ -6391,6 +7651,7 @@ mod tests {
             from: 0,
             to: 4,
             tween: crate::anim::Tween::new(std::time::Duration::ZERO, crate::anim::Easing::Linear),
+            kind: ScrollAnimKind::Scroll,
         });
         assert_eq!(s.effective_transcript_scroll(), 4, "done tween shows rounded target");
     }
@@ -6404,6 +7665,7 @@ mod tests {
                 std::time::Duration::from_millis(100),
                 crate::anim::Easing::Linear,
             ),
+            kind: ScrollAnimKind::Scroll,
         };
         // Right after construction progress is ~0, so current() is near `from`.
         let c = a.current();
@@ -6457,7 +7719,7 @@ mod tests {
         // The command band is deliberately absent from this list: it is a dock,
         // not a modal, and must NOT register as an overlay at all (SQ-0664).
         s.overlays.command_band = Some(CommandBandState::default());
-        assert!(!s.any_overlay_open(), "the command band is not an overlay");
+        assert!(!s.any_overlay_open(), "the command panel is not an overlay");
         assert!(!s.any_modal_overlay_open(), "…and certainly not a modal one");
         s.overlays.command_band = None;
 
@@ -6472,7 +7734,7 @@ mod tests {
         // both.
         s.room_dock.toggle_to(true, true);
         s.selected_room = Some(1);
-        assert!(!s.any_overlay_open(), "the room dock is not an overlay, pinned or not");
+        assert!(!s.any_overlay_open(), "the room panel is not an overlay, pinned or not");
         s.selected_room = None;
         assert!(!s.any_overlay_open());
         s.room_dock.toggle_to(false, true);
@@ -6519,6 +7781,20 @@ mod tests {
         s.debug = None;
 
         assert!(!s.any_overlay_open(), "all cleared => any_overlay_open false again");
+    }
+
+    #[test]
+    fn recall_is_modal_and_yields_to_an_existing_dialog() {
+        let mut s = AppState::default();
+        s.recall_mode = true;
+        assert!(s.any_modal_overlay_open());
+        assert!(!s.any_modal_overlay_open_except_recall());
+        assert!(s.open_modal_overlays().contains(&"recall"));
+        s.overlays.reset_dialog = true;
+        assert!(s.any_modal_overlay_open_except_recall());
+        s.overlays.reset_dialog = false;
+        s.clear_search();
+        assert!(!s.any_modal_overlay_open());
     }
 
     #[test]
@@ -6814,7 +8090,7 @@ mod tests {
     }
 
     /// Wait for the in-flight render worker to finish, then install it.
-    fn drain_render_job(s: &mut AppState) {
+    fn drain_render_job(s: &mut AppState, graph: &MapGraph) {
         while s
             .render_job
             .borrow()
@@ -6823,11 +8099,11 @@ mod tests {
         {
             std::thread::yield_now();
         }
-        s.poll_render_job();
+        s.poll_render_job(graph);
     }
 
     /// SQ-0391, flipped by SQ-0666: a direction that goes NOWHERE adds no room and no
-    /// connection, so `graph_gen` deliberately does not bump for it (SQ-0378 keeps a plain step
+    /// connection, so `struct_gen` deliberately does not bump for it (SQ-0378 keeps a plain step
     /// from re-routing the whole map). The untried-exits OVERLAY was memoised on that generation
     /// and needed a hand-written refresh to notice a foiled move; the matrix view that replaced
     /// it reads the graph directly on every frame and so cannot go stale at all. Same fact, same
@@ -6842,16 +8118,16 @@ mod tests {
         m.observe(1, "Hall", None);
         let mut s = AppState::default();
         let _ = s.cached_map_render(0, &m.graph);
-        drain_render_job(&mut s);
+        drain_render_job(&mut s, &m.graph);
 
         assert_eq!(classify(&m.graph, 1, Direction::N), MatrixCell::Untried, "north starts `·`");
 
         let (gen, rooms, conns) =
-            (s.graph_gen, m.graph.rooms().count(), m.graph.connections().len());
+            (m.graph.struct_gen(), m.graph.rooms().count(), m.graph.connections().len());
         m.observe(1, "Hall", Some(Direction::N)); // typed, went nowhere
         assert_eq!(m.graph.rooms().count(), rooms, "a foiled move adds no room");
         assert_eq!(m.graph.connections().len(), conns, "and no connection");
-        assert_eq!(s.graph_gen, gen, "so the map memo is NOT invalidated");
+        assert_eq!(m.graph.struct_gen(), gen, "so the map memo is NOT invalidated");
 
         assert_eq!(
             classify(&m.graph, 1, Direction::N),
@@ -6878,7 +8154,7 @@ mod tests {
             assert_eq!(rm.rooms.len(), 0, "empty placeholder while the first route runs");
         }
         assert!(s.render_job.borrow().is_some(), "even the first build is off-thread");
-        drain_render_job(&mut s);
+        drain_render_job(&mut s, &g);
         {
             let rm = s.cached_map_render(0, &g);
             assert_eq!(rm.rooms.len(), 1, "routed model served once it lands");
@@ -6887,17 +8163,16 @@ mod tests {
         let _ = s.cached_map_render(0, &g);
         assert!(s.render_job.borrow().is_none());
 
-        // A geometry change (new room + gen bump): re-route OFF-thread, the STALE
-        // model (still 1 room) served meanwhile.
+        // A geometry change (new room, which bumps struct_gen on its own): re-route
+        // OFF-thread, the STALE model (still 1 room) served meanwhile.
         g.upsert_room(2, "B".into());
         g.set_pos(2, (1, 0));
-        s.graph_gen = s.graph_gen.wrapping_add(1);
         {
             let rm = s.cached_map_render(0, &g);
             assert_eq!(rm.rooms.len(), 1, "last-ready model served while routing");
         }
         assert!(s.render_job.borrow().is_some(), "a stale model re-routes off-thread");
-        drain_render_job(&mut s);
+        drain_render_job(&mut s, &g);
         {
             let rm = s.cached_map_render(0, &g);
             assert_eq!(rm.rooms.len(), 2, "the freshly routed model is now served");
@@ -6937,7 +8212,7 @@ mod tests {
         }
 
         // The routed model lands at the SAME (gen, layer): the cache must drop.
-        drain_render_job(&mut s);
+        drain_render_job(&mut s, &g);
         assert!(
             s.map_derived.borrow().is_none(),
             "installing the routed model drops the placeholder's tables"
@@ -6955,7 +8230,7 @@ mod tests {
     }
 
     /// SQ-0378: a step between already-placed rooms changes the current-room
-    /// highlight but not the routed geometry, so `graph_gen` does not bump. The
+    /// highlight but not the routed geometry, so `struct_gen` does not bump. The
     /// cache must follow the player WITHOUT re-routing (no worker spawns).
     #[test]
     fn cached_map_render_refreshes_current_without_rerouting() {
@@ -6970,14 +8245,14 @@ mod tests {
 
         // Build + install the initial model.
         let _ = s.cached_map_render(0, &g);
-        drain_render_job(&mut s);
+        drain_render_job(&mut s, &g);
         {
             let rm = s.cached_map_render(0, &g);
             assert!(rm.rooms.iter().find(|r| r.id == 1).unwrap().is_current);
             assert!(!rm.rooms.iter().find(|r| r.id == 2).unwrap().is_current);
         }
 
-        // Move the player to room 2 WITHOUT bumping graph_gen.
+        // Move the player to room 2 WITHOUT bumping struct_gen (set_current never does).
         g.set_current(2);
         {
             let rm = s.cached_map_render(0, &g);
@@ -6990,6 +8265,52 @@ mod tests {
         assert!(
             s.render_job.borrow().is_none(),
             "a current-room change must NOT spawn a re-route worker"
+        );
+    }
+
+    /// SQ-1544: `invalidate_map_render`'s own doc comment says a generation-number
+    /// comparison alone cannot be trusted across a wholesale graph swap, because a
+    /// brand-new `MapGraph`'s `struct_gen` starts back at 0 and can coincidentally
+    /// equal a stale cache entry's `gen`. This forces exactly that collision — not a
+    /// contrived mismatch — and checks the fresh graph is routed anyway.
+    #[test]
+    fn invalidate_map_render_defeats_a_generation_collision_after_a_wholesale_graph_swap() {
+        use mapper::graph::MapGraph;
+
+        let mut s = AppState::default();
+        // Poison the cache with a routed model standing in for the previous game's
+        // stale map — a room the fresh graph below can never contain.
+        *s.map_render.borrow_mut() = Some(MapRenderCache {
+            gen: 0,
+            layer: 0,
+            rm: {
+                let mut poisoned = MapGraph::new();
+                poisoned.upsert_room(1, "Stale Room".into());
+                poisoned.set_pos(1, (0, 0));
+                mapper::render::render(&poisoned)
+            },
+        });
+
+        let fresh = MapGraph::new();
+        assert_eq!(
+            fresh.struct_gen(),
+            0,
+            "fixture: the collision this test forces (gen 0 == gen 0) is real, not assumed"
+        );
+
+        // Without invalidation, `cached_map_render`'s `c.gen == gen` freshness check
+        // would treat the poisoned entry as still fresh for this "new" graph and
+        // serve "Stale Room" straight through with no re-route.
+        s.invalidate_map_render();
+        let rm = s.cached_map_render(0, &fresh);
+        assert!(
+            rm.rooms.is_empty(),
+            "the fresh empty-placeholder model must be served, not the poisoned cache: {:?}",
+            rm.rooms.iter().map(|r| &r.label).collect::<Vec<_>>()
+        );
+        assert!(
+            s.render_job.borrow().is_some(),
+            "a real re-route must be spawned for the new graph, not skipped as already \"fresh\""
         );
     }
 
@@ -7255,7 +8576,7 @@ mod tests {
         // Build a minimal HintSession using the minizork fixture (same approach as
         // the reset test in input.rs). If the fixture is absent we skip.
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../zvm/tests/fixtures/minizork.z3");
+            .join("tests/fixtures/stories/minizork-r34-s871124.z3");
         if !fixture_path.exists() {
             return; // fixture absent — skip
         }
@@ -7279,7 +8600,7 @@ mod tests {
     #[test]
     fn hint_session_scroll_by_clamps_to_range() {
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../zvm/tests/fixtures/minizork.z3");
+            .join("tests/fixtures/stories/minizork-r34-s871124.z3");
         if !fixture_path.exists() {
             return; // fixture absent — skip
         }
@@ -7311,12 +8632,30 @@ mod tests {
         assert_eq!(hs.scroll, 0);
     }
 
+    /// `HintSession::scroll_by` has no follow concept at all — SQ-1595 never
+    /// touched hint-panel scrolling — so its `ScrollAnim` must always tag
+    /// `Scroll`, protecting against a future accidental follow-tagging of
+    /// hint scrolling (SQ-1597).
+    #[test]
+    fn hint_session_scroll_by_produces_scroll_kind_not_follow() {
+        let Some(mut hs) = make_hint_session() else { return }; // fixture absent — skip
+        let anim = crate::config::AnimationConfig {
+            enabled: true,
+            easing: crate::anim::Easing::EaseOut,
+            scroll_ms: 100,
+            ..Default::default()
+        };
+        hs.scroll_by(3, 5, &anim);
+        let a = hs.scroll_anim.as_ref().expect("animation armed when enabled");
+        assert_eq!(a.kind, ScrollAnimKind::Scroll, "hint-panel scroll must never tag Follow");
+    }
+
     /// Build a minimal `HintSession` off the minizork fixture (its transcript
     /// starts empty so `apply_turn` math is easy to assert), or `None` if the
     /// fixture is absent (caller skips).
     fn make_hint_session() -> Option<HintSession> {
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../zvm/tests/fixtures/minizork.z3");
+            .join("tests/fixtures/stories/minizork-r34-s871124.z3");
         if !fixture_path.exists() {
             return None;
         }
@@ -7355,6 +8694,9 @@ mod tests {
             pictures: Vec::new(),
             transcript_elems: vec![],
             prose_retired: None,
+            declared_exit: None,
+            description: None,
+            items: Vec::new(),
         }
     }
 
@@ -7441,6 +8783,110 @@ mod tests {
     }
 
     #[test]
+    fn recall_scope_ignores_meta_append_but_not_new_story_text() {
+        let mut s = AppState::default();
+        s.push_transcript("The brass key is on the shelf.");
+        s.recall_scope_edits = s.transcript_edits;
+        s.recall_scope_len = s.transcript.len();
+        s.push_transcript_kind("App notification", TranscriptKind::Meta);
+        assert!(s.recall_scope_current(), "app output must not restart a pending recall");
+        s.push_transcript("A new room appears.");
+        assert!(!s.recall_scope_current(), "new observed text changes the search scope");
+        s.recall_scope_len = s.transcript.len();
+        s.game_dir = std::path::PathBuf::from("other-story.save");
+        assert!(!s.recall_scope_current(), "a different story cannot reuse ranked positions");
+    }
+
+    #[test]
+    fn recall_keeps_its_query_separate_from_literal_search() {
+        let mut s = AppState::default();
+        s.run_search("lamp", false);
+        s.recall_mode = true;
+        s.search_query = Some("thing that lights the dark".into());
+        s.recall_last_query = s.search_query.clone();
+        s.clear_search();
+        assert_eq!(s.search_last_literal_query.as_deref(), Some("lamp"));
+        assert_eq!(s.recall_last_query.as_deref(), Some("thing that lights the dark"));
+        s.reset_transcript_sidecars();
+        assert!(s.recall_last_query.is_none(), "restore must forget the previous timeline's recall");
+    }
+
+    #[test]
+    fn recall_stores_the_same_trimmed_query_as_its_worker_reply() {
+        let mut s = AppState::default();
+        assert!(s.transcript.is_empty()); // empty corpus returns without loading a model
+        s.begin_recall(" lantern ").unwrap();
+        assert_eq!(s.search_query.as_deref(), Some("lantern"));
+        assert_eq!(s.recall_last_query.as_deref(), Some("lantern"));
+        let reply = (0..100)
+            .find_map(|_| {
+                let reply = s.recall_worker.poll();
+                if reply.is_none() { std::thread::sleep(std::time::Duration::from_millis(1)); }
+                reply
+            })
+            .expect("empty-corpus reply should arrive without model loading");
+        assert_eq!(s.recall_pending_id, Some(reply.request_id));
+        assert_eq!(s.search_query.as_deref(), Some(reply.query.as_str()));
+    }
+
+    #[test]
+    fn recall_wrap_scroll_uses_display_rows_and_handles_missing_viewport() {
+        let starts = [0, 8, 9, 10];
+        assert_eq!(scroll_for_wrapped_recall(&starts, 11, 0, 4, None), Some(7));
+        assert_eq!(scroll_for_wrapped_recall(&starts, 11, 1, 4, None), Some(0));
+        assert_eq!(scroll_for_wrapped_recall(&starts, 11, 2, 4, None), Some(0));
+        assert_eq!(scroll_for_wrapped_recall(&starts, 11, 1, 0, None), None);
+    }
+
+    #[test]
+    fn recall_before_screen_clear_bypasses_fresh_screen_anchor() {
+        use crate::render::transcript::{window_wrapped_rows, WrappedRow};
+        let rows: Vec<_> = ["old clue", "new room"].into_iter().map(|text| WrappedRow {
+            text: text.to_string(), kind: TranscriptKind::Story,
+            style: ratatui::style::Style::default(), runs: Vec::new(),
+            band: None, float: None,
+        }).collect();
+        let scroll = scroll_for_wrapped_recall(&[0, 1], rows.len(), 0, 10, Some(1)).unwrap();
+        assert_eq!(scroll, 1);
+        let (visible, _, _) = window_wrapped_rows(&rows, Some(1), 10, scroll);
+        assert_eq!(visible[0].text, "old clue");
+    }
+
+    #[test]
+    fn closing_recall_uses_native_raster_rows_and_raw_source_indices() {
+        let mut s = AppState::default();
+        s.config.v6_render = crate::config::V6RenderMode::Raster;
+        s.transcript_filter = TranscriptFilter::Story;
+        s.transcript = vec!["notice ".repeat(70), "LANTERN lights the dark corridor".into(), "later scenery ".repeat(80)];
+        s.transcript_kinds = vec![TranscriptKind::Meta, TranscriptKind::Story, TranscriptKind::Story];
+        let (_, metrics) = crate::render::screen::build_main_text(&s, 20, 8);
+        s.v6_raster_metrics.set(Some(metrics));
+        s.recall_mode = true;
+        s.search_matches = vec![0]; // visible position zero is raw line one
+        s.transcript_scroll = 1; // a different terminal-cell offset
+        s.close_recall();
+        let (visible, _) = crate::render::screen::build_main_text(&s, 20, 8);
+        assert!(visible.lines.iter().any(|line| line.contains("LANTERN")), "{:?}", visible.lines);
+        assert!(!s.recall_mode);
+    }
+
+    #[test]
+    fn closing_recall_can_show_raster_source_before_a_screen_clear() {
+        let mut s = AppState::default();
+        s.config.v6_render = crate::config::V6RenderMode::Raster;
+        s.transcript = vec!["old clue".into(), "new room".into()];
+        s.transcript_kinds = vec![TranscriptKind::Story; 2];
+        s.clear_anchor = Some(1);
+        let (_, metrics) = crate::render::screen::build_main_text(&s, 40, 12);
+        s.v6_raster_metrics.set(Some(metrics));
+        s.recall_mode = true;
+        s.search_matches = vec![0];
+        s.close_recall();
+        let (visible, _) = crate::render::screen::build_main_text(&s, 40, 12);
+        assert_eq!(visible.lines[0], "old clue");
+    }
+
+    #[test]
     fn map_trace_routes_render_steps_to_log_only_when_on() {
         let dir = std::env::temp_dir().join(format!("bm-maptrace-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7458,7 +8904,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-state"))]
 mod play_sound_tests {
     use super::*;
 

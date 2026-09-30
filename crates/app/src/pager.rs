@@ -99,6 +99,33 @@ pub struct Pager {
     /// BEFORE this turn's output, awaiting the next render to decide whether to
     /// engage. `None` when not armed.
     pub pending_before_rows: Option<u16>,
+    /// Set by [`AppState::reset_transcript_sidecars`](crate::state::AppState::
+    /// reset_transcript_sidecars) whenever `transcript` is replaced wholesale
+    /// (load / restore / reset / history jump — SQ-1411). `last_transcript_
+    /// total_rows` is now a baseline for a transcript that no longer exists;
+    /// left alone, the first arm after a resume measures the WHOLE restored
+    /// backlog as "new" and pages the reader through scrollback they already
+    /// read. `apply_frame` clears it by calibrating rather than measuring on
+    /// the first frame that actually has a transcript surface. Named so
+    /// `derive(Default)` gives `false` — valid — under every
+    /// `AppState::default()` in the test suite; do not rename to a
+    /// `baseline_valid` that would default the wrong way.
+    pub baseline_stale: bool,
+    /// True when [`AppState::mark_screen_clear`](crate::state::AppState::
+    /// mark_screen_clear) ran during the turn now armed — set there, alongside
+    /// `pending_before_rows`'s own arm, and consumed (read AND reset) by
+    /// [`apply_frame`] so it can never leak into a later, unrelated frame.
+    ///
+    /// `AppState::clear_anchor` sounds like the same fact but isn't: it is a
+    /// persistent transcript-line index the renderer pins post-clear output to,
+    /// and it survives across turns — it can answer "where was the most recent
+    /// clear", never "did THIS turn clear". This field answers exactly that,
+    /// for exactly one consumer: `mark_screen_clear` unconditionally parks
+    /// `transcript_scroll` at 0, which otherwise makes `apply_frame`'s
+    /// `at_bottom` check true regardless of where the reader actually was,
+    /// arming a follow-EASE animation on a turn that should just snap to place
+    /// instantly (SQ-1607).
+    pub screen_cleared_this_turn: bool,
 }
 
 impl Pager {
@@ -162,6 +189,58 @@ impl Pager {
 /// already.
 pub fn baseline_before(last_frame_rows: u16, continued_row: bool) -> u16 {
     last_frame_rows.saturating_sub(u16::from(continued_row))
+}
+
+/// The baseline the OPENING-BANNER arm (`startup.rs`) starts from: the first row
+/// of the boot output that carries anything to read (SQ-1434).
+///
+/// The banner arm is the one arm with no previous frame to measure against, so it
+/// used to start at row 0 — which counts the blank rows a story opens with as
+/// output the reader must not miss. They are not: the pager exists to guarantee
+/// the first row of PROSE is on screen, and a blank row is not prose.
+///
+/// It is not a rounding error. Every Inform 7 Glulx story opens by printing two
+/// or three newlines before its prologue (measured: `chlorophyll.gblorb` and
+/// `Alias 'The Magpie'.gblorb` three each, `advent.blb` six), and on a pane where
+/// the prose fits exactly those blanks are the WHOLE overflow. The pager then
+/// engaged, parked the view with those blank rows across the top of the screen,
+/// pushed three rows of real text below the fold, and — with a `Line` read
+/// pending — ate the first character of the player's first command to dismiss
+/// itself. That is strictly worse than not paging at all, and it is the reported
+/// symptom: "the `>` prompt appears, the first keystroke is swallowed, and there
+/// is plainly screen left".
+///
+/// A blank line wraps to exactly one row, so counting leading blank LINES counts
+/// leading blank ROWS — except for a line carrying an inline image, which is
+/// blank as text and several rows tall as a picture, so those stop the count.
+pub fn opening_baseline(state: &crate::state::AppState) -> u16 {
+    state
+        .transcript
+        .iter()
+        .enumerate()
+        .take_while(|(i, line)| {
+            line.trim().is_empty() && state.transcript_images.get(*i).is_none_or(Option::is_none)
+        })
+        .count()
+        .min(u16::MAX as usize) as u16
+}
+
+/// Arm the opening-banner pager: the ruleset a fresh boot and a restart both
+/// want, so neither has to spell `should_arm` + `arm` by hand and the two paths
+/// cannot drift apart (SQ-1575 — `reset_game` never armed at all, so a
+/// restarted game's banner never paused where a fresh boot's would). Engages
+/// only when the game is now waiting on player input and the v6 "never print
+/// [MORE]" veto isn't in force, baselined at the banner's first row of prose
+/// ([`opening_baseline`]).
+///
+/// This is the ruleset shared by every opening-banner arm, not the whole
+/// precondition for any one caller: `startup.rs` skips calling it entirely for
+/// a resumed transcript (that scrollback was already read), which is a
+/// boot-specific fact this helper knows nothing about and must not guess at.
+pub fn arm_opening_banner(state: &mut crate::state::AppState, session: &dyn crate::engine::Engine) {
+    if should_arm(session.pending_input(), more_suppressed(session)) {
+        state.pager.arm(opening_baseline(state));
+    }
 }
 
 /// What drove the turn whose output the pager is about to measure.
@@ -251,6 +330,19 @@ pub fn activation_target(
 /// made the next keypress measure the ENTIRE backlog as "new output", re-parking
 /// the view at the top with a [more] to drain. A pending arm simply survives
 /// until the next frame that really lays the transcript out.
+///
+/// `state.pager.baseline_stale` (SQ-1411) is the same idea one level up: a
+/// resume can replace the WHOLE transcript while sitting on a picture-only
+/// frame (Zork Zero's "Q to resume story" splash), so the surfaceless skip
+/// above leaves `last_transcript_total_rows` at its pre-resume value with no
+/// picture frame ever getting a chance to refresh it. The first frame that
+/// *does* have a surface is then the resumed transcript in full, and a bare
+/// baseline mismatch would measure it as "everything since the last real
+/// frame" and page the reader through scrollback they already read. So that
+/// first surfaced frame CALIBRATES instead of measuring: drop any pending
+/// arm, leave the view at the bottom, and cache the new total as the
+/// baseline — the same "already read" reasoning `startup.rs` applies to the
+/// opening-banner arm for a resumed transcript.
 pub fn apply_frame(
     state: &mut crate::state::AppState,
     max_scroll: u16,
@@ -262,8 +354,37 @@ pub fn apply_frame(
     if !transcript_surface {
         return;
     }
+    if state.pager.baseline_stale {
+        state.pager.pending_before_rows = None;
+        state.pager.screen_cleared_this_turn = false;
+        state.pager.active = false;
+        state.transcript_scroll = 0;
+        state.last_transcript_total_rows = total_rows;
+        state.pager.baseline_stale = false;
+        return;
+    }
     state.transcript_scroll = state.transcript_scroll.min(max_scroll);
+    // SQ-1607: consumed here, alongside `pending_before_rows`, regardless of
+    // whether an arm is pending — so a clear on a non-arming turn can never
+    // leak into a later, unrelated frame's decision.
+    let cleared_this_turn = std::mem::take(&mut state.pager.screen_cleared_this_turn);
     if let Some(before) = state.pager.pending_before_rows.take() {
+        // SQ-1595: was the reader already at (or following) the bottom before
+        // this turn's output arrived? Only then does the transition to
+        // wherever it lands get an autoscroll-follow ease — a reader scrolled
+        // into history is never dragged back down, by this or by anything
+        // else, exactly today's behavior of leaving their view alone.
+        //
+        // `mark_screen_clear` unconditionally parks `transcript_scroll` at 0,
+        // which makes `at_bottom` true here even when the reader had scrolled
+        // away before the clear — so a turn that cleared the screen (SQ-1607)
+        // is excluded from the follow-ease below and takes the instant-jump
+        // path instead, exactly as if the reader were not at the bottom.
+        let at_bottom = state.transcript_scroll == 0 && !cleared_this_turn;
+        // The pre-turn bottom's equivalent offset now that the transcript has
+        // grown by `added` rows: showing the same absolute rows the reader was
+        // just looking at means sitting `added` rows back from the NEW bottom.
+        let added = total_rows.saturating_sub(before);
         match activation_target(before, total_rows, viewport_rows, prompt_rows) {
             Some(target) => {
                 // `max_scroll` came from THIS frame, which has no prompt bar on it;
@@ -273,16 +394,29 @@ pub fn apply_frame(
                 // banner, `before == 0`) one row short and drop its first line —
                 // exactly the row this quest is about, on the one turn where the
                 // clamp binds (SQ-0823).
-                state.scroll_transcript_to(target.min(max_scroll.saturating_add(prompt_rows)));
+                let clamped = target.min(max_scroll.saturating_add(prompt_rows));
+                // The ease runs UP TO the pager's own park and no further — paging
+                // past it afterward is a reader action (`Action::PagerAdvance`)
+                // and always uses `scroll_ms`, never this.
+                if at_bottom {
+                    state.arm_transcript_follow_ease(added, clamped);
+                } else {
+                    state.scroll_transcript_to(clamped);
+                }
                 state.pager.active = true;
             }
-            None => state.pager.active = false,
+            None => {
+                if at_bottom && added > 0 {
+                    state.arm_transcript_follow_ease(added, 0);
+                }
+                state.pager.active = false;
+            }
         }
     }
     state.last_transcript_total_rows = total_rows;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-render"))]
 mod tests {
     use super::*;
 
@@ -410,6 +544,107 @@ mod tests {
         assert_eq!(60 - target - (10 - 1), 19);
     }
 
+    // ── Transcript follow-ease (SQ-1595) ─────────────────────────────────────
+
+    /// Output that fits in one screen (no pager) while the reader was at the
+    /// bottom still gets a follow-ease: the display starts from the pre-growth
+    /// equivalent offset (`added` rows back from the new bottom) and eases down
+    /// to 0, rather than jumping there with no animation at all.
+    #[test]
+    fn apply_frame_arms_a_follow_ease_when_at_bottom_and_output_fits() {
+        let mut state = crate::state::AppState::default();
+        assert_eq!(state.transcript_scroll, 0, "premise: reader is at the bottom");
+        state.pager.arm(20); // before_rows = 20
+        // 5 rows added (25 - 20), viewport 10: fits, no [more].
+        apply_frame(&mut state, 15, 10, 0, 25, true);
+        assert!(!state.pager.active, "5 added rows fit in a 10-row viewport");
+        assert_eq!(state.transcript_scroll, 0, "logical target is still the bottom");
+        let a = state.scroll_anim.as_ref().expect("a follow-ease must be armed");
+        assert_eq!(a.from, 5, "display starts 5 rows back — where the old bottom now sits");
+        assert_eq!(a.target(), 0);
+    }
+
+    /// SQ-1607: a turn that CLEARED the screen (e.g. Anchorhead's opening
+    /// `erase_window`) must snap to place instantly, never ease — even though
+    /// `mark_screen_clear` unconditionally parks `transcript_scroll` at 0,
+    /// which makes `apply_frame`'s `at_bottom` check true regardless of where
+    /// the reader actually was. Same shape as
+    /// `apply_frame_arms_a_follow_ease_when_at_bottom_and_output_fits` above
+    /// (5 rows added into a 10-row viewport, fits, no [more]) but going through
+    /// `mark_screen_clear` first — contrast the two: that one asserts a
+    /// follow-ease IS armed, this one asserts none is.
+    #[test]
+    fn apply_frame_skips_follow_ease_when_the_turn_cleared_the_screen() {
+        let mut state = crate::state::AppState::default();
+        state.mark_screen_clear();
+        assert_eq!(state.transcript_scroll, 0, "mark_screen_clear always parks at the bottom");
+        assert!(state.pager.screen_cleared_this_turn, "premise: the clear flag is set");
+        state.pager.arm(20); // before_rows = 20, as if armed for the clearing turn
+        // 5 rows added (25 - 20), viewport 10: fits, no [more].
+        apply_frame(&mut state, 15, 10, 0, 25, true);
+        assert!(!state.pager.active, "5 added rows fit in a 10-row viewport");
+        assert_eq!(state.transcript_scroll, 0, "already at the bottom from the clear");
+        assert!(
+            state.scroll_anim.is_none(),
+            "a clearing turn snaps instantly — no follow-ease, unlike the non-clearing case above"
+        );
+        assert!(!state.pager.screen_cleared_this_turn, "the flag must not leak into a later frame");
+    }
+
+    /// The same exclusion when the pager DOES engage (output overflows a
+    /// clearing turn's repaint): the reader still lands at the pager's park,
+    /// but via the ordinary instant-jump path (`scroll_transcript_to`), never
+    /// the Follow-kind ease `apply_frame_follow_ease_target_is_clamped_to_
+    /// the_pager_park` pins for the non-clearing case with identical numbers.
+    #[test]
+    fn apply_frame_jumps_instead_of_easing_when_the_pager_engages_on_a_clearing_turn() {
+        let mut state = crate::state::AppState::default();
+        state.mark_screen_clear();
+        state.pager.arm(2);
+        apply_frame(&mut state, 30, 10, 1, 27, true);
+        assert!(state.pager.active, "25 added rows overflow a 10-row viewport");
+        assert_eq!(state.transcript_scroll, 16, "parked exactly where the pager would park");
+        if let Some(a) = state.scroll_anim.as_ref() {
+            assert_ne!(
+                a.kind,
+                crate::state::ScrollAnimKind::Follow,
+                "a clearing turn must never arm a Follow ease"
+            );
+        }
+        assert!(!state.pager.screen_cleared_this_turn, "the flag must not leak into a later frame");
+    }
+
+    /// The reader scrolled into history before this output arrived: nothing
+    /// drags their view — no follow-ease, no change to `transcript_scroll` at
+    /// all, exactly today's (correct) behavior for a turn that fits on screen.
+    #[test]
+    fn apply_frame_arms_no_follow_ease_when_reader_scrolled_away() {
+        let mut state = crate::state::AppState::default();
+        state.transcript_scroll = 7; // reader scrolled up into history
+        state.pager.arm(20);
+        apply_frame(&mut state, 50, 10, 0, 25, true);
+        assert!(!state.pager.active);
+        assert_eq!(state.transcript_scroll, 7, "the reader's position must not move");
+        assert!(state.scroll_anim.is_none(), "no follow-ease for a reader who scrolled away");
+    }
+
+    /// When the pager DOES engage (output overflows), the follow-ease runs only
+    /// up to wherever it parks — never past it, and never all the way back to
+    /// the pre-growth offset. Same numbers as `the_prompt_row_comes_out_of_
+    /// the_parked_screenful` above: `activation_target(2, 27, 10, 1) == Some(16)`.
+    #[test]
+    fn apply_frame_follow_ease_target_is_clamped_to_the_pager_park() {
+        let mut state = crate::state::AppState::default();
+        assert_eq!(state.transcript_scroll, 0, "premise: reader is at the bottom");
+        state.pager.arm(2);
+        apply_frame(&mut state, 30, 10, 1, 27, true);
+        assert!(state.pager.active, "25 added rows overflow a 10-row viewport");
+        assert_eq!(state.transcript_scroll, 16, "parked exactly where the pager would park");
+        let a = state.scroll_anim.as_ref().expect("a follow-ease must be armed");
+        assert_eq!(a.from, 25, "display starts at the pre-growth equivalent offset (27 - 2)");
+        assert_eq!(a.target(), 16, "…and eases only down to the park, not past it");
+    }
+
     #[test]
     fn arm_disarm_roundtrip() {
         let mut p = Pager::default();
@@ -486,7 +721,7 @@ mod tests {
 
         // While the pager is showing, NOTHING re-arms or re-parks it — the player
         // is mid-catch-up and a fresh baseline would jump the view.
-        let mut p = Pager { active: true, pending_before_rows: None };
+        let mut p = Pager { active: true, pending_before_rows: None, ..Pager::default() };
         p.arm_after_turn(50, InputKind::Char, false, Driver::Timeout);
         assert!(p.pending_before_rows.is_none());
         p.arm_after_turn(50, InputKind::Line, false, Driver::PlayerInput);

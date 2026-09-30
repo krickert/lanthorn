@@ -39,10 +39,18 @@ mod v6_macintosh_profile;
 mod v6_hint_menu_mouse;
 #[path = "suites/v6_mouse_zork0.rs"]
 mod v6_mouse_zork0;
+#[path = "suites/v6_click_vs_selection.rs"]
+mod v6_click_vs_selection;
+#[path = "suites/host_v6_click.rs"]
+mod host_v6_click;
 #[path = "suites/v6_zork0_color_command.rs"]
 mod v6_zork0_color_command;
 #[path = "suites/v6_zork0_hints.rs"]
 mod v6_zork0_hints;
+#[path = "suites/sq1618_grid_flank_extension.rs"]
+mod sq1618_grid_flank_extension;
+#[path = "suites/sq1620_grid_wider_than_viewport.rs"]
+mod sq1620_grid_wider_than_viewport;
 #[path = "suites/v6_zork0_icon_backdrop.rs"]
 mod v6_zork0_icon_backdrop;
 #[path = "suites/v6_zork0_splash.rs"]

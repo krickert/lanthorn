@@ -45,22 +45,21 @@
 //!   day.
 //!
 //! ```text
-//!  NW  N  NE │VERB     │WHAT — here │WHAT — carried│WITH…
-//!   W  ·  E  │ look     │ window     │ brass key    │▸brass key
-//!  SW  S  SE │▸unlock   │▸iron door  │ lantern      │ lantern
-//!  up   down │
-//!  in    out │
-//!  look   inv│
-//!  wait again│
+//!  NW  N  NE   ↑ │VERB     │WHAT — here │WHAT — carried│WITH…
+//!   W  ·  E  ◉ ◎ │ look     │ window     │ brass key    │▸brass key
+//!  SW  S  SE   ↓ │▸unlock   │▸iron door  │ lantern      │ lantern
+//!  look inventory│
+//!  wait again    │
 //! ```
 //!
 //! (The `> unlock iron door with _` prompt line above this strip in the
 //! mockup is the ordinary story input, drawn elsewhere — not part of this
-//! module anymore.) The quick block now STACKS — rose on top, the
-//! non-compass words flowing below it — rather than sitting beside the
-//! columns (SQ-0677's other geometry change); see the "Quick-block layout"
-//! section below. Single-cell `│` dividers separate the block from VERB and
-//! every column from its neighbour, full band height.
+//! module anymore.) The quick block STACKS — rose and portal-glyph cluster
+//! on top, side by side, the remaining words flowing below both (SQ-0677's
+//! geometry, SQ-1218's cluster) — rather than sitting beside the columns;
+//! see the "Quick-block layout" section below. Single-cell `│` dividers
+//! separate the block from VERB and every column from its neighbour, full
+//! band height.
 //!
 //! The caller (`main.rs`) sizes `area` from the animated `PanelSlide`
 //! fraction, so `area` may be shorter than the band's target height while a
@@ -191,14 +190,59 @@ pub struct VerbEntry {
     /// [`verbs_from_grammar`] fills this from the RAW
     /// [`grammar_model::SyntaxLine`]s; [`VerbEntry::new`] derives it from the
     /// lines it is handed, which is the right answer for a table (the
-    /// built-ins, `[command_band] verbs`) whose shapes ARE its whole grammar.
+    /// built-ins, `[command_panel] verbs`) whose shapes ARE its whole grammar.
     pub takes_object: bool,
+    /// How far forward this verb belongs (SQ-1554) — see [`VerbTier`]. A host
+    /// shows [`VerbTier::Core`] and [`VerbTier::Story`] up front and the rest
+    /// behind a "More…"; the list already arrives in that order.
+    pub tier: VerbTier,
+    /// The story's OTHER spellings of this same verb, spelled out (SQ-1554):
+    /// `carry`, `get` and `hold` behind a `take` row. Not listed, still
+    /// recognised — [`crate::state::CommandBandState::verb_by_word`] finds the
+    /// row through any of them, so a player who types `carry` gets `take`'s
+    /// shapes. Empty for a table whose rows ARE its words (the built-ins, a
+    /// configured list).
+    pub synonyms: Vec<String>,
+}
+
+/// Where a verb belongs in a list ordered for a player rather than a parser
+/// (SQ-1554).
+///
+/// A story's grammar is eighty-odd verbs in Zork I, and an alphabetical column
+/// buries `take` between `swim` and `tell`. The tiers put the verbs a player
+/// actually needs first and keep the rest reachable, in declaration order of
+/// importance:
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum VerbTier {
+    /// A verb nearly every parser game needs ([`CORE_VERBS`]) that THIS story's
+    /// grammar accepts, in that list's order. Also every row of a table that
+    /// is not the story's grammar — the built-in fallback and a configured
+    /// list are short curated sets already, and are shown whole as before.
+    #[default]
+    Core,
+    /// A verb the story's own text mentions, or one the player has already
+    /// typed and the story's dictionary knew. Alphabetical.
+    Story,
+    /// Everything else the grammar holds. Alphabetical, behind "More…".
+    More,
 }
 
 impl VerbEntry {
     pub fn new(word: &str, lines: Vec<VerbLine>) -> Self {
         let takes_object = lines.iter().any(|l| l.nouns > 0);
-        VerbEntry { word: word.to_string(), lines, takes_object }
+        VerbEntry {
+            word: word.to_string(),
+            lines,
+            takes_object,
+            tier: VerbTier::Core,
+            synonyms: Vec::new(),
+        }
+    }
+
+    /// Does `word` name this verb — its shown spelling or one of its folded
+    /// synonyms? Case-insensitive, whole-word.
+    pub fn answers_to(&self, word: &str) -> bool {
+        self.word.eq_ignore_ascii_case(word) || self.synonyms.iter().any(|s| s.eq_ignore_ascii_case(word))
     }
 
     /// Record that the grammar gives this verb an object slot the band cannot
@@ -267,7 +311,7 @@ pub enum VerbSource {
     /// `VERB — generic`.
     #[default]
     Builtin,
-    /// The player's own `[command_band] verbs` list. Labelled `VERB — yours`:
+    /// The player's own `[command_panel] verbs` list. Labelled `VERB — yours`:
     /// it is not the story's grammar either, but it is not our guess.
     Configured,
 }
@@ -321,9 +365,43 @@ impl VerbTable {
         if hidden.is_empty() {
             return self;
         }
-        self.entries
-            .retain(|e| !hidden.iter().any(|h| h.eq_ignore_ascii_case(&e.word)));
+        self.drop_spellings(|w| hidden.iter().any(|h| h.eq_ignore_ascii_case(w)));
         self
+    }
+
+    /// Remove every spelling `gone` names, the folded synonyms included
+    /// (SQ-1554). A row whose shown word goes is shown under its first
+    /// surviving synonym instead, and dropped only when none survives — which
+    /// is exactly what the column did when every spelling was its own row.
+    fn drop_spellings(&mut self, gone: impl Fn(&str) -> bool) {
+        let mut promoted = false;
+        self.entries.retain_mut(|e| {
+            e.synonyms.retain(|s| !gone(s));
+            if !gone(&e.word) {
+                return true;
+            }
+            if e.synonyms.is_empty() {
+                return false;
+            }
+            e.word = e.synonyms.remove(0);
+            promoted = true;
+            true
+        });
+        if promoted {
+            // A renamed row takes its alphabetical place again. Stable, and
+            // keyed on the index for `Core`, so the curated order — and a
+            // built-in or configured table, which is all `Core` — is untouched.
+            let mut keyed: Vec<(VerbTier, usize, String, VerbEntry)> = std::mem::take(&mut self.entries)
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| match e.tier {
+                    VerbTier::Core => (e.tier, i, String::new(), e),
+                    _ => (e.tier, 0, e.word.clone(), e),
+                })
+                .collect();
+            keyed.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+            self.entries = keyed.into_iter().map(|(.., e)| e).collect();
+        }
     }
 
     /// Drop the story's own test-harness and diagnostic verbs — every word whose
@@ -352,7 +430,7 @@ impl VerbTable {
     /// [`layer_band_verbs`](crate::config::Config::layer_band_verbs), which are
     /// the two places a table is assembled; this is `pub` only so they can.
     pub fn without_sigil_verbs(mut self) -> VerbTable {
-        self.entries.retain(|e| !e.word.starts_with(SIGILS));
+        self.drop_spellings(|w| w.starts_with(SIGILS));
         self
     }
 }
@@ -471,56 +549,128 @@ pub fn default_verbs() -> VerbTable {
     VerbTable::new(entries, VerbSource::Builtin)
 }
 
-/// The story's own verb column: one row per dictionary spelling every verb of
-/// its grammar answers to, alphabetically.
+/// The verbs nearly every parser game needs, in the order a player reaches for
+/// them — the curated half of [`VerbTier::Core`] (SQ-1554).
 ///
-/// **Every spelling, not one per verb**, and that is the whole point. Infocom's
-/// tables list a verb's synonyms in DICTIONARY order, so the first spelling is
-/// merely the alphabetically-earliest one: Zork I's take-verb is `carry`, its
-/// look-verb is `gaze`, its put-verb is `hide`, its throw-verb is `chuck`, and
-/// its wave-verb is the truncated key `brandi`. Naming one spelling per verb
-/// would hand the player a column of words no one would ever type. Listing them
-/// all needs no heuristic, has zero false positives — every word here is one the
-/// parser really accepts — and puts `take`, `look`, `put` and `throw` back where
-/// the player expects them, beside their oddities.
+/// Only ever INTERSECTED with a story's grammar: a word here that the story
+/// does not hold contributes nothing, and one it does hold is shown as spelled
+/// here — `examine`, not the `examin` a Version 3 dictionary stores — which the
+/// parser truncates back to the same entry. Two of them reaching one verb
+/// (`talk` and `tell` in a story that files them together) make one row, under
+/// whichever comes first.
+pub const CORE_VERBS: &[&str] = &[
+    "look", "examine", "take", "drop", "inventory", "open", "close", "put", "go", "enter",
+    "wait", "read", "push", "pull", "turn", "give", "talk", "ask", "tell",
+];
+
+/// The story's own verb column: one row per VERB of its grammar, tiered for a
+/// player and not for a parser (SQ-1554).
 ///
-/// One-character spellings (`x`, `g`, `z`, `l`, `q`) are dropped: they are real
-/// vocabulary and a wasted row, the same call `vocab::StoryVocabulary`'s synonym
-/// offer already makes. Where two verbs claim one spelling the first wins, as
-/// both engines' readers do.
-pub fn verbs_from_grammar(verbs: &[grammar_model::Verb]) -> Vec<VerbEntry> {
-    let mut out: std::collections::BTreeMap<String, VerbEntry> = std::collections::BTreeMap::new();
-    for verb in verbs {
-        let mut lines: Vec<VerbLine> = Vec::new();
-        for line in &verb.lines {
-            if let Some(l) = VerbLine::from_syntax(line) {
-                if !lines.contains(&l) {
-                    lines.push(l);
-                }
-            }
-        }
-        // Asked of the RAW syntax lines, not of `lines`: "the story lets this
-        // verb take an object" is a different question from "the band knows how
-        // to compose one", and only the first decides whether a quick word is
-        // redundant in the column (SQ-1128).
-        let takes_object =
-            verb.lines.iter().any(|l| l.slots.iter().any(grammar_model::Slot::is_noun_slot));
-        for word in &verb.words {
-            let word = word.to_lowercase();
-            if word.chars().count() < 2 {
-                continue;
-            }
-            out.entry(word.clone()).or_insert_with(|| {
-                let e = VerbEntry::new(&word, lines.clone());
-                if takes_object {
-                    e.also_takes_object()
-                } else {
-                    e
-                }
-            });
+/// **One row per verb, its other spellings folded behind it.** This used to be
+/// one row per spelling, because Infocom files a verb's synonyms in dictionary
+/// order and the first is merely the alphabetically-earliest — Zork I's
+/// take-verb is `carry`, its look-verb `gaze` — and listing every spelling was
+/// the only heuristic-free way to put `take` in the column at all. It also made
+/// the column 200-odd rows long. Now each verb shows ONE spelling and keeps the
+/// rest in [`VerbEntry::synonyms`], still recognised when typed; the spelling
+/// shown is:
+///
+/// 1. the [`CORE_VERBS`] word that reaches it, if one does (`take`, `look`);
+/// 2. otherwise the commonest English verb among its spellings — the one in the
+///    most [`verb_synonyms`] groups (`throw` over `chuck`, `wave` over
+///    `brandish`) — then the shortest, then the first alphabetically.
+///
+/// **The tiers**, in list order ([`VerbTier`]): the core verbs this story
+/// accepts, in [`CORE_VERBS`] order; then verbs whose spelling the story's own
+/// text uses ([`crate::vocab::StoryVocabulary::text_words`]) or the player has
+/// typed (`used` — first words of commands, resolved through the story's own
+/// dictionary), alphabetically; then everything else, alphabetically. Nothing
+/// is dropped, only ordered.
+///
+/// Spellings are shown spelled out ([`crate::vocab::StoryVocabulary::spell`],
+/// SQ-1553). One-character spellings (`x`, `g`, `z`) are dropped, as the offer
+/// drops them; where two verbs claim one spelling the first wins, as both
+/// engines' readers do.
+pub fn story_verbs(
+    vocab: &crate::vocab::StoryVocabulary,
+    used: &std::collections::BTreeSet<String>,
+) -> Vec<VerbEntry> {
+    let verbs = vocab.verbs();
+    let index_of = |v: &grammar_model::Verb| verbs.iter().position(|x| std::ptr::eq(x, v));
+    // Which curated word reaches each verb — the first one wins.
+    let mut core: Vec<Option<(usize, &str)>> = vec![None; verbs.len()];
+    for (pos, &c) in CORE_VERBS.iter().enumerate() {
+        if let Some(i) = vocab.verb_named(c).and_then(index_of) {
+            core[i].get_or_insert((pos, c));
         }
     }
-    out.into_values().collect()
+    let used_verbs: std::collections::BTreeSet<usize> =
+        used.iter().filter_map(|u| vocab.verb_named(u).and_then(index_of)).collect();
+    let text = vocab.text_words();
+
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<(VerbTier, usize, VerbEntry)> = Vec::new();
+    for (i, verb) in verbs.iter().enumerate() {
+        let spellings: Vec<String> = verb
+            .words
+            .iter()
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.chars().count() >= 2 && claimed.insert(w.clone()))
+            .map(|w| vocab.spell(&w).to_string())
+            .collect();
+        let (tier, rank, word) = match core[i] {
+            Some((pos, c)) => (VerbTier::Core, pos, c.to_string()),
+            None => {
+                let Some(word) = commonest(&spellings) else { continue };
+                let story = used_verbs.contains(&i) || spellings.iter().any(|s| text.contains(s));
+                (if story { VerbTier::Story } else { VerbTier::More }, 0, word)
+            }
+        };
+        let mut synonyms: Vec<String> =
+            spellings.into_iter().filter(|s| !s.eq_ignore_ascii_case(&word)).collect();
+        synonyms.sort();
+        synonyms.dedup();
+        let mut e = entry_for(verb, &word);
+        e.tier = tier;
+        e.synonyms = synonyms;
+        out.push((tier, rank, e));
+    }
+    out.sort_by(|a, b| (a.0, a.1, &a.2.word).cmp(&(b.0, b.1, &b.2.word)));
+    out.into_iter().map(|(_, _, e)| e).collect()
+}
+
+/// The spelling of a verb a player is likeliest to know: the one in the most
+/// [`verb_synonyms`] groups, then the shortest, then the first alphabetically.
+fn commonest(spellings: &[String]) -> Option<String> {
+    spellings
+        .iter()
+        .min_by_key(|s| (std::cmp::Reverse(verb_synonyms::groups(s).count()), s.len(), s.as_str()))
+        .cloned()
+}
+
+/// One grammar verb as a band row named `word`, with the shapes the band can
+/// compose from its syntax lines.
+fn entry_for(verb: &grammar_model::Verb, word: &str) -> VerbEntry {
+    let mut lines: Vec<VerbLine> = Vec::new();
+    for line in &verb.lines {
+        if let Some(l) = VerbLine::from_syntax(line) {
+            if !lines.contains(&l) {
+                lines.push(l);
+            }
+        }
+    }
+    // Asked of the RAW syntax lines, not of `lines`: "the story lets this verb
+    // take an object" is a different question from "the band knows how to
+    // compose one", and only the first decides whether a quick word is
+    // redundant in the column (SQ-1128).
+    let takes_object =
+        verb.lines.iter().any(|l| l.slots.iter().any(grammar_model::Slot::is_noun_slot));
+    let e = VerbEntry::new(word, lines);
+    if takes_object {
+        e.also_takes_object()
+    } else {
+        e
+    }
 }
 
 /// Refill the band's VERB column from the running story's own grammar.
@@ -528,21 +678,37 @@ pub fn verbs_from_grammar(verbs: &[grammar_model::Verb]) -> Vec<VerbEntry> {
 /// Called from the same per-tick hook as [`refresh_objects`], and for the same
 /// reason the band opens before it can ask: `Action::OpenCommandBand` has the
 /// config but no engine, so the band is born on the fallback and swaps to the
-/// story's own words on the tick before its first frame. Read ONCE per open —
-/// the grammar table is static, so no later turn can change the answer — and
-/// never over a `[command_band] verbs` list, which is the player's own.
+/// story's own words on the tick before its first frame. The grammar is read
+/// once per open; the column is RE-RANKED once per turn (`turn_epoch`), because
+/// the verbs the player has typed move a verb into [`VerbTier::Story`]
+/// (SQ-1554). Never over a `[command_panel] verbs` list, which is the player's
+/// own.
 ///
 /// Returns `true` when the column actually changed (→ repaint).
 pub fn refresh_verbs(state: &mut AppState, session: &dyn crate::engine::Engine) -> bool {
     let Some(band) = state.overlays.command_band.as_ref() else { return false };
-    if band.verbs_read || band.verb_source == VerbSource::Configured {
+    if band.verb_source == VerbSource::Configured {
         return false;
     }
+    let epoch = state.turn_epoch;
+    let stale_story = band.verb_source == VerbSource::Story && band.verbs_epoch != Some(epoch);
+    if band.verbs_read && !stale_story {
+        return false;
+    }
+    // What the player has typed this session: the first word of every command
+    // line, which `story_verbs` resolves through the story's own dictionary.
+    // A slash command's `/` word resolves to nothing, so needs no filtering.
+    let used: std::collections::BTreeSet<String> = state
+        .command_history
+        .iter()
+        .filter_map(|c| c.split_whitespace().next())
+        .map(str::to_lowercase)
+        .collect();
     // `VocabState` is the one vocabulary seam (SQ-1117): the same snapshot the
     // guidance offer reads, cached for the session, so this costs one grammar
     // read whichever of the two asks first.
     let mut vocab = std::mem::take(&mut state.vocab);
-    let story = vocab.get(session).map(|v| verbs_from_grammar(v.verbs()));
+    let story = vocab.get(session).map(|v| story_verbs(v, &used));
     state.vocab = vocab;
     let table = match story {
         Some(entries) if !entries.is_empty() => {
@@ -552,6 +718,7 @@ pub fn refresh_verbs(state: &mut AppState, session: &dyn crate::engine::Engine) 
     };
     let Some(band) = state.overlays.command_band.as_mut() else { return false };
     band.verbs_read = true;
+    band.verbs_epoch = Some(epoch);
     match table {
         Some(t) => {
             if band.verbs == t.entries && band.verb_source == t.source {
@@ -912,7 +1079,7 @@ pub fn draw_command_band(
             width: layout.width,
             height: content.height.min(layout.height),
         };
-        draw_quick_block(band, layout, block_area, buf, base, theme, &mut hits.quick);
+        draw_quick_block(band, layout, &state.symbols.portal, block_area, buf, base, theme, &mut hits.quick);
         let divider_x = content.x + layout.width;
         // The block/VERB divider is VERB's left flank: it carries the
         // current-column accent when VERB is current (see the column loop).
@@ -973,62 +1140,73 @@ pub fn draw_command_band(
     }
 }
 
-// ── Compass-rose quick block (SQ-0675, restacked SQ-0677) ──────────────────
+// ── Compass-rose quick block (SQ-0675, restacked SQ-0677, given a portal
+// glyph cluster SQ-1218) ────────────────────────────────────────────────────
 //
 // The flat quick row (below) is the narrow-band fallback; when there is
 // room, the quick actions instead draw as a block on the band's left edge:
-// the compass rose on top, the non-compass words flowing below it —
-// stacked, not side by side (SQ-0677; the SQ-0675 original packed both into
-// the rose's own 3 rows, which left the block no narrower even when the
-// word list was short, and ate width the columns could have used):
+// the compass rose on top, a cluster of portal-direction glyphs beside it,
+// the remaining words flowing below both (SQ-1218; SQ-0677's version flowed
+// up/down/in/out as ordinary words under the rose, which spelled out four
+// words the map already draws as one glyph apiece):
 //
 // ```text
-//  NW  N  NE
-//   W  ·  E
-//  SW  S  SE
-//  up   down
-//  in    out
-//  look   inv
+//  NW  N  NE   ↑
+//   W  ·  E  ◉ ◎
+//  SW  S  SE   ↓
+//  look inventory
 //  wait again
 // ```
 //
 // The 8 compass points (matched by MEANING via `compass_spelling`, not
 // spelling — same rule the VERB column's quick exclusion uses) form a 3×3
-// rose with an always-inert centre; everything else in the effective quick
-// list (up/down/in/out are directions too, but not compass POINTS, so they
-// stay in the word list, not the rose) flows left-to-right then wraps,
-// packed into as many rows as `WORD_ROW_BUDGET` needs at the narrowest width
-// that achieves it. Every cell — rose point or word — is a `hits.quick`
-// entry keyed by its index into `band.quick`, exactly like the flat row's
-// words: this is a different LAYOUT of the same one-click-submit contract
-// (`input::band_quick_pick_command`, `main::band_mouse_action`), not a new
-// one, so neither needed to change.
+// rose with an always-inert centre. up/down/in/out are directions too, but
+// not compass POINTS, so `ROSE_ORDER` excludes them — they instead fill the
+// portal-glyph cluster to the rose's right, drawn with the same
+// `PortalGlyphs` icons (`↑`/`↓`/`◉`/`◎` by default, or whatever
+// `[symbols].portal` names in `style.toml`) the map uses for an up/down/in/out
+// exit, so a click reads as the same glyph the automap would show for it.
+// Everything else in the effective quick list flows left-to-right then
+// wraps, packed into as many rows as `WORD_ROW_BUDGET` needs at the
+// narrowest width that achieves it. Every cell — rose point, cluster glyph or
+// word — is a `hits.quick` entry keyed by its index into `band.quick`,
+// exactly like the flat row's words: this is a different LAYOUT of the same
+// one-click-submit contract (`input::band_quick_pick_command`,
+// `main::band_mouse_action`), not a new one, so neither needed to change.
 //
-// **Height interplay (SQ-0677):** the block's natural height (rose rows plus
-// however many word rows `WORD_ROW_BUDGET` needs) may exceed the band's
-// actual configured height — e.g. the shipped default (5 rows) fits the
-// 3-row rose plus only 2 of the default quick list's 3 word rows. Of the
-// three options on the table (cap the block at the band's height and clip
-// the rest; wrap overflow words into an extra COLUMN of the block; raise the
-// band's effective minimum height whenever the block is shown), the first is
-// what's implemented: `draw_command_band` sizes `block_area.height` to
-// `content.height.min(layout.height)`, and `draw_quick_block` below silently
-// stops drawing (and registering hits for) any row that falls off the
-// bottom — the exact same clip-past-the-edge the renderer already did at a
-// fixed 3 rows before this amendment, just against a height that now varies
-// with the word list instead of a constant. This was picked over the other
-// two because it costs nothing elsewhere (the columns still always get the
-// band's full height; `MIN_BAND_ROWS`/`DEFAULT_BAND_ROWS` stay singular,
-// global constants unaffected by which quick list happens to be configured)
-// and a taller band is one resize away for anyone who wants every word row
-// visible at once.
+// **Height interplay (SQ-0677, revised SQ-1218):** the block's natural
+// height (rose rows plus however many word rows `WORD_ROW_BUDGET` needs) may
+// exceed the band's actual configured height. With up/down/in/out moved into
+// the glyph cluster, the default quick list's word flow is down to 4 words
+// (`look`/`inventory`/`wait`/`again`), which packs into exactly 2 rows at
+// `WORD_ROW_BUDGET = 2` — so the shipped default band (5 rows: 3-row rose +
+// 2 word rows) shows the whole default list with nothing clipped. The clip
+// below still applies to a longer CUSTOM quick list, or to a shorter band:
+// of the three options on the table (cap the block at the band's height and
+// clip the rest; wrap overflow words into an extra COLUMN of the block;
+// raise the band's effective minimum height whenever the block is shown),
+// the first is what's implemented: `draw_command_band` sizes
+// `block_area.height` to `content.height.min(layout.height)`, and
+// `draw_quick_block` below silently stops drawing (and registering hits for)
+// any row that falls off the bottom — the exact same clip-past-the-edge the
+// renderer already did at a fixed 3 rows before the SQ-0677 amendment, just
+// against a height that now varies with the word list instead of a
+// constant. This was picked over the other two because it costs nothing
+// elsewhere (the columns still always get the band's full height;
+// `MIN_BAND_ROWS`/`DEFAULT_BAND_ROWS` stay singular, global constants
+// unaffected by which quick list happens to be configured) and a taller
+// band is one resize away for anyone who wants every word row of a longer
+// custom list visible at once.
 
 /// Target row budget the word flow tries to pack into (`word_flow_width`
 /// grows the width, not this) — independent of the band's actual configured
-/// height; see the height-interplay note above for why. Picked so the whole
-/// block (rose + words) lands around the "3 rose + a handful of word rows"
-/// shape a taller-than-default band comfortably shows in full.
-const WORD_ROW_BUDGET: u16 = 3;
+/// height; see the height-interplay note above for why. Picked (SQ-1218) so
+/// the default quick list's 4 remaining words (`look`/`inventory`/`wait`/
+/// `again`, now that up/down/in/out are the glyph cluster's) land in exactly
+/// the 2 rows the shipped default band (5 rows: 3-row rose + 2 word rows)
+/// shows in full — a longer custom list still wraps to more rows and clips
+/// against a short band, per the height-interplay note.
+const WORD_ROW_BUDGET: u16 = 2;
 /// Rows the compass rose itself occupies.
 const ROSE_ROWS: u16 = 3;
 /// Width of one rose cell: enough for the two-letter intercardinal labels
@@ -1052,8 +1230,35 @@ const ROSE_ORDER: [mapper::direction::Direction; 8] = {
     [NW, N, NE, W, E, SW, S, SE]
 };
 
-/// A resolved rose+words quick block: which `band.quick` index (if any)
-/// fills each of the 8 rose slots, whether the rose draws at all, the word
+/// The portal-glyph cluster's 4 slots (`CLUSTER_ORDER` order): up alone on
+/// row 0, in/out side by side on row 1, down alone on row 2 — see the sketch
+/// above `WORD_ROW_BUDGET`.
+const CLUSTER_UP: usize = 0;
+const CLUSTER_IN: usize = 1;
+const CLUSTER_OUT: usize = 2;
+const CLUSTER_DOWN: usize = 3;
+const CLUSTER_ORDER: [mapper::direction::Direction; 4] = {
+    use mapper::direction::Direction::*;
+    [Up, In, Out, Down]
+};
+/// Columns between the "in" and "out" glyphs on the cluster's middle row.
+const CLUSTER_INNER_GAP: u16 = 1;
+/// Total width of the cluster: one glyph column, the inner gap, one more
+/// glyph column — up/down centre on the middle column, directly over the gap.
+const CLUSTER_WIDTH: u16 = 1 + CLUSTER_INNER_GAP + 1;
+/// Columns between the rose's right edge and the cluster's left edge, when
+/// both draw.
+const CLUSTER_ROSE_GAP: u16 = 1;
+/// X-offset of the "in" glyph within the cluster (its own left edge).
+const CLUSTER_IN_X: u16 = 0;
+/// X-offset of the "out" glyph within the cluster.
+const CLUSTER_OUT_X: u16 = 1 + CLUSTER_INNER_GAP;
+/// X-offset of the "up"/"down" glyphs within the cluster: centred on the
+/// single column between "in" and "out".
+const CLUSTER_UPDOWN_X: u16 = 1;
+
+/// A resolved rose+cluster+words quick block: which `band.quick` index (if
+/// any) fills each of the 8 rose slots, whether the rose draws at all, the word
 /// flow's row assignment, and the total width/height the whole block needs —
 /// computed once so the width-vs-fallback decision in `draw_command_band` and
 /// the actual drawing in `draw_quick_block` always agree exactly.
@@ -1061,17 +1266,28 @@ struct QuickBlockLayout {
     /// `band.quick` index for each of the 8 rose slots (`ROSE_LABELS` order).
     rose: [Option<usize>; 8],
     has_rose: bool,
+    /// `band.quick` index for each of the 4 portal-glyph cluster slots
+    /// (`CLUSTER_ORDER` order: up, in, out, down).
+    cluster: [Option<usize>; 4],
+    has_cluster: bool,
+    /// X-offset (past `BLOCK_MARGIN`) of the cluster's own left edge:
+    /// `ROSE_WIDTH + CLUSTER_ROSE_GAP` when the rose also draws, else 0 (the
+    /// cluster then starts flush with the block's margin, same as the rose
+    /// does when it is alone). Meaningless when `has_cluster` is false.
+    cluster_x: u16,
     /// One row per line of the word flow, each a list of `(index into
     /// band.quick, x-offset within the block, past `BLOCK_MARGIN`)`. Empty
-    /// when the effective quick list has no non-compass words at all.
+    /// when the effective quick list has no non-compass, non-portal words
+    /// at all.
     word_rows: Vec<Vec<(usize, u16)>>,
     /// Row (from the block's top) where the word flow starts: `ROSE_ROWS`
-    /// when the rose draws (words stack UNDER it), else 0 (no rose to stack
-    /// under).
+    /// when the rose or the cluster draws (words stack UNDER them), else 0
+    /// (neither to stack under).
     words_y: u16,
     /// Total width the block needs, margins included: `BLOCK_MARGIN` +
-    /// `max(rose width, widest word row)` + `BLOCK_MARGIN` — "as narrow as
-    /// the widest word row" whenever that's wider than the rose.
+    /// `max(rose width + gap + cluster width, widest word row)` +
+    /// `BLOCK_MARGIN` — "as narrow as the widest word row" whenever that's
+    /// wider than the rose and cluster together.
     width: u16,
     /// Total height the block wants: `words_y` + the word flow's row count.
     /// May exceed the band's actual content height; see the height-interplay
@@ -1133,26 +1349,38 @@ pub(crate) fn compass_spelling(word: &str) -> Option<mapper::direction::Directio
     })
 }
 
-/// Split the effective quick list into the 8 compass-rose slots (by index, so
-/// a click can resolve through the same `band.quick.get(idx)` every other
-/// pick does) and everything else, in original list order. A word is routed
-/// to the rose by the DIRECTION it names ([`compass_spelling`]), not its
-/// spelling, so a custom quick row spelling out `"north"` still lands in the
-/// rose's N slot rather than the word flow — the same rule
-/// `CommandBandState::items`'s VERB exclusion already uses. `up`/`down`/`in`/
-/// `out` are directions too but not compass POINTS, so `ROSE_ORDER` excludes
-/// them on purpose — they flow as ordinary words instead, per the design.
-fn split_quick_rose(quick: &[String]) -> ([Option<usize>; 8], Vec<usize>) {
+/// Split the effective quick list into the 8 compass-rose slots, the 4
+/// portal-glyph cluster slots (each by index, so a click can resolve through
+/// the same `band.quick.get(idx)` every other pick does), and everything
+/// else, in original list order. A word is routed by the DIRECTION it names
+/// ([`compass_spelling`]), not its spelling, so a custom quick row spelling
+/// out `"north"` still lands in the rose's N slot rather than the word flow —
+/// the same rule `CommandBandState::items`'s VERB exclusion already uses.
+/// `up`/`down`/`in`/`out` are directions too but not compass POINTS, so
+/// `ROSE_ORDER` excludes them on purpose — they route to `CLUSTER_ORDER`
+/// instead (SQ-1218), drawn as the map's own portal glyphs rather than
+/// spelled-out words.
+fn split_quick_rose(quick: &[String]) -> ([Option<usize>; 8], [Option<usize>; 4], Vec<usize>) {
     let mut rose: [Option<usize>; 8] = [None; 8];
+    let mut cluster: [Option<usize>; 4] = [None; 4];
     let mut words = Vec::new();
     for (i, w) in quick.iter().enumerate() {
-        let slot = compass_spelling(w).and_then(|d| ROSE_ORDER.iter().position(|&r| r == d));
-        match slot {
-            Some(s) => rose[s] = Some(i),
-            None => words.push(i),
+        match compass_spelling(w) {
+            Some(d) if ROSE_ORDER.contains(&d) => {
+                let s = ROSE_ORDER.iter().position(|&r| r == d).expect("just checked");
+                rose[s] = Some(i);
+            }
+            Some(d) if CLUSTER_ORDER.contains(&d) => {
+                let c = CLUSTER_ORDER.iter().position(|&r| r == d).expect("just checked");
+                cluster[c] = Some(i);
+            }
+            // Unreachable in practice — `compass_spelling`'s range is exactly
+            // `ROSE_ORDER` plus `CLUSTER_ORDER` — but a vocabulary question is
+            // never worth a panic, so an impossible third case just flows.
+            Some(_) | None => words.push(i),
         }
     }
-    (rose, words)
+    (rose, cluster, words)
 }
 
 /// Rows a greedy, row-major left-to-right wrap of `words` needs at `width`: a
@@ -1217,45 +1445,56 @@ fn flow_words(quick: &[String], idxs: &[usize], width: u16) -> Vec<Vec<(usize, u
 /// answer the width-vs-fallback question, then again (necessarily the same
 /// answer) to actually draw.
 fn quick_block_layout(quick: &[String]) -> QuickBlockLayout {
-    let (rose, word_idxs) = split_quick_rose(quick);
+    let (rose, cluster, word_idxs) = split_quick_rose(quick);
     let has_rose = rose.iter().any(Option::is_some);
+    let has_cluster = cluster.iter().any(Option::is_some);
     let word_strs: Vec<&str> = word_idxs.iter().map(|&i| quick[i].as_str()).collect();
     let words_width = word_flow_width(&word_strs, WORD_ROW_BUDGET);
     let word_rows = flow_words(quick, &word_idxs, words_width);
 
-    // Rose and words now share the same left edge and stack vertically
-    // (SQ-0677), so the block's width is just whichever of the two needs
-    // more room — no horizontal gap between them left to account for.
-    let content_w = if has_rose { ROSE_WIDTH.max(words_width) } else { words_width };
+    // The rose and the portal-glyph cluster sit side by side on the rose's
+    // own 3 rows (SQ-1218); the word flow stacks under both, sharing their
+    // left edge — so the block's width is whichever of "rose + gap + cluster"
+    // and "widest word row" needs more room, never the two added together.
+    let rose_w = if has_rose { ROSE_WIDTH } else { 0 };
+    let cluster_gap = if has_rose && has_cluster { CLUSTER_ROSE_GAP } else { 0 };
+    let cluster_w = if has_cluster { CLUSTER_WIDTH } else { 0 };
+    let cluster_x = rose_w + cluster_gap;
+    let top_w = rose_w + cluster_gap + cluster_w;
+    let content_w = top_w.max(words_width);
     let width = BLOCK_MARGIN + content_w + BLOCK_MARGIN;
-    let words_y = if has_rose { ROSE_ROWS } else { 0 };
+    let words_y = if has_rose || has_cluster { ROSE_ROWS } else { 0 };
     let height = words_y + word_rows.len() as u16;
-    QuickBlockLayout { rose, has_rose, word_rows, words_y, width, height }
+    QuickBlockLayout { rose, has_rose, cluster, has_cluster, cluster_x, word_rows, words_y, width, height }
 }
 
-/// Draw the rose+words quick block into `area` (the band's left strip, sized
-/// by the caller to `layout.width` × `content.height.min(layout.height)` —
-/// see the height-interplay note above `WORD_ROW_BUDGET`).
+/// Draw the rose+cluster+words quick block into `area` (the band's left
+/// strip, sized by the caller to `layout.width` ×
+/// `content.height.min(layout.height)` — see the height-interplay note above
+/// `WORD_ROW_BUDGET`).
 ///
-/// Any row — rose or word — that falls at or past `area.bottom()` is simply
-/// not drawn and registers no `hits.quick` entry: a short band shows the rose
-/// and clips the word rows it has no room for, exactly the clip-past-the-edge
-/// behaviour the pre-SQ-0677 renderer already had at a fixed 3 rows.
+/// Any row — rose, cluster or word — that falls at or past `area.bottom()` is
+/// simply not drawn and registers no `hits.quick` entry: a short band shows
+/// the rose and cluster and clips the word rows it has no room for, exactly
+/// the clip-past-the-edge behaviour the pre-SQ-0677 renderer already had at a
+/// fixed 3 rows.
 ///
-/// Every rose point and every word registers the exact same `hits` entry
-/// shape the flat row's words did (`(index into band.quick, rect)`), so
+/// Every rose point, cluster glyph and word registers the exact same `hits`
+/// entry shape the flat row's words did (`(index into band.quick, rect)`), so
 /// `input::band_quick_pick_command` and `main::band_mouse_action` need no
 /// changes — a click resolves identically regardless of which layout drew it.
+#[allow(clippy::too_many_arguments)]
 fn draw_quick_block(
     band: &crate::state::CommandBandState,
     layout: &QuickBlockLayout,
+    portal: &crate::symbols::PortalGlyphs,
     area: Rect,
     buf: &mut Buffer,
     base: Style,
     theme: &crate::theme::resolve::Theme,
     hits: &mut Vec<(usize, Rect)>,
 ) {
-    let style = base.patch(theme.get("band.quick").style);
+    let style = base.patch(theme.get("command_panel.quick").style);
     // The centre is always inert decoration — never a pick target — styled
     // like the map matrix's own frontier dot rather than a new selector.
     let dim = base.patch(theme.get("map.matrix.cell:frontier").style);
@@ -1266,7 +1505,7 @@ fn draw_quick_block(
     // design doc amendment for why reversed was safe to pick).
     let cell_style = |qi: usize| {
         if band.quick_hover == Some(qi) {
-            style.patch(theme.get("band.quick:hover").style)
+            style.patch(theme.get("command_panel.quick:hover").style)
         } else {
             style
         }
@@ -1308,6 +1547,30 @@ fn draw_quick_block(
         }
     }
 
+    if layout.has_cluster {
+        // Up alone on row 0 (centred), in/out side by side on row 1, down
+        // alone on row 2 (centred) — the map's own portal glyphs, so a click
+        // here reads as the same icon the automap draws for that exit.
+        let cx0 = area.x + BLOCK_MARGIN + layout.cluster_x;
+        let slots: [(usize, u16, u16, char); 4] = [
+            (CLUSTER_UP, 0, CLUSTER_UPDOWN_X, portal.up),
+            (CLUSTER_IN, 1, CLUSTER_IN_X, portal.in_),
+            (CLUSTER_OUT, 1, CLUSTER_OUT_X, portal.out),
+            (CLUSTER_DOWN, 2, CLUSTER_UPDOWN_X, portal.down),
+        ];
+        for (slot, row, x_off, glyph) in slots {
+            let y = area.y + row;
+            if y >= area.bottom() {
+                continue;
+            }
+            let Some(qi) = layout.cluster[slot] else { continue };
+            let x = cx0 + x_off;
+            let cell_area = Rect { x, y, width: 1, height: 1 };
+            crate::render::draw_char_clipped(buf, x, y, glyph, cell_style(qi), cell_area);
+            hits.push((qi, cell_area));
+        }
+    }
+
     for (row_i, row) in layout.word_rows.iter().enumerate() {
         let y = area.y + layout.words_y + row_i as u16;
         if y >= area.bottom() {
@@ -1338,8 +1601,8 @@ fn draw_quick_row(
     theme: &crate::theme::resolve::Theme,
     hits: &mut Vec<(usize, Rect)>,
 ) {
-    let style = base.patch(theme.get("band.quick").style);
-    let hover_style = theme.get("band.quick:hover").style;
+    let style = base.patch(theme.get("command_panel.quick").style);
+    let hover_style = theme.get("command_panel.quick:hover").style;
     for x in area.x..area.right() {
         if let Some(cell) = buf.cell_mut((x, area.y)) {
             cell.set_symbol(" ").set_style(style);
@@ -1411,7 +1674,7 @@ fn draw_column(
     //
     // SQ-1111 gives the row back for the ONE thing worth saying there: when the
     // column is NOT the story's own grammar — the generic fallback, or the
-    // player's own `[command_band] verbs` list — it says so
+    // player's own `[command_panel] verbs` list — it says so
     // (`VerbSource::column_label`), the same way `here_is_seen` relabels the
     // object column rather than passing a scrape off as the room's contents. A
     // story whose grammar we CAN read pays nothing: no label, no header, one
@@ -1420,7 +1683,7 @@ fn draw_column(
         if col == COL_VERB && band.verb_source.column_label().is_none() { 0 } else { 1 };
     if header_h > 0 {
         let header_style = base.patch(
-            theme.get(if is_current { "band.column_header:active" } else { "band.column_header" }).style,
+            theme.get(if is_current { "command_panel.column_header:active" } else { "command_panel.column_header" }).style,
         );
         let header_area = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
         for x in header_area.x..header_area.right() {
@@ -1456,7 +1719,7 @@ fn draw_column(
     }
 
     let items = band.rows(col);
-    let label_style = base.patch(theme.get("band.group_label").style);
+    let label_style = base.patch(theme.get("command_panel.group_label").style);
     if items.is_empty() {
         // Column-specific wording (SQ-0667, following the SQ-0668 data fix
         // that made an empty carried/here column a real possibility rather
@@ -1501,7 +1764,7 @@ fn draw_column(
         let style = if is_selected {
             theme.get("dialog.list_selected").style
         } else if items[idx].seen {
-            base.patch(theme.get("band.item:seen").style)
+            base.patch(theme.get("command_panel.item:seen").style)
         } else {
             base
         };
@@ -1532,7 +1795,7 @@ fn draw_column(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-render"))]
 mod tests {
     use super::*;
     use crate::state::{AppState, CommandBandState};
@@ -1847,22 +2110,97 @@ mod tests {
     }
 
     /// The word flow holds exactly the effective quick words that are NOT one
-    /// of the 8 compass points — `up`/`down`/`in`/`out` are directions too,
-    /// but not compass POINTS, so they stay in the word flow rather than the
-    /// rose (see `split_quick_rose`'s doc). Falsifies against a rose that
-    /// (wrongly) also swallows up/down/in/out, which would shrink this list.
+    /// of the 8 compass points AND NOT one of the 4 portal directions —
+    /// `up`/`down`/`in`/`out` are directions too, but not compass POINTS, so
+    /// they leave the word flow for the glyph cluster instead (SQ-1218; see
+    /// `split_quick_rose`'s doc). Falsifies against a rose that (wrongly)
+    /// swallows them, or a cluster that (wrongly) leaves them in the word
+    /// flow — either would change this list.
     #[test]
-    fn word_block_holds_exactly_the_non_compass_quick_words() {
+    fn word_block_holds_exactly_the_non_compass_non_portal_quick_words() {
         let quick = default_quick();
         let layout = quick_block_layout(&quick);
         assert!(layout.has_rose, "n/s/e/w are compass words — the rose shows");
+        assert!(layout.has_cluster, "up/down/in/out are portal words — the cluster shows");
 
         let mut got: Vec<&str> =
             layout.word_rows.iter().flatten().map(|&(i, _)| quick[i].as_str()).collect();
         got.sort_unstable();
-        let mut want = vec!["up", "down", "in", "out", "look", "inventory", "wait", "again"];
+        let mut want = vec!["look", "inventory", "wait", "again"];
         want.sort_unstable();
-        assert_eq!(got, want, "the word flow holds exactly the non-compass quick words");
+        assert_eq!(got, want, "the word flow holds exactly the non-compass, non-portal quick words");
+    }
+
+    /// The glyph cluster holds exactly `up`/`down`/`in`/`out`, each mapped to
+    /// its own `band.quick` index in `CLUSTER_ORDER` order (up, in, out,
+    /// down). Falsifies against a cluster that mismatches a direction to the
+    /// wrong slot or leaves one out.
+    #[test]
+    fn glyph_cluster_holds_exactly_the_four_portal_words_in_order() {
+        let quick = default_quick();
+        let layout = quick_block_layout(&quick);
+        let up = quick.iter().position(|q| q == "up").unwrap();
+        let down = quick.iter().position(|q| q == "down").unwrap();
+        let in_ = quick.iter().position(|q| q == "in").unwrap();
+        let out = quick.iter().position(|q| q == "out").unwrap();
+        assert_eq!(layout.cluster, [Some(up), Some(in_), Some(out), Some(down)]);
+    }
+
+    /// The glyph cluster draws the map's own portal icons (SQ-1218) — default
+    /// `↑`/`◉`/`◎`/`↓`, one per cell, each its own click target that resolves
+    /// through `band_quick_pick_command` to the bare direction, same as the
+    /// rose's own cells. Falsifies against the cluster drawing text (`"up"`
+    /// spelled out) instead of the glyph, or against a click landing on the
+    /// wrong word.
+    #[test]
+    fn glyph_cluster_draws_portal_glyphs_and_is_clickable() {
+        let s = state_with_band(); // default quick, default (ascii) portal glyphs
+        let mut buf = Buffer::empty(BAND);
+        let mut hits = CommandBandHits::default();
+        draw_command_band(&s, BAND, &mut buf, &mut 0, &mut hits);
+        let out = dump(&buf);
+
+        for glyph in ['\u{2191}', '\u{2193}', '\u{25c9}', '\u{25ce}'] {
+            assert!(out.contains(glyph), "the cluster draws the default portal glyph {glyph:?}: {out}");
+        }
+        // The word flow no longer spells these out — only the compass words
+        // and the plain quick words remain as text.
+        assert!(!out.contains("up") && !out.contains("down"), "no spelled-out up/down: {out}");
+
+        let quick = &s.overlays.command_band.as_ref().unwrap().quick;
+        for word in ["up", "down", "in", "out"] {
+            let qi = quick.iter().position(|q| q == word).unwrap();
+            let (_, rect) = *hits.quick.iter().find(|(i, _)| *i == qi).unwrap_or_else(|| {
+                panic!("{word} (idx {qi}) should have a hit rect: {:?}", hits.quick)
+            });
+            assert_eq!(rect.width, 1, "a glyph cell is exactly one column wide");
+            assert_eq!(
+                crate::input::band_quick_pick_command(&s, qi),
+                Some(word.to_string()),
+                "clicking the {word} glyph submits {word}"
+            );
+        }
+    }
+
+    /// A `style.toml` portal-glyph preset override reaches the cluster the
+    /// same way it reaches the map (SQ-1218): both read
+    /// `state.symbols.portal`. Falsifies against the cluster hard-coding the
+    /// default `PortalGlyphs::preset("ascii")` instead of reading the active
+    /// symbol set.
+    #[test]
+    fn glyph_cluster_honors_a_custom_portal_glyph_preset() {
+        let mut s = state_with_band();
+        s.symbols = crate::symbols::SymbolSet::from_preset_names("ascii", "filled", "nerdfont-stairs", "light");
+        let mut buf = Buffer::empty(BAND);
+        draw_command_band(&s, BAND, &mut buf, &mut 0, &mut CommandBandHits::default());
+        let out = dump(&buf);
+
+        let portal = &s.symbols.portal;
+        assert_ne!(portal.up, '\u{2191}', "sanity: nerdfont-stairs does not reuse the ascii glyph");
+        for glyph in [portal.up, portal.down, portal.in_, portal.out] {
+            assert!(out.contains(glyph), "the cluster draws the configured preset's glyph {glyph:?}: {out}");
+        }
+        assert!(!out.contains('\u{2191}'), "the default ascii glyph must not leak through: {out}");
     }
 
     /// A custom quick list with no compass words at all draws no rose —
@@ -2081,7 +2419,7 @@ mod tests {
         assert_ne!(scope, seen, "the weaker claim must look weaker");
         assert_eq!(
             seen.fg,
-            s.colors.theme.get("band.item:seen").style.fg,
+            s.colors.theme.get("command_panel.item:seen").style.fg,
             "and it must take its colour from the selector, not a literal",
         );
     }
@@ -2294,29 +2632,71 @@ mod tests {
         assert_eq!(v.joiner(), Some("from"));
     }
 
-    /// Every dictionary spelling gets a row, one-letter abbreviations do not,
-    /// and the column comes out alphabetical. This is what puts `take` and
-    /// `look` in a Zork I column whose verbs are internally named `carry` and
-    /// `gaze`.
+    /// A Version 3 story's grammar as the vocabulary snapshot the band reads:
+    /// every spelling a verb word, six-character keys, and `text` as the words
+    /// its own static text holds.
+    fn story_vocab(
+        verbs: Vec<grammar_model::Verb>,
+        text: &[&str],
+    ) -> crate::vocab::StoryVocabulary {
+        let mut words = std::collections::BTreeMap::new();
+        for v in &verbs {
+            for w in &v.words {
+                let mut r = grammar_model::WordRoles::default();
+                r.verb = true;
+                words.insert(w.clone(), r);
+            }
+        }
+        crate::vocab::StoryVocabulary::new(verbs, words, Default::default(), 6)
+            .with_story_text(Some(text.iter().map(|w| w.to_string()).collect()))
+    }
+
+    fn verb(n: u32, words: &[&str], lines: Vec<grammar_model::SyntaxLine>) -> grammar_model::Verb {
+        grammar_model::Verb::new(n, 0, words.iter().map(|w| w.to_string()).collect(), lines)
+    }
+
+    /// SQ-1554: one row per VERB, not per spelling, in three tiers — the core
+    /// verbs this story accepts in their curated order, then what the story's
+    /// own text mentions, then everything else — each later tier alphabetical.
+    /// Nothing is dropped: every spelling still reaches its row. This is what
+    /// shows `take` and `look` in a Zork I column whose verbs are internally
+    /// named `carry` and `gaze`, and shows them FIRST.
     #[test]
-    fn the_story_s_column_is_every_spelling_alphabetically() {
+    fn the_story_s_column_is_one_row_per_verb_in_tiers() {
         let verbs = vec![
-            grammar_model::Verb::new(
+            verb(
                 255,
-                0,
-                vec!["carry".into(), "get".into(), "take".into()],
+                &["carry", "get", "take"],
                 vec![line(vec![noun()]), line(vec![noun(), word("from"), noun()])],
             ),
-            grammar_model::Verb::new(
-                254,
-                0,
-                vec!["gaze".into(), "l".into(), "look".into()],
-                vec![line(vec![]), line(vec![word("at"), noun()])],
-            ),
+            verb(254, &["dig"], vec![line(vec![noun()])]),
+            verb(253, &["pray"], vec![line(vec![])]),
+            verb(252, &["gaze", "l", "look"], vec![line(vec![]), line(vec![word("at"), noun()])]),
         ];
-        let entries = verbs_from_grammar(&verbs);
-        let words: Vec<&str> = entries.iter().map(|e| e.word.as_str()).collect();
-        assert_eq!(words, vec!["carry", "gaze", "get", "look", "take"], "no `l`, alphabetical");
+        let v = story_vocab(verbs, &["pray"]);
+        let entries = story_verbs(&v, &Default::default());
+        let rows: Vec<(&str, VerbTier)> = entries.iter().map(|e| (e.word.as_str(), e.tier)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("look", VerbTier::Core),
+                ("take", VerbTier::Core),
+                ("pray", VerbTier::Story),
+                ("dig", VerbTier::More),
+            ],
+            "core in curated order (look before take), then mentioned, then the rest"
+        );
+        let take = entries.iter().find(|e| e.word == "take").expect("take");
+        assert_eq!(take.synonyms, vec!["carry", "get"], "folded, not dropped");
+        assert!(take.answers_to("carry") && take.answers_to("GET"));
+        let look = entries.iter().find(|e| e.word == "look").expect("look");
+        assert_eq!(look.synonyms, vec!["gaze"], "no one-letter `l`");
+
+        // A verb the player has typed joins the story tier.
+        let used = ["dig".to_string()].into_iter().collect();
+        let entries = story_verbs(&v, &used);
+        let dig = entries.iter().find(|e| e.word == "dig").expect("dig");
+        assert_eq!(dig.tier, VerbTier::Story);
         let take = entries.iter().find(|e| e.word == "take").expect("take");
         assert_eq!(take.max_nouns(), 2, "a synonym carries the verb's own shapes");
         assert_eq!(take.joiner(), Some("from"));
@@ -2337,13 +2717,8 @@ mod tests {
     /// syntax — which would answer the same here and wrongly for `look` above.
     #[test]
     fn a_genuinely_bare_verb_takes_no_object() {
-        let verbs = vec![grammar_model::Verb::new(
-            253,
-            0,
-            vec!["wait".into(), "z".into()],
-            vec![line(vec![])],
-        )];
-        let entries = verbs_from_grammar(&verbs);
+        let v = story_vocab(vec![verb(253, &["wait", "z"], vec![line(vec![])])], &[]);
+        let entries = story_verbs(&v, &Default::default());
         let wait = entries.iter().find(|e| e.word == "wait").expect("wait");
         assert!(!wait.takes_object, "one bare line and nothing else");
         assert_eq!(wait.max_nouns(), 0);
@@ -2363,6 +2738,25 @@ mod tests {
         let table = VerbTable::new(entries, VerbSource::Story).without_sigil_verbs();
         let words: Vec<&str> = table.entries.iter().map(|e| e.word.as_str()).collect();
         assert_eq!(words, vec!["take", "dollar", "hash"], "the sigil is a PREFIX, not a substring");
+    }
+
+    /// Folded spellings are filtered like the rows they used to be (SQ-1554):
+    /// a sigil or adult SYNONYM is stripped from its row, and a row whose shown
+    /// word goes is shown under a surviving synonym rather than lost.
+    #[test]
+    fn a_filter_reaches_folded_synonyms_and_promotes_a_survivor() {
+        let mut row = VerbEntry::new("#record", vec![VerbLine::bare()]);
+        row.synonyms = vec!["record".into()];
+        let mut take = VerbEntry::new("take", vec![VerbLine::object()]);
+        take.synonyms = vec!["$take".into(), "get".into()];
+        let table = VerbTable::new(vec![row, take], VerbSource::Story).without_sigil_verbs();
+        assert_eq!(table.entries[0].word, "record", "promoted, not dropped");
+        assert!(table.entries[0].synonyms.is_empty());
+        assert_eq!(table.entries[1].synonyms, vec!["get"], "the sigil synonym is gone");
+
+        let hidden = table.hiding(&["get".to_string(), "record".to_string()]);
+        assert_eq!(hidden.entries.len(), 1, "a row with nothing left to show goes");
+        assert!(hidden.entries[0].synonyms.is_empty());
     }
 
     /// The rule is the first character only, so a verb that merely contains one
@@ -2533,7 +2927,7 @@ mod tests {
     fn a_nautical_alias_flows_as_a_word_instead_of_filling_a_rose_slot() {
         let quick: Vec<String> =
             ["port", "bow", "north", "e"].iter().map(|s| s.to_string()).collect();
-        let (rose, words) = split_quick_rose(&quick);
+        let (rose, _cluster, words) = split_quick_rose(&quick);
         assert_eq!(rose[ROSE_LABELS.iter().position(|l| *l == "W").unwrap()], None, "`port` is not W");
         assert_eq!(rose[ROSE_LABELS.iter().position(|l| *l == "N").unwrap()], Some(2), "`north` is N");
         assert_eq!(rose[ROSE_LABELS.iter().position(|l| *l == "E").unwrap()], Some(3), "`e` is E");
@@ -2554,8 +2948,12 @@ mod tests {
         let quick = default_quick();
         let layout = quick_block_layout(&quick);
         assert!(layout.has_rose);
-        assert_eq!(layout.words_y, ROSE_ROWS, "the word flow starts right under the 3-row rose");
-        assert!(!layout.word_rows.is_empty(), "the default quick list has non-compass words");
+        assert!(layout.has_cluster, "up/down/in/out are portal words — the cluster shows");
+        assert_eq!(
+            layout.words_y, ROSE_ROWS,
+            "the word flow starts right under the 3-row rose+cluster"
+        );
+        assert!(!layout.word_rows.is_empty(), "the default quick list has non-compass, non-portal words");
 
         let widest_row: u16 = layout
             .word_rows
@@ -2568,11 +2966,14 @@ mod tests {
             })
             .max()
             .unwrap_or(0);
-        assert!(widest_row <= ROSE_WIDTH.max(widest_row), "sanity");
+        // The rose and the glyph cluster sit side by side (SQ-1218): the
+        // block's top width is rose + gap + cluster, not either alone.
+        let top_w = ROSE_WIDTH + CLUSTER_ROSE_GAP + CLUSTER_WIDTH;
+        assert!(widest_row <= top_w.max(widest_row), "sanity");
         assert_eq!(
             layout.width,
-            BLOCK_MARGIN + ROSE_WIDTH.max(widest_row) + BLOCK_MARGIN,
-            "block width is margins plus max(rose width, widest word row) — never rose + words added"
+            BLOCK_MARGIN + top_w.max(widest_row) + BLOCK_MARGIN,
+            "block width is margins plus max(rose+gap+cluster width, widest word row) — never everything added"
         );
     }
 
@@ -2586,6 +2987,56 @@ mod tests {
         let layout = quick_block_layout(&quick);
         assert_eq!(layout.height, ROSE_ROWS + layout.word_rows.len() as u16);
         assert!(layout.word_rows.len() > 1, "the default quick list needs more than one word row");
+    }
+
+    /// SQ-1218: with up/down/in/out moved to the glyph cluster, the default
+    /// quick list's word flow is down to 4 words, which `WORD_ROW_BUDGET = 2`
+    /// packs into exactly `look inventory` / `wait again` — TWO rows, not
+    /// three — so the shipped default band (5 rows: 3-row rose + 2 word rows,
+    /// `DEFAULT_BAND_ROWS`) shows the whole list with nothing clipped.
+    /// Falsifies against a `WORD_ROW_BUDGET` that still packs `look` and
+    /// `inventory` onto separate rows (the pre-amendment budget of 3, which
+    /// finds the narrowest width satisfying 3 rows rather than 2 and lands on
+    /// a width too narrow to hold `look inventory` together).
+    #[test]
+    fn the_default_word_flow_packs_into_exactly_two_rows() {
+        let quick = default_quick();
+        let layout = quick_block_layout(&quick);
+        assert_eq!(layout.word_rows.len(), 2, "look/inventory/wait/again pack into exactly 2 rows");
+
+        let row_words = |row: &[(usize, u16)]| -> Vec<&str> {
+            row.iter().map(|&(i, _)| quick[i].as_str()).collect()
+        };
+        assert_eq!(row_words(&layout.word_rows[0]), vec!["look", "inventory"]);
+        assert_eq!(row_words(&layout.word_rows[1]), vec!["wait", "again"]);
+
+        // The shipped default band height fits rose + both word rows with
+        // nothing clipped.
+        assert_eq!(
+            layout.height, DEFAULT_BAND_ROWS,
+            "rose (3) + 2 word rows == the default band height"
+        );
+
+        let s = state_with_band();
+        let area = Rect { x: 0, y: 0, width: 120, height: DEFAULT_BAND_ROWS };
+        let mut buf = Buffer::empty(area);
+        let mut hits = CommandBandHits::default();
+        draw_command_band(&s, area, &mut buf, &mut 0, &mut hits);
+        let out = dump(&buf);
+        assert!(out.contains("look") && out.contains("inventory"), "row 0: {out}");
+        assert!(out.contains("wait") && out.contains("again"), "row 1: {out}");
+
+        // Every word hit lands on one of the two word rows, none past them —
+        // no third row exists to clip against, at any band height.
+        let word_idxs: std::collections::HashSet<usize> =
+            layout.word_rows.iter().flatten().map(|&(i, _)| i).collect();
+        let word_rows_y: std::collections::HashSet<u16> = hits
+            .quick
+            .iter()
+            .filter(|(i, _)| word_idxs.contains(i))
+            .map(|(_, r)| r.y)
+            .collect();
+        assert_eq!(word_rows_y.len(), 2, "word hits land on exactly two rows: {word_rows_y:?}");
     }
 
     /// The height interplay (SQ-0677, documented above `WORD_ROW_BUDGET`):

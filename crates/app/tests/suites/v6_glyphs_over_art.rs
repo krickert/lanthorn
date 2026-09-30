@@ -50,7 +50,7 @@
 
 use std::path::PathBuf;
 
-use app::engine::Engine;
+use app::engine::{Engine, WinNode};
 use app::graphics::PictSource;
 use app::session::GameSession;
 use ratatui::buffer::Buffer;
@@ -165,23 +165,8 @@ fn ring_rows_above(buf: &Buffer, viewport: Rect) -> Vec<String> {
         .collect()
 }
 
-/// The palette this suite's colour assertions resolve through, **stated rather than
-/// inherited** (SQ-0958).
-///
-/// Every story these cases drive is a bare file that names no machine, so its colour
-/// numbers resolve through ZMSD §8.3.1's own table — which is what every assertion
-/// below was written against. Until now nothing here said so, and the suite believed
-/// whatever the last suite in its group binary left behind: harmless only while every
-/// one of them happened to leave `Standard` there, and not at all once a sibling boots
-/// a machine press. See [`app::v6_palette`], which is why this both names a palette
-/// and takes the shared lock. Hold the guard for the whole case.
-fn standard_palette() -> app::V6PaletteGuard {
-    app::v6_palette(zvm::screen::Palette::Standard)
-}
-
 #[test]
 fn halfblocks_draw_the_banner_labels_as_real_glyphs() {
-    let _g = standard_palette();
     for honor in [true, false] {
         let Some((buf, viewport)) = frame(honor, None) else { return };
         let rows = ring_rows_above(&buf, viewport);
@@ -208,7 +193,6 @@ fn halfblocks_draw_the_banner_labels_as_real_glyphs() {
 
 #[test]
 fn a_banner_glyph_sits_in_the_picture_not_in_a_box() {
-    let _g = standard_palette();
     // The point of sampling: the cell a glyph lands in must keep a background that
     // belongs to the ART around it, not the theme's backdrop. Measured against the
     // glyph's own NEIGHBOURING art cells rather than against a hardcoded colour,
@@ -274,7 +258,6 @@ fn a_banner_glyph_sits_in_the_picture_not_in_a_box() {
 
 #[test]
 fn kitty_sixel_and_iterm2_are_left_exactly_as_they_were() {
-    let _g = standard_palette();
     // The capability is absent on all three — on kitty because a virtual placement
     // is positioned by its placeholder CELLS, so a glyph in one deletes the image
     // rather than layering over it (measured; see `pty_oracle.rs`). So none of them
@@ -297,7 +280,6 @@ fn kitty_sixel_and_iterm2_are_left_exactly_as_they_were() {
 
 #[test]
 fn no_rasterised_ghost_of_the_label_survives_past_its_glyphs() {
-    let _g = standard_palette();
     // The other half of the change, and the half a "the letters are there" test
     // cannot see: the rows these runs sit on are withheld from the chrome canvas
     // (`TextLayer::SkipGlyphRows`) so the band ships the picture WITHOUT a
@@ -376,7 +358,6 @@ fn no_rasterised_ghost_of_the_label_survives_past_its_glyphs() {
 /// painted straight back in, a text row above where the glyphs land.
 #[test]
 fn no_rasterised_ghost_of_the_label_survives_above_its_glyphs() {
-    let _g = standard_palette();
     for honor in [true, false] {
         let Some((buf, viewport)) = frame(honor, None) else { return };
         let rows = ring_rows_above(&buf, viewport);
@@ -434,7 +415,6 @@ fn no_rasterised_ghost_of_the_label_survives_above_its_glyphs() {
 /// and it holds with game colours declined too.
 #[test]
 fn the_frames_outer_gutter_is_the_page_under_halfblocks() {
-    let _g = standard_palette();
     for honor in [true, false] {
         let Some((buf, viewport)) = frame(honor, None) else { return };
         assert!(viewport.x >= 4, "honor={honor}: the flank should be several columns wide, got {} (wrong frame?)", viewport.x);
@@ -465,11 +445,93 @@ fn the_frames_outer_gutter_is_the_page_under_halfblocks() {
     }
 }
 
+// ── SQ-1592: the RASTER path's own `V6TextRun::over_art` must agree ─────────
+
+/// Compose the RASTER path's own text runs for `session`'s current frame — the
+/// public host route ([`app::render::screen::compose_v6_frame`]), at the SAME
+/// default v6 cell [`render_state`] leaves `AppState::v6_text` at (neither this
+/// suite nor `render_state` ever sets a machine face, so both sides read the
+/// story exactly the way a bare IbmPc boot does).
+fn raster_chrome_text() -> Option<Vec<app::render::v6_layout::V6TextRun>> {
+    use app::render::v6_layout as v6;
+    let session = zork0_in_play(true)?;
+    let tf = app::native_font::TextFace::cell_only(zvm::screen::V6Cell::DEFAULT);
+    let model = session.screen();
+    let WinNode::Layered(items) = &model.root else { panic!("a v6 frame has a Layered root") };
+    let native = v6::native_extent(items, &tf);
+    let layout = v6::classify_windows(items, tf.cell());
+    let colors = app::colors::ColorScheme::terminal_default();
+    let empty_prose = |_cols: u16, rows: u16| {
+        (
+            v6::MainText {
+                lines: Vec::new(),
+                styles: Vec::new(),
+                input: String::new(),
+                cursor_col: 0,
+                awaiting: false,
+                floats: Vec::new(),
+            },
+            app::render::screen::RasterMetrics { total_rows: 0, viewport_rows: rows, max_scroll: 0, first_visible_row: 0 },
+        )
+    };
+    let host_pair = (image::Rgba([220, 220, 220, 255]), image::Rgba([0, 0, 0, 255]));
+    let inputs = app::render::screen::V6FrameInputs {
+        host_pair,
+        honor_game_colours: true,
+        colors: &colors,
+        face: &tf,
+        paint: None,
+        panel_input: None,
+        input: None,
+        prose: &empty_prose,
+        reveal: None,
+        pager_active: false,
+        more_prompt_pair: host_pair,
+        text: v6::V6TextMode::RasteriseAndRecord,
+        bottom_anchor_menu: false,
+        hybrid_text_rows: std::collections::HashSet::new(),
+        extend_flanks_under_story_grid: false,
+    };
+    let f = app::render::screen::compose_v6_frame(&layout, v6::RasterFrame::native(native), &inputs);
+    Some(f.text)
+}
+
+/// **Cross-path agreement (SQ-1592).** The hybrid ring draws Zork0's banner
+/// labels as real glyphs on the ribbon's own colour — this suite's own
+/// [`halfblocks_draw_the_banner_labels_as_real_glyphs`] and
+/// [`a_banner_glyph_sits_in_the_picture_not_in_a_box`] are exactly that
+/// evidence, and both hold ONLY because the hybrid ring's own
+/// `ChromeRowOracle::over_art` (`region_has_opaque` over the frame's art-only
+/// canvas) answered `true` for every one of them — the module doc's own
+/// specimen note: "all 29 chrome runs sit on the banner ribbon". The RASTER
+/// path answers the identical question through the identical primitive,
+/// independently, in `build_chrome_canvas_into`. This asserts the two answers
+/// agree for the SAME frame: every CHROME run the raster path records here
+/// carries `over_art: true`.
+#[test]
+fn raster_over_art_agrees_with_the_hybrid_rings_own_classification() {
+    use app::render::v6_layout::V6RunSource;
+    let Some(runs) = raster_chrome_text() else { return };
+    let chrome: Vec<_> = runs.iter().filter(|r| r.source == V6RunSource::Chrome).collect();
+    assert!(!chrome.is_empty(), "non-vacuity: the raster path recorded no chrome runs at all");
+    let all_text: String = chrome.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("|");
+    for word in BANNER_WORDS {
+        assert!(all_text.contains(word), "non-vacuity: banner word {word:?} missing from raster runs: {all_text}");
+    }
+    for r in &chrome {
+        assert!(
+            r.over_art,
+            "raster over_art disagrees with the hybrid ring: run {:?}@{} should be over_art like every \
+             other chrome run on this frame (hybrid draws it as a glyph on the ribbon, not in a box)",
+            r.text, r.y
+        );
+    }
+}
+
 /// CI has no `stories/`, so every case above returns early there and this file
 /// would pass without measuring anything. Count one real decision and say so.
 #[test]
 fn the_smokes_were_not_vacuous() {
-    let _g = standard_palette();
     let mut seen = 0;
     if let Some((buf, viewport)) = frame(true, None) {
         assert!(ring_rows_above(&buf, viewport).join("\n").contains("Banquet Hall"));

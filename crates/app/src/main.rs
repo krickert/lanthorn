@@ -11,23 +11,23 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 use mapper::mapper::Mapper;
-use mapper::render::{render as render_map_data, render_layer};
+use mapper::render::render_layer;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::Terminal;
 
 use app::export_dot::export_dot;
-use app::export_svg::export_svg;
 use app::map_dump::render_dump;
 use app::archive::load_archive;
-use app::input::{apply_action, apply_text_entry, key_to_command, mouse_to_action, Action, KeyResolve};
-use app::tidy::should_bg_tidy;
-use app::persist_files::{list_saves, restore_game};
+use app::input::{
+    apply_action, apply_text_entry, key_to_command, live_slash_context, mouse_to_action, Action, KeyResolve,
+};
+use app::persist_files::restore_game;
 use app::render::dialog::{DialogRects, DialogStyle};
 use app::render::hints_panel::{hint_input_action, hint_key_routes, HintInputAct, HintKeyKind, HintsPanelRects};
 use app::render::command_band::draw_command_band;
-use app::render::map::{pulse_border_color, render_map_layered, room_screen_rects, sound_pulse_color};
+use app::render::map::{pulse_border_color, render_map_layered, room_screen_rects, sound_pulse_color, MarkerKind};
 use app::render::paneframe::{build_layer_segments, InsetSegment};
 use app::render::panel::{PanelFrame, PanelSpec, PanelStrip};
 use app::render::controls::BorderControl;
@@ -37,15 +37,13 @@ use mapper::layer::LayerId;
 use app::render::screen::render_story_pane;
 use app::render::draw_str_clipped;
 use app::engine::Engine;
-use app::session::{apply_turn, TurnResult};
+use app::session::TurnResult;
 use app::hints;
 use app::keymap::Context;
 use app::render::hintbar::{hint_bar, ANIM_HINTS, GAME_HINTS};
 use app::slash;
 use app::state::{AppState, FbMode, FileBrowserState, Focus, Layout, SavesState};
 
-mod engine_helpers;
-mod ingame_io;
 mod lifecycle;
 mod loop_tick;
 mod overlays;
@@ -53,17 +51,19 @@ mod picker_ui;
 mod reset;
 mod slash_dispatch;
 mod startup;
-mod turn;
 
 use crate::slash_dispatch::dispatch_slash_outcome;
-use crate::ingame_io::{
-    delete_save_confirmed, handle_save_as, open_ingame_saves, resolve_filename_request,
-    resolve_ingame_dialog,
-};
+// The per-turn apply and the in-game file requests live in the library now
+// (SQ-1538); named here so the loop and its sibling modules keep calling them
+// as `turn::…` / `ingame_io::…`.
+use app::host::{ingame_io, turn};
+use app::host::ingame_io::combined_saves;
+use app::host::turn::{format_rfc3339, reobserve_location};
+use crate::ingame_io::{delete_save_confirmed, handle_save_as};
 use crate::reset::reset_game;
-use crate::engine_helpers::{
-    apply_archive_state, engine_supports_save, engine_tag, glulx_session_opt_mut, restore_error_msg,
-    restore_from_file, zvm_session_mut, zvm_session_opt, zvm_session_opt_mut, RestoreOutcome,
+use app::engine_helpers::{
+    engine_supports_save, glulx_session_opt_mut, restore_error_msg, zvm_session_mut, zvm_session_opt,
+    zvm_session_opt_mut,
 };
 
 // ── Run outcome ─────────────────────────────────────────────────────────────
@@ -84,40 +84,6 @@ impl From<app::state::ExitTarget> for RunOutcome {
             app::state::ExitTarget::Library => RunOutcome::ToLibrary,
         }
     }
-}
-
-// ── Arrow-key withholding (SQ-0460) ──────────────────────────────────────────
-
-/// Whether an arrow keypress should be forwarded to the story as a ZSCII
-/// cursor code (129-132; ZMSD §3.8). Some v6 games bind arrows to movement;
-/// `v6_arrow_keys = false` withholds them so the key falls through to
-/// app-side handling (scrollback / map panning) instead. Only v6 is gated —
-/// v1-5 and Glulx stories always get arrows, regardless of `version`'s value
-/// for a non-Z-machine session (callers pass a version of 0 in that case).
-fn forward_arrow_to_v6(v6_arrow_keys: bool, version: u8) -> bool {
-    version != 6 || v6_arrow_keys
-}
-
-/// Whether `ki` is an arrow that `v6_arrow_keys = false` withholds from a v6
-/// story. Withholding applies ONLY at a line (`>`) prompt (`is_line_input`) —
-/// that's where movement-vs-panning conflicts, and v6 games list arrows in
-/// their terminating-characters table (SQ-0188), so an arrow would otherwise
-/// move the player from the prompt regardless of the setting. During CHAR
-/// input (`is_line_input = false`: menus, "press any key") arrows are NEVER
-/// withheld — those screens are unnavigable without them, so the setting has
-/// no say there and arrows always reach a v6 story (SQ-0483).
-fn withhold_arrow_from_v6(
-    ki: Option<app::engine::KeyInput>,
-    v6_arrow_keys: bool,
-    version: u8,
-    is_line_input: bool,
-) -> bool {
-    is_line_input
-        && ki.is_some_and(|ki| {
-            matches!(ki, app::engine::KeyInput::Up | app::engine::KeyInput::Down
-                | app::engine::KeyInput::Left | app::engine::KeyInput::Right)
-                && !forward_arrow_to_v6(v6_arrow_keys, version)
-        })
 }
 
 // ── Terminal restore helpers ──────────────────────────────────────────────────
@@ -521,6 +487,15 @@ struct PaneRects {
     /// The draggable pane boundaries of this frame, with their grab zones.
     boundaries: Vec<app::layout::BoundaryZone>,
     room_rects: Vec<(RoomId, Rect)>,
+    /// This frame's room-box marker hit-rects (SQ-1273): the alias-count superscript and any
+    /// `?` random-exit stub, exactly as [`app::render::map::MapHits::marker_rects`] returned
+    /// them — Boxes zoom only, empty at every other zoom and in the matrix view.
+    map_marker_rects: Vec<(RoomId, MarkerKind, Rect)>,
+    /// Which view drew `room_rects` this frame (SQ-1246): the matrix view's row
+    /// labels and destination cells both resolve to a room and want a hover
+    /// tooltip, the drawn view's boxes do not — this is what tells the mouse
+    /// handler which behaviour `room_rects` is standing in for.
+    map_view: mapper::layer::MapView,
     /// The room dock's rect this frame (SQ-0692), zero-area when it is closed.
     /// Mouse routing needs it as its own rect: the dock is carved OUT of the map
     /// pane, so a click inside it is neither a map click nor a story click, and
@@ -529,6 +504,23 @@ struct PaneRects {
     /// Hit-rects for the dock's two view tabs. A click switches the body, the way
     /// a click on a layer tab switches layers.
     room_dock_tabs: Vec<(app::state::RoomDockView, Rect)>,
+    /// Hit-rect for the dock's close box (SQ-1265), when the frame drew one.
+    room_dock_close: Option<Rect>,
+    /// The room the dock's active body actually described this frame (SQ-1280) —
+    /// `None` whenever no body was drawn (closed, or too short). The run loop
+    /// compares this against `AppState::room_dock_scroll_room` after the frame to
+    /// decide whether the displayed room changed and both scrolls reset.
+    room_dock_room: Option<RoomId>,
+    /// The active body's total row count and viewport height this frame (SQ-1280),
+    /// both 0 alongside `room_dock_room == None`. Synced into
+    /// `AppState::room_dock_{info,diag}_scroll` and `room_dock_body_viewport` the
+    /// same way `modal_list_viewport` is, right after the render call returns.
+    room_dock_body_total: u16,
+    room_dock_body_viewport: u16,
+    /// The room context menu's frame and per-item hit-rects (SQ-1265), zero-area
+    /// / empty when it is closed.
+    room_menu_area: Rect,
+    room_menu_items: Vec<(usize, Rect)>,
     /// Hit-rects for each layer tab, paired with the layer id; the mouse
     /// handler hit-tests these to switch the viewed layer on click.
     layer_tabs: Vec<(LayerId, Rect)>,
@@ -570,6 +562,10 @@ struct PaneRects {
     /// Hit-rects for the command band (when open): its own rect, the column
     /// headers, the item rows and the quick words (rose block or flat row).
     pub command_band: app::render::command_band::CommandBandHits,
+    /// Hit-rects for the inventory dock (when open): its own rect and one row
+    /// rect per item (SQ-1244) — a click composes the row's word into the
+    /// prompt the same way a command-band WHAT-column click does.
+    pub inventory_dock: app::render::inventory_dock::InventoryDockHits,
     /// Hit-rects for the command palette's candidate rows, as `(cmd_index, rect)`;
     /// the mouse handler hit-tests these to execute a command on click. (SQ-0419)
     pub palette: Vec<(usize, Rect)>,
@@ -579,6 +575,12 @@ struct PaneRects {
     /// linked. Story-pane cells share the Glk screen frame, so these coords are
     /// directly click-comparable.
     pub transcript_links: Vec<((u16, u16), u32)>,
+    /// Every Glk-identified leaf's ACTUAL drawn rect this frame, as `(win id,
+    /// kind, absolute screen rect)` — see `StoryPaneMetrics::win_rects`. The Glk
+    /// mouse/hyperlink hit-test (`glk_mouse_target`/`glk_hyperlink_window`) uses
+    /// this instead of gvm's own layout rect, which reserves a border gutter the
+    /// theme may draw thinner or not at all (SQ-1203).
+    pub win_rects: Vec<(u32, app::engine::WinKind, Rect)>,
     /// Largest meaningful `transcript_scroll` this frame (total wrapped rows −
     /// viewport). The loop clamps `state.transcript_scroll` to this so the view
     /// can't over-scroll past the top.
@@ -606,7 +608,7 @@ struct PaneRects {
 
 /// The map render model for one frame: either borrowed from the per-frame cache
 /// (the live graph, keyed by generation + layer) or freshly built and owned (the
-/// replay / tidy-animation graphs, which `graph_gen` does not track). Derefs to
+/// replay / tidy-animation graphs, which `struct_gen` does not track). Derefs to
 /// `&RenderMap` so the draw call sites are unchanged. (SQ-0305)
 enum FrameRenderMap<'a> {
     Cached(std::cell::Ref<'a, mapper::render::RenderMap>),
@@ -656,10 +658,11 @@ fn draw_frame(
     let mut map_area = Rect::default();
     let mut story_area = Rect::default();
     let mut room_rects_out: Vec<(RoomId, Rect)> = Vec::new();
+    let mut map_marker_rects_out: Vec<(RoomId, MarkerKind, Rect)> = Vec::new();
     // Hit rects handed back by the map renderer itself. The matrix view's rows and destination
     // cells are not room BOXES, so they cannot be recomputed from the render model afterwards
     // the way `room_screen_rects` recomputes the drawn view's (SQ-0666).
-    let mut map_hits: Option<Vec<(RoomId, Rect)>> = None;
+    let mut map_hits: Option<app::render::map::MapHits> = None;
     let mut layer_tabs_out: Vec<(LayerId, Rect)> = Vec::new();
     let mut border_controls_out: Vec<(BorderControl, Rect)> = Vec::new();
     // The view the map pane's cluster is drawn against, captured where the pane
@@ -668,10 +671,17 @@ fn draw_frame(
     // does not.
     let mut map_control_view = mapper::layer::MapView::Drawn;
     let mut room_dock_tabs_out: Vec<(app::state::RoomDockView, Rect)> = Vec::new();
+    let mut room_dock_close_out: Option<Rect> = None;
+    let mut room_dock_room_out: Option<RoomId> = None;
+    let mut room_dock_body_total_out: u16 = 0;
+    let mut room_dock_body_viewport_out: u16 = 0;
+    let mut room_menu_area_out: Rect = Rect::default();
+    let mut room_menu_items_out: Vec<(usize, Rect)> = Vec::new();
     let mut debug_tabs_out: Vec<(usize, usize, Rect)> = Vec::new();
     let mut dialog_rects_out: Option<DialogRects> = None;
     let mut overlay_rects: Option<overlays::OverlayRects> = None;
     let mut band_hits = app::render::command_band::CommandBandHits::default();
+    let mut inv_hits = app::render::inventory_dock::InventoryDockHits::default();
     let mut palette_hits: Vec<(usize, Rect)> = Vec::new();
     let mut modal_list_viewport: usize = 0;
     let mut transcript_max_scroll: u16 = 0;
@@ -680,6 +690,7 @@ fn draw_frame(
     let mut transcript_total_rows: u16 = 0;
     let mut transcript_surface = false;
     let mut transcript_links_out: Vec<((u16, u16), u32)> = Vec::new();
+    let mut win_rects_out: Vec<(u32, app::engine::WinKind, Rect)> = Vec::new();
     let mut pane_layout_out = app::layout::PaneLayout::default();
 
     terminal.draw(|f| {
@@ -696,21 +707,28 @@ fn draw_frame(
         *state.v6_paint.borrow_mut() = engine.paint_surface();
         // During replay the map shows the reconstructed snapshot for the selected turn.
         let replay_graph: Option<mapper::graph::MapGraph> = state.overlays.replay.as_ref().map(|r| {
-            let snap = state
-                .history
-                .get(r.idx)
+            let rec = state.history.get(r.idx);
+            let snap = rec
                 .map(|rec| rec.turn)
                 .and_then(|turn| app::history::map_at_turn(&state.history, turn))
                 .and_then(|json| mapper::persist::from_json(json).ok());
             // Replaying a turn before the first map snapshot has no recorded
             // map — show an empty map, never the live (future) graph.
-            snap.map(|m| m.graph).unwrap_or_default()
+            let mut graph = snap.map(|m| m.graph).unwrap_or_default();
+            // The snapshot's own `current` is frozen at whichever (possibly
+            // earlier, structurally-changing) turn produced it — override with
+            // the SELECTED turn's own recorded location (SQ-1621), never
+            // perturbing `struct_gen` (`MapGraph::set_current` doesn't bump it).
+            if let Some(loc) = rec.and_then(|rec| rec.location) {
+                graph.set_current(loc);
+            }
+            graph
         });
 
         // During tidy-animation playback the map shows the current captured stage, not the live graph.
-        // The live graph's routed model is memoized on (graph_gen, layer) — see `cached_map_render` —
+        // The live graph's routed model is memoized on (struct_gen, layer) — see `cached_map_render` —
         // so an animation / transcript / mouse-move redraw of an unchanged map skips re-routing.
-        // Replay and tidy-animation graphs are not tracked by `graph_gen`, so they are built fresh.
+        // Replay and tidy-animation graphs are not tracked by `struct_gen`, so they are built fresh.
         // `frame_layer`, not `active_layer(g)`: an animation frame's graph is a layer SUBGRAPH and
         // cannot be asked which layer it is — it always answers main, and the map draws blank
         // (SQ-0359).
@@ -731,14 +749,22 @@ fn draw_frame(
         };
 
         // ── Inventory dock: reserve a bottom band (above the help row) that
-        // slides up when toggled, sized from the item list + slide fraction.
+        // slides up when toggled, sized from the content-row list + slide
+        // fraction (SQ-1630: "Carrying" cross-referenced against the mapper's
+        // whole-game item registry, plus "Elsewhere" for everything else it
+        // has ever tracked — see `render::inventory_dock`'s own doc).
         let inv_visible = state.show_inventory || state.inv_dock.active();
-        let inv_items: Vec<String> = if inv_visible {
-            app::render::transcript::inventory_items(state.player_obj, &state.inventory_fallback, engine.introspect())
+        let inv_rows: Vec<app::render::inventory_dock::ItemDockRow> = if inv_visible {
+            let carried = app::render::transcript::inventory_items_with_keys(
+                state.player_obj,
+                &state.inventory_fallback,
+                engine.introspect(),
+            );
+            app::render::inventory_dock::build_inventory_dock_rows(&carried, &mapper.graph, state.inv_dock_filter.as_deref())
         } else {
             Vec::new()
         };
-        let pane_layout = app::layout::compute_pane_layout(full, state, inv_items.len());
+        let pane_layout = app::layout::compute_pane_layout(full, state, inv_rows.len());
         pane_layout_out = pane_layout;
 
         // While any background map job is in flight — a tidy relayout or the
@@ -812,6 +838,7 @@ fn draw_frame(
             transcript_total_rows = m.total_rows;
             transcript_surface = m.transcript_surface;
             transcript_links_out = m.links;
+            win_rects_out = m.win_rects;
             story_area = story_fp.content;
 
             debug_tabs_out = app::render::debug_panel::draw_debug_panel(state, pane_layout.map, buf);
@@ -847,6 +874,7 @@ fn draw_frame(
                     transcript_total_rows = m.total_rows;
                     transcript_surface = m.transcript_surface;
                     transcript_links_out = m.links;
+                    win_rects_out = m.win_rects;
                     story_area = story_fp.content;
                     map_area = Rect::default();
                 }
@@ -882,6 +910,7 @@ fn draw_frame(
                     transcript_total_rows = m.total_rows;
                     transcript_surface = m.transcript_surface;
                     transcript_links_out = m.links;
+                    win_rects_out = m.win_rects;
                     story_area = story_fp.content;
 
                     // The tab strip names every layer, so it reads the LIVE graph — never an
@@ -980,12 +1009,16 @@ fn draw_frame(
         // Compute room screen rects for accurate mouse hit-testing. Skipped while
         // the debug inspector occupies the map slot — `map_area` is the debug
         // rect, not a real map, so there is nothing to hit-test.
-        room_rects_out = if map_area.height > 0 && state.debug.is_none() {
-            // The renderer's own hits when it produced any (the matrix view's rows and cells);
-            // otherwise recompute the drawn view's room boxes, as before.
-            map_hits.take().unwrap_or_else(|| room_screen_rects(&rm, state, map_area))
+        (room_rects_out, map_marker_rects_out) = if map_area.height > 0 && state.debug.is_none() {
+            // The renderer's own hits when it produced any (the matrix view's rows and cells,
+            // plus — Boxes zoom only — the room-marker rects); otherwise recompute the drawn
+            // view's room boxes, as before, with no markers to report.
+            match map_hits.take() {
+                Some(h) => (h.room_rects, h.marker_rects),
+                None => (room_screen_rects(&rm, state, map_area), Vec::new()),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         // ── Room dock (SQ-0692) ───────────────────────────────────────────────
@@ -1019,7 +1052,21 @@ fn draw_frame(
             let dock_resize_hl = (state.resize_mode
                 && state.resize_target == app::state::ResizeTarget::RoomDock)
                 || state.boundary_active(app::layout::Boundary::RoomDockTop);
-            room_dock_tabs_out = app::render::room_dock::draw_room_dock(
+            // SQ-1280: the active body's scroll offset, read from its `ListScroll` —
+            // unless the room this frame describes differs from the one those
+            // offsets were last synced to, in which case a reset is coming right
+            // after this draw returns (see the post-render sync below) and drawing
+            // at the STALE offset for one frame would show a scrolled window into
+            // the wrong room's content.
+            let dock_scroll_offset = if state.room_dock_scroll_room == room {
+                match state.room_dock_view {
+                    app::state::RoomDockView::Info => state.room_dock_info_scroll.display_offset() as u16,
+                    app::state::RoomDockView::Diagnostics => state.room_dock_diag_scroll.display_offset() as u16,
+                }
+            } else {
+                0
+            };
+            let dock_rects = app::render::room_dock::draw_room_dock(
                 graph,
                 room,
                 state.room_dock_pinned(),
@@ -1030,15 +1077,30 @@ fn draw_frame(
                 &state.colors,
                 &state.symbols,
                 dock_resize_hl,
+                dock_scroll_offset,
                 buf,
             );
+            room_dock_tabs_out = dock_rects.tabs;
+            room_dock_close_out = dock_rects.close;
+            room_dock_room_out = room;
+            room_dock_body_total_out = dock_rects.body_total;
+            room_dock_body_viewport_out = dock_rects.body_viewport;
         }
 
         // ── Inventory dock panel ──────────────────────────────────────────────
         if pane_layout.inv_dock.height > 0 {
             let inv_resize_hl = (state.resize_mode && state.resize_target == app::state::ResizeTarget::InvDock)
                 || state.boundary_active(app::layout::Boundary::InvDockTop);
-            app::render::inventory_dock::draw_inventory_dock(&inv_items, pane_layout.inv_dock, &state.colors, inv_resize_hl, buf);
+            let inv_scroll_offset = state.inv_dock_scroll.display_offset() as u16;
+            app::render::inventory_dock::draw_inventory_dock(
+                &inv_rows,
+                pane_layout.inv_dock,
+                &state.colors,
+                inv_resize_hl,
+                inv_scroll_offset,
+                buf,
+                &mut inv_hits,
+            );
         }
 
         // ── Command band ───────────────────────────────────────────────────────
@@ -1056,7 +1118,7 @@ fn draw_frame(
             // (arrowed or the typed nearest match) makes Tab pick it and
             // advance instead. Enter never picks — it always sends the
             // prompt. Quick (rose/words) is mouse-only; F2 re-closes.
-            "Command Band | type: goes to the prompt | \u{2191}\u{2193}: highlight | Tab: move col. (pick if highlighted) | Shift-Tab: move col. | Ctrl+\u{2191}\u{2193}: history | Enter: send | Esc: close | F2: close"
+            "Command Panel | type: goes to the prompt | \u{2191}\u{2193}: highlight | Tab: move col. (pick if highlighted) | Shift-Tab: move col. | Ctrl+\u{2191}\u{2193}: history | Enter: send | Esc: close | F2: close"
                 .to_string()
         } else if state.overlays.file_browser.as_ref().map(|fb| fb.mode == FbMode::PickFile).unwrap_or(false) {
             "Import Save | \u{2191}\u{2193}: move | Enter: open/import | Esc: cancel".to_string()
@@ -1080,8 +1142,8 @@ fn draw_frame(
             let t = match state.resize_target {
                 ResizeTarget::StoryMap => "story/map",
                 ResizeTarget::InvDock => "inventory",
-                ResizeTarget::CommandBand => "command band",
-                ResizeTarget::RoomDock => "room dock",
+                ResizeTarget::CommandBand => "command panel",
+                ResizeTarget::RoomDock => "room panel",
             };
             format!("Resize [{t}] | Tab: pane | arrows: adjust | 0: reset | Esc: done")
         } else {
@@ -1146,6 +1208,17 @@ fn draw_frame(
             &mut palette_hits,
         ));
 
+        // ── Room context menu (SQ-1265) ───────────────────────────────────────
+        // Drawn LAST, above the overlay ladder, the room dock and the map — a
+        // popup anchored at the right-click that opened it, clamped to the map
+        // pane it was opened over.
+        if let Some(menu) = &state.overlays.room_menu {
+            let rects =
+                app::room_menu::draw_room_menu(menu, map_area, &state.keymap, &state.colors, buf);
+            room_menu_area_out = rects.area;
+            room_menu_items_out = rects.items;
+        }
+
         // ── Border-control hover hint (SQ-1123) ───────────────────────────────
         // After the overlay ladder, so the hint floats above the panes; the
         // hover is only ever SET while no modal overlay is open, so this can
@@ -1156,6 +1229,24 @@ fn draw_frame(
             let mut views = app::render::controls::controls_for(state);
             views.extend(app::render::controls::map_controls_for(state, map_control_view));
             app::render::controls::draw_control_hint(buf, full, state, &views, &border_controls_out);
+        }
+
+        // ── Matrix room-name tooltip (SQ-1246) ──────────────────────────────────
+        // Drawn after the overlay ladder, exactly where the border-control hint
+        // above is, so it floats on top and is never set while a modal owns the
+        // pointer (see `matrix_update_hover`, which never sets it there either).
+        {
+            let graph = if let Some(g) = &replay_graph { g } else { &mapper.graph };
+            app::render::matrix::draw_hover_tip(graph, layer, state, full, buf);
+        }
+
+        // ── Room-marker tooltip (SQ-1273) ─────────────────────────────────────
+        // Same placement as the matrix tip just above, clipped to the map pane
+        // rather than the whole frame — the marker it names only ever sits on a
+        // room box, which is always inside `map_area`.
+        {
+            let graph = if let Some(g) = &replay_graph { g } else { &mapper.graph };
+            app::render::map::draw_map_hover_tip(graph, state, map_area, buf);
         }
 
         // Story-pane text-selection highlight + copy extraction now happen inside
@@ -1197,7 +1288,7 @@ fn draw_frame(
 
     // The draw closure runs exactly once, so the overlay ladder always ran.
     let overlay_rects = overlay_rects.expect("draw_frame closure runs exactly once");
-    Ok(PaneRects { map: map_area, story: story_area, boundaries: pane_layout_out.boundary_zones(), pane_layout: pane_layout_out, room_rects: room_rects_out, room_dock: pane_layout_out.room_dock, room_dock_tabs: room_dock_tabs_out, layer_tabs: layer_tabs_out, border_controls: border_controls_out, debug_tabs: debug_tabs_out, dialog: overlay_rects.dialog, aux_dialog: overlay_rects.aux_dialog, history_prompt: overlay_rects.history_prompt, font_check: overlay_rects.font_check, fetch_keep: overlay_rects.fetch_keep, reset_dialog: overlay_rects.reset_dialog, region_prompt: overlay_rects.region_prompt, game_over: overlay_rects.game_over, save_name_dialog: overlay_rects.save_name_dialog, text_entry: overlay_rects.text_entry, confirm_delete: overlay_rects.confirm_delete, confirm_overwrite: overlay_rects.confirm_overwrite, quit_dialog: overlay_rects.quit_dialog, launch_dialog: overlay_rects.launch_dialog, hints_panel: overlay_rects.hints_panel, command_band: band_hits, palette: palette_hits, transcript_links: transcript_links_out, transcript_max_scroll, transcript_viewport_rows, transcript_prompt_rows, transcript_total_rows, transcript_surface, modal_list_viewport })
+    Ok(PaneRects { map: map_area, story: story_area, boundaries: pane_layout_out.boundary_zones(), pane_layout: pane_layout_out, room_rects: room_rects_out, map_marker_rects: map_marker_rects_out, map_view: map_control_view, room_dock: pane_layout_out.room_dock, room_dock_tabs: room_dock_tabs_out, room_dock_close: room_dock_close_out, room_dock_room: room_dock_room_out, room_dock_body_total: room_dock_body_total_out, room_dock_body_viewport: room_dock_body_viewport_out, room_menu_area: room_menu_area_out, room_menu_items: room_menu_items_out, layer_tabs: layer_tabs_out, border_controls: border_controls_out, debug_tabs: debug_tabs_out, dialog: overlay_rects.dialog, aux_dialog: overlay_rects.aux_dialog, history_prompt: overlay_rects.history_prompt, font_check: overlay_rects.font_check, fetch_keep: overlay_rects.fetch_keep, reset_dialog: overlay_rects.reset_dialog, region_prompt: overlay_rects.region_prompt, game_over: overlay_rects.game_over, save_name_dialog: overlay_rects.save_name_dialog, text_entry: overlay_rects.text_entry, confirm_delete: overlay_rects.confirm_delete, confirm_overwrite: overlay_rects.confirm_overwrite, quit_dialog: overlay_rects.quit_dialog, launch_dialog: overlay_rects.launch_dialog, hints_panel: overlay_rects.hints_panel, command_band: band_hits, inventory_dock: inv_hits, palette: palette_hits, transcript_links: transcript_links_out, win_rects: win_rects_out, transcript_max_scroll, transcript_viewport_rows, transcript_prompt_rows, transcript_total_rows, transcript_surface, modal_list_viewport })
 }
 
 // ── Command-band mouse routing ───────────────────────────────────────────────
@@ -1222,6 +1313,13 @@ fn band_mouse_action(
     use crossterm::event::{MouseButton, MouseEventKind};
 
     state.overlays.command_band.as_ref()?;
+    // SQ-1236: a modal dialog stacked on top (config_screen, hotkey_dialog, …)
+    // takes all mouse input; the band underneath must claim nothing while one is
+    // open, so a click falls through to `mouse_to_action`'s dialog hit-testing
+    // instead of being swallowed here first.
+    if state.any_modal_overlay_open() {
+        return None;
+    }
     let hits = &panes.command_band;
     let inside = |r: &Rect| {
         r.width > 0 && r.height > 0 && m.column >= r.x && m.column < r.right() && m.row >= r.y
@@ -1264,6 +1362,54 @@ fn band_mouse_action(
     }
 }
 
+/// Resolve a mouse event against the inventory dock's hit rects (SQ-1244) —
+/// the panel's own counterpart of `band_mouse_action`. The two panels are
+/// mutually exclusive (`SidePanel`), so this never competes with the band for
+/// the same click; it claims exactly the dock's own rect, the same way the
+/// band claims its own, so a click never falls through to the story pane.
+fn inventory_mouse_action(
+    state: &AppState,
+    panes: &PaneRects,
+    m: crossterm::event::MouseEvent,
+) -> Option<Action> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    // SQ-1236's rule, same as the band: a modal dialog stacked on top takes
+    // all mouse input, so the dock underneath claims nothing while one is
+    // open and the click falls through to `mouse_to_action`'s dialog
+    // hit-testing instead.
+    if state.any_modal_overlay_open() {
+        return None;
+    }
+    let hits = &panes.inventory_dock;
+    let inside = |r: &Rect| {
+        r.width > 0 && r.height > 0 && m.column >= r.x && m.column < r.right() && m.row >= r.y
+            && m.row < r.bottom()
+    };
+    if !inside(&hits.area) {
+        return None;
+    }
+
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((idx, _)) = hits.rows.iter().find(|(_, r)| inside(r)).copied() {
+                return Some(Action::InventoryClickRow(idx));
+            }
+            // Anywhere else inside the dock: claimed but does nothing, same
+            // as a click on empty band real estate.
+            Some(Action::None)
+        }
+        // A wheel notch anywhere inside the dock scrolls its body (SQ-1630),
+        // honouring `mouse_wheel_invert` the same way every other wheel
+        // handler resolves it — via `wheel_delta`.
+        _ => match app::input::wheel_delta(m.kind, state.config.mouse_wheel_invert) {
+            Some(d) => Some(Action::InventoryDockScroll(d as i32)),
+            // Drag/Up inside the dock must not start a story-pane text selection.
+            None => Some(Action::None),
+        },
+    }
+}
+
 /// Update the command band's quick-block hover highlight from a `Moved`
 /// mouse event (SQ-0677) — the quick block (rose + flowing words, and the
 /// flat-row fallback) is mouse-click-only now, so hover is its only
@@ -1303,6 +1449,69 @@ fn band_update_quick_hover(state: &mut AppState, panes: &PaneRects, event: &Even
             band.quick_hover = hover;
         }
     }
+}
+
+/// Track which matrix-view room the pointer is on (SQ-1246): a row label or a
+/// destination cell, both of which name a room the table may have had to
+/// abbreviate.
+///
+/// Same shape as [`band_update_quick_hover`] just above: pointer motion with
+/// no button held resolves against LAST FRAME's `room_rects` — the same ones
+/// a click on a row or a destination cell already resolves against — and only
+/// while that frame actually drew the matrix view, since `room_rects` carries
+/// the drawn map's room boxes too and those are out of scope for this hint.
+/// Never claims the event, and clears — rather than leaving a stale room lit
+/// — the moment the pointer moves off, the view changes, or a modal opens.
+fn matrix_update_hover(state: &mut AppState, panes: &PaneRects, event: &Event) {
+    use crossterm::event::MouseEventKind;
+    let Event::Mouse(m) = event else { return };
+    if m.kind != MouseEventKind::Moved {
+        return;
+    }
+    state.matrix_hover = if state.any_modal_overlay_open()
+        || panes.map_view != mapper::layer::MapView::Matrix
+    {
+        None
+    } else {
+        panes.room_rects.iter().copied().find(|(_, r)| {
+            r.width > 0
+                && r.height > 0
+                && m.column >= r.x
+                && m.column < r.right()
+                && m.row >= r.y
+                && m.row < r.bottom()
+        })
+    };
+}
+
+/// Track which room-box marker the pointer is on (SQ-1273): the alias-count superscript or a
+/// `?` random-exit stub, each published as its own rect by `render_map_layered` (via
+/// `render::map::MapHits::marker_rects`) at the exact cells `draw_box_room`/`draw_portal_icons`
+/// painted.
+///
+/// Same shape as [`matrix_update_hover`] just above: pointer motion resolves against LAST
+/// FRAME's rects, never claims the event, and clears the moment the pointer moves off, a modal
+/// opens, or the frame simply drew none there (a scroll, a zoom change, a re-route). Markers
+/// exist only at Boxes zoom, so `map_marker_rects` is naturally empty at every other zoom and
+/// in the matrix view — no extra check needed here for either.
+fn map_update_hover(state: &mut AppState, panes: &PaneRects, event: &Event) {
+    use crossterm::event::MouseEventKind;
+    let Event::Mouse(m) = event else { return };
+    if m.kind != MouseEventKind::Moved {
+        return;
+    }
+    state.map_hover = if state.any_modal_overlay_open() {
+        None
+    } else {
+        panes.map_marker_rects.iter().copied().find(|(_, _, r)| {
+            r.width > 0
+                && r.height > 0
+                && m.column >= r.x
+                && m.column < r.right()
+                && m.row >= r.y
+                && m.row < r.bottom()
+        })
+    };
 }
 
 // ── File-browser entry action helper ─────────────────────────────────────────
@@ -1355,23 +1564,40 @@ fn toggle_style_watch(
     set_style_watch(state, watcher, watcher.is_none());
 }
 
-/// Run a map-export Action (SVG/DOT/dump) into the per-game dir. Returns true if
-/// `action` was a map-export action (so callers fall through otherwise). Mirrors
-/// the resolve→create_dir_all→render→write→notice logic that was inline at the
-/// main-loop Action::Export* arms (SQ-0297: slash commands never reached that
-/// match, so this is shared so both the slash and key-dispatch paths export).
+/// Run a map-export Action (SVG/DOT/dump/JSON) into the per-game dir. Returns
+/// true if `action` was a map-export action (so callers fall through
+/// otherwise). Mirrors the resolve→create_dir_all→render→write→notice logic
+/// that was inline at the main-loop Action::Export* arms (SQ-0297: slash
+/// commands never reached that match, so this is shared so both the slash and
+/// key-dispatch paths export).
+///
+/// `session`/`story_bytes`/`story_path` are only ever read by the
+/// `ExportJson` arm (SQ-1336), to build the played story's own identity —
+/// see [`app::export_json::build_walked_story`]. Every other arm ignores them.
 fn handle_map_export(
     action: &Action,
     game_dir: &std::path::Path,
     mapper: &Mapper,
     state: &mut AppState,
+    session: &dyn Engine,
+    story_bytes: &[u8],
+    story_path: &std::path::Path,
 ) -> bool {
     match action {
         Action::ExportSvg(dest) => {
             let path = app::export::resolve_export_path(dest.as_deref(), game_dir, "map.svg");
             if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
-            let rm = render_map_data(&mapper.graph);
-            match export_svg(&path, &rm) {
+            // SQ-1337: every layer stacked, with headings, cross-layer ghosts and
+            // the legend — exactly what `lanthorn-mapgen` writes for `.map.json`'s
+            // sibling `.svg` (`mapgen::write_artefacts`). `render_svg_layered`
+            // reads the current room straight off `mapper.graph` itself
+            // (`MapGraph::current()`, set as the player moves), so the
+            // current-room highlight `render_svg_of` drew here before still
+            // shows — nothing to thread through for it.
+            match app::storage::atomic_write(
+                &path,
+                app::export_svg::render_svg_layered(&mapper.graph).as_bytes(),
+            ) {
                 Ok(()) => state.push_notice(&format!("[SVG exported to {}]", abbreviate_home(&path))),
                 Err(e) => state.push_notice(&format!("[SVG export failed: {}]", e)),
             }
@@ -1399,6 +1625,16 @@ fn handle_map_export(
             }
             true
         }
+        Action::ExportJson(dest) => {
+            let path = app::export::resolve_export_path(dest.as_deref(), game_dir, "map.json");
+            if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
+            let walked = app::export_json::build_walked_story(session, story_bytes, story_path);
+            match app::export_json::export_json(&path, &mapper.graph, &walked) {
+                Ok(()) => state.push_notice(&format!("[JSON exported to {}]", abbreviate_home(&path))),
+                Err(e) => state.push_notice(&format!("[JSON export failed: {}]", e)),
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1422,20 +1658,6 @@ fn loading_line(name: &str, bytes: usize, frame: char) -> String {
     format!("lanthorn: loading {name} ({:.1} MB) {frame}", bytes as f64 / 1_048_576.0)
 }
 
-/// Format the startup line naming the PRNG seed this launch handed the engine
-/// (SQ-0811). `pinned` is whether it came from the `random_seed` config key.
-///
-/// The unpinned line says how to keep the run, because a fresh seed is the whole
-/// point of the default and a player who has just had a remarkable game has no
-/// other way to ask for it again.
-fn random_seed_line(seed: u32, pinned: bool) -> String {
-    if pinned {
-        format!("random seed {seed} (pinned by random_seed in config.toml)")
-    } else {
-        format!("random seed {seed} (set random_seed = {seed} to replay this run)")
-    }
-}
-
 /// Clear the terminal, and tell the graphics cache that it just lost every image
 /// placement (SQ-0587).
 ///
@@ -1456,133 +1678,95 @@ fn clear_terminal<B: ratatui::backend::Backend>(
     gr.invalidate_v6();
 }
 
-/// True when an armed deadline has come due. Extracted so the "is this clock
-/// due?" decision is testable on its own (SQ-0650). `None` = not armed.
-fn deadline_due(deadline: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    deadline.is_some_and(|dl| now >= dl)
-}
+/// `--fetch`: run the IFDB metadata pass over `source` without a terminal,
+/// printing one line per story, and return the process exit code (0 unless a
+/// fetch failed). The worker, the delay between requests and the sidecar
+/// writes are the picker's own; only the reporting differs.
+fn run_headless_fetch(
+    source: &app::picker::StorySource,
+    mode: app::config::FetchMode,
+    data_base: &std::path::Path,
+) -> i32 {
+    use app::fetch_worker::{FetchOrder, Fetcher, Outcome};
+    let targets = app::picker::fetch_targets(source, data_base);
+    let total = targets.len();
+    if total == 0 {
+        eprintln!("lanthorn: no stories under {}", source.dir().display());
+        return 1;
+    }
+    eprintln!("lanthorn: fetching IFDB metadata for {total} stories under {}", source.dir().display());
+    let fetcher = Fetcher::new(
+        Box::new(app::ifdb::IfdbClient::new()),
+        data_base.to_path_buf(),
+        std::time::Duration::from_millis(500),
+    );
+    fetcher.request(FetchOrder { stories: targets, forced: mode.forced(), id_override: None });
 
-/// Fire every game clock whose deadline has come due: the Z-machine timed-input
-/// interrupt, the Glulx Glk timer, sampled-sound finish routines / sound-notify,
-/// and Sound2 volume ramps + their volume-notify. Returns
-/// `(redraw_needed, should_quit)`.
-///
-/// **Runs once per loop iteration, on every path** (SQ-0650). This used to live
-/// inside the poll-timeout branch, which meant it only ran on a tick where NO
-/// terminal event arrived — so a mouse whose motion events keep `poll()`
-/// permanently "ready" froze every one of these clocks: a timed-input puzzle
-/// stopped counting down, a Glk timer stopped ticking, and a finished sound never
-/// ran its finish routine, for as long as the pointer kept moving. The loop top
-/// is the same safe point the timeout branch used (both sit between whole event
-/// dispatches, with nothing borrowed), so this is a move, not a new re-entrancy.
-///
-/// Each fired clock disarms itself before dispatching so an elapsed deadline
-/// cannot re-fire every iteration until the game re-arms it.
-fn dispatch_due_game_clocks(
-    state: &mut app::state::AppState,
-    mapper: &mut Mapper,
-    session: &mut dyn Engine,
-    game_dir: &std::path::Path,
-    map_rect: Rect,
-) -> (bool, bool) {
-    let mut redraw = false;
-    // Timed-input interrupt: the deadline elapsed with no key pressed. Run the
-    // game's interrupt routine and apply its output through the same path a
-    // char-mode keypress uses. If the read continues, the pre-input pollers
-    // re-arm the deadline next iteration from `pending_timeout()`; if the routine
-    // aborted the read, it returns `None` and the timer simply stops.
-    if deadline_due(state.input_deadline, std::time::Instant::now()) {
-        if let Some(zs) = zvm_session_opt_mut(session) {
-            let result = zs.run_timed_interrupt();
-            // Fired: disarm so the next armed iteration re-arms fresh at
-            // now + interval (otherwise the elapsed deadline would refire
-            // immediately every iteration).
-            state.input_deadline = None;
-            redraw = true; // interrupt ran → repaint any output
-            if turn::apply_game_driven_result(
-                state, mapper, &result, game_dir, map_rect, &*session, app::pager::Driver::Timeout,
-            ) {
-                return (redraw, true);
-            }
-        }
+    #[derive(Default)]
+    struct Tally {
+        done: usize,
+        fetched: usize,
+        skipped: usize,
+        not_found: usize,
+        failed: usize,
     }
-    // Glulx Glk timer tick: the interval elapsed with no key pressed. Deliver an
-    // evtype_Timer to the game and apply its output; disarm so the next armed
-    // iteration re-arms fresh at now + interval (mirroring the guard above).
-    if deadline_due(state.glulx_timer_next_fire, std::time::Instant::now()) {
-        state.glulx_timer_next_fire = None;
-        redraw = true; // timer event delivered → repaint any output
-        if let Some(gs) = glulx_session_opt_mut(session) {
-            let result = gs.deliver_timer();
-            if turn::apply_game_driven_result(
-                state, mapper, &result, game_dir, map_rect, &*session, app::pager::Driver::Timeout,
-            ) {
-                return (redraw, true);
-            }
-        }
-    }
-    // Poll for finished sampled sounds and fire their finish-routines.
-    let done: Vec<u32> = state.audio.as_mut().map(|b| b.finished()).unwrap_or_default();
-    if !done.is_empty() {
-        redraw = true; // finish-routine output / channel state changed
-    }
-    for id in done {
-        // Always forget the number->id mapping for a finished sound, even one
-        // with no finish routine.
-        state.sound_ids.retain(|_, v| *v != id);
-        if let Some(routine) = state.sound_routines.remove(&id) {
-            if routine != 0 {
-                if let Some(zs) = zvm_session_opt_mut(session) {
-                    let result = zs.run_sound_finish(routine);
-                    if turn::apply_game_driven_result(
-                        state, mapper, &result, game_dir, map_rect, &*session, app::pager::Driver::Timeout,
-                    ) {
-                        return (redraw, true);
-                    }
+    impl Tally {
+        fn note(&mut self, p: app::fetch_worker::FetchProgress, total: usize) {
+            self.done += 1;
+            let word = match &p.outcome {
+                Outcome::Fetched => {
+                    self.fetched += 1;
+                    "fetched".to_string()
                 }
-            }
-        }
-        // Glulx sound-notify: a finished channel delivers Evtype_SoundNotify.
-        if let Some((snd, notify)) = state.glulx_sound_notify.remove(&id) {
-            state.glulx_channels.retain(|_, v| *v != id);
-            if let Some(gs) = glulx_session_opt_mut(session) {
-                let result = gs.sound_notify(snd, notify);
-                if turn::apply_game_driven_result(
-                    state, mapper, &result, game_dir, map_rect, &*session, app::pager::Driver::Timeout,
-                ) {
-                    return (redraw, true);
+                Outcome::Skipped => {
+                    self.skipped += 1;
+                    "skipped (current)".to_string()
                 }
+                Outcome::NotFound => {
+                    self.not_found += 1;
+                    "not on IFDB".to_string()
+                }
+                Outcome::Failed(e) => {
+                    self.failed += 1;
+                    format!("failed: {e}")
+                }
+            };
+            let place = match &p.disk_entry {
+                Some(e) => format!("{} [{e}]", p.path.display()),
+                None => p.path.display().to_string(),
+            };
+            println!("[{}/{total}] {}  ({place})  {word}", self.done, p.title);
+        }
+    }
+    let mut tally = Tally::default();
+    loop {
+        let batch = fetcher.drain();
+        let quiet = batch.is_empty();
+        for p in batch {
+            tally.note(p, total);
+        }
+        if tally.done >= total {
+            break;
+        }
+        if quiet {
+            // The worker clears `busy` after its last send, so a drain after
+            // seeing it clear collects the tail; an empty tail is the end.
+            if !fetcher.busy() {
+                let tail = fetcher.drain();
+                if tail.is_empty() {
+                    break;
+                }
+                for p in tail {
+                    tally.note(p, total);
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
-    // Glulx Sound2 volume-ramp completion: a gradual set_volume_ext whose
-    // duration has elapsed delivers an evtype_VolumeNotify. The host owns the
-    // ramp clock (mirroring the sound-finish notify above); deliver every due one.
-    let now = std::time::Instant::now();
-    // Step any in-flight Sound2 volume ramp toward its target (host owns the ramp
-    // clock). Pure audio — no redraw needed.
-    state.advance_volume_ramps(now);
-    let due_volume: Vec<(u32, u32)> = state
-        .glulx_volume_notify
-        .iter()
-        .filter(|(_, (deadline, _))| *deadline <= now)
-        .map(|(&chan, &(_, notify))| (chan, notify))
-        .collect();
-    if !due_volume.is_empty() {
-        redraw = true;
-    }
-    for (chan, notify) in due_volume {
-        state.glulx_volume_notify.remove(&chan);
-        if let Some(gs) = glulx_session_opt_mut(session) {
-            let result = gs.volume_notify(notify);
-            if turn::apply_game_driven_result(
-                state, mapper, &result, game_dir, map_rect, &*session, app::pager::Driver::Timeout,
-            ) {
-                return (redraw, true);
-            }
-        }
-    }
-    (redraw, false)
+    let Tally { fetched, skipped, not_found, failed, .. } = tally;
+    println!("lanthorn: {fetched} fetched, {skipped} skipped, {not_found} not on IFDB, {failed} failed");
+    if failed > 0 { 1 } else { 0 }
 }
 
 fn main() {
@@ -1618,6 +1802,23 @@ fn main() {
     // compilation disc instead of only whichever one the mount prefers. A miss
     // prints the list and exits 2 — the same code `resolve_launch` uses for "no
     // story given", and never a fallback to booting an arbitrary game.
+    // `--fetch`: the browser's IFDB pass with no browser, then exit. Placed
+    // after `source` so it takes the same library or disk set the picker
+    // would, and before anything touches the terminal.
+    // `--import-metadata`: curated rows for what `--fetch` could not settle.
+    if let Some(tsv) = ctx.cli.import_metadata.as_deref() {
+        let source = app::ifdb::IfdbClient::new();
+        std::process::exit(app::metadata_import::run(tsv, &ctx.data_base, &source, std::time::Duration::from_millis(500)));
+    }
+
+    if let Some(mode) = ctx.cli.fetch {
+        let Some(source) = source.as_ref() else {
+            eprintln!("lanthorn: --fetch needs a library directory or a story file");
+            std::process::exit(2);
+        };
+        std::process::exit(run_headless_fetch(source, mode, &ctx.data_base));
+    }
+
     let direct = ctx.cli.story_pick.as_deref().map(|want| {
         let single = ctx.single_file.clone().unwrap_or_default();
         match app::story_pick::pick(source.as_ref(), &single, &ctx.data_base, want) {
@@ -1637,6 +1838,12 @@ fn main() {
     // rather than dropping the player into a list they asked not to see.
     let launched_from_library = source.is_some() && direct.is_none();
 
+    // Where the browser was sitting the last time it handed off a story
+    // (SQ-1474): `None` the first time through, then fed back into the next
+    // `run_story_picker` call so a return from the game lands back on the
+    // same directory and row rather than snapping to the top of the root.
+    let mut picker_position: Option<picker_ui::PickerPosition> = None;
+
     // ── Picker → play loop ────────────────────────────────────────────────────
     loop {
         // Obtain the next story to play, plus any boot-time overrides chosen on
@@ -1652,8 +1859,16 @@ fn main() {
             // Library (or multi-disk set) launch: run the picker on the normal
             // screen (the previous game left its alt-screen). Quitting the
             // picker (None) exits.
-            match picker_ui::run_story_picker(source.clone(), &ctx.cfg, &ctx.data_base) {
-                Some(p) => (p.path, p.disk_entry, p.overrides),
+            match picker_ui::run_story_picker(
+                source.clone(),
+                &ctx.cfg,
+                &ctx.data_base,
+                picker_position.as_ref(),
+            ) {
+                Some(p) => {
+                    picker_position = Some(p.position);
+                    (p.path, p.disk_entry, p.overrides)
+                }
                 None => break,
             }
         } else {
@@ -1705,6 +1920,20 @@ fn cli_overrides(ctx: &startup::LaunchCtx) -> app::launch_options::LaunchOverrid
             std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()).display().to_string()
         }),
         interpreter_number: None,
+        // No CLI flag for this (SQ-1473 added no `--scott-picture-resolution`);
+        // a command-line launch inherits the sidecar/default exactly as before.
+        scott_picture_resolution: None,
+        // No launch-options dialog on this path (a bare file or `--story` pick
+        // never shows it), so there is no session-only choice to carry — the
+        // per-game sidecar and `--colour`/`--game-colours` decide exactly as
+        // they did before SQ-1532.
+        colour_source: None,
+        honor_game_colours: None,
+        // No CLI flag for THIS launch specifically (SQ-1556) — `--images off`
+        // already exists globally and reaches every launch on the command
+        // line, so a second, per-launch door into the same setting would be
+        // redundant on this path. The dialog's own art row is what needs it.
+        images: None,
     }
 }
 
@@ -1722,6 +1951,8 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         game_dir,
         ifid,
         arc_file,
+        quick_save_file,
+        resume_source_file,
         story_bytes,
         story_path,
         data_base,
@@ -1730,6 +1961,12 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
     // Whether a story library exists to return to; gates `/quit-to-library`. Set
     // once here from the launch context. (SQ-0435)
     state.launched_from_library = launched_from_library;
+    // A story launched from the list always resolves back to it, on every way
+    // the run can end — the game's own quit included — not only the explicit
+    // `/quit-to-library` path. Seeding the default here means a game-driven quit
+    // (`should_exit_on_turn`, never touched by any quit dispatch) resolves
+    // correctly with no separate wiring of its own (SQ-1258).
+    state.exit_target = app::state::ExitTarget::for_launch(launched_from_library);
 
     // ── 5. Event loop ─────────────────────────────────────────────────────────
 
@@ -1754,6 +1991,12 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
     let mut vm_story_size: Option<(u16, u16)> = None;
     let mut story_size_seen: Option<(u16, u16)> = None;
     let mut resize_dirty: Option<std::time::Instant> = None;
+
+    // In-game picker settle-and-requery debounce (SQ-1511). Set the instant an
+    // `Event::Resize` arrives (below); `loop_tick::poll_picker_requery` acts once
+    // it has sat unchanged for the settle window — same shape as `resize_dirty`
+    // above, one settle tracker per independent debounced poller.
+    let mut picker_resize_dirty: Option<std::time::Instant> = None;
 
     // Poll FPS while a background tidy is in flight.
     const TIDY_POLL_MS: u64 = 33;
@@ -1822,12 +2065,15 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // instead, once per iteration, on every path. (The timeout branch reached
         // this same point via its `continue`, so the ordering is unchanged for the
         // idle case that already worked.)
+        // The rules live in the library (SQ-1539): `fire_due` is what a host
+        // that is not a terminal calls on its own schedule too.
         {
-            let (redraw, quit) = dispatch_due_game_clocks(
-                &mut state, &mut mapper, &mut *session, &game_dir, last_panes.map,
+            let fired = app::host::clock::fire_due(
+                &mut state, &mut mapper, &mut *session, &game_dir, map_view(last_panes.map),
+                std::time::Instant::now(),
             );
-            needs_redraw |= redraw;
-            if quit {
+            needs_redraw |= fired.redraw;
+            if fired.quit {
                 break 'event_loop state.exit_target.into();
             }
         }
@@ -1837,6 +2083,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // independent pollable subsystem lives in `loop_tick` and returns its
         // redraw contribution, OR-ed into `needs_redraw` here (order preserved).
         needs_redraw |= loop_tick::poll_style_watch(&mut state, &style_watcher, &mut watch_dirty);
+        needs_redraw |= loop_tick::poll_recall(&mut state, &last_panes);
         loop_tick::sync_theme_colours(&state, &mut *session);
         needs_redraw |= loop_tick::poll_glulx_resize(
             &mut *session,
@@ -1845,6 +2092,18 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             &mut resize_dirty,
             &mut vm_story_size,
         );
+        // SQ-1511: settle-and-requery the in-game Picker's cell size after a
+        // resize (see `loop_tick::poll_picker_requery`'s docs for why this
+        // requeries via stdio rather than the ioctl `refresh_cell_size` used to).
+        // `mode`/`shm` are copied out before the borrow so the closure below
+        // doesn't need to capture `state` (which is already borrowed mutably by
+        // the call itself).
+        {
+            let (mode, shm) = (state.config.image_protocol, state.config.kitty_shared_memory);
+            needs_redraw |= loop_tick::poll_picker_requery(&mut state, &mut picker_resize_dirty, || {
+                picker_ui::build_cover_picker(mode, shm)
+            });
+        }
         // ZMSD §8.4 / §8.3.3 (SQ-0532): keep the story's header describing the REAL
         // host — the story pane's measured size in $20/$21, and our own default
         // page/ink in $2C/$2D (which a live style reload can change mid-game).
@@ -1854,26 +2113,33 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // Before the poll, so the job it schedules is picked up on the next pass
         // rather than sitting a whole frame longer than it has to.
         needs_redraw |=
-            loop_tick::catch_up_deferred_map_layout(&mut state, &mapper, &mut bg_tidy_counter);
+            turn::catch_up_deferred_map_layout(&mut state, &mapper, &mut bg_tidy_counter);
         needs_redraw |= loop_tick::poll_tidy_jobs(&mut state, &mut mapper, &last_panes);
-        needs_redraw |= state.poll_render_job();
+        needs_redraw |= state.poll_render_job(&mapper.graph);
         needs_redraw |= state.poll_v6_encode_job();
         // Play out a v6 turn's picture sequence one frame at a time (SQ-0708).
         // Runs before the draw, so an advanced frame paints on this very pass.
-        needs_redraw |= loop_tick::poll_picture_pacing(&mut state, &mut *session);
-        needs_redraw |= loop_tick::refresh_engine_input(&mut state, &mut *session);
+        // Lives in the library now (`host::clock::poll_picture_pacing`, SQ-1570)
+        // so a headless host gets the same pacer.
+        needs_redraw |= app::host::clock::poll_picture_pacing(&mut state, &mut *session);
+        needs_redraw |= app::host::clock::refresh_input(&mut state, &mut *session);
         // The command band's object columns are LIVE: refilled from the engine
         // every tick, so a take/drop moves an object between *here* and
         // *carried* on the very next frame (SQ-0664).
         needs_redraw |= loop_tick::refresh_command_band(&mut state, &*session);
+        // The inventory dock's clickable words are LIVE too, and independent of
+        // the command band (SQ-1244): the two panels are mutually exclusive, so
+        // the dock cannot piggyback on the band's own object refresh.
+        app::render::inventory_dock::refresh_inventory_click_words(&mut state, &*session);
         needs_redraw |= loop_tick::expire_sound_and_settle_dock(&mut state);
         // One collector for the shared shadow, routing each answer to whoever
-        // asked for it (SQ-1124, SQ-0785): a vocabulary offer lands above the
-        // prompt like any other assist and drops silently if the player has typed
-        // again, while a return-path answer goes on the map whenever it arrives —
-        // it is a fact about the world, not about this turn. The same call hands
-        // the return search its next question.
-        needs_redraw |= loop_tick::poll_shadow_answers(&mut state, &mut mapper, &mut bg_tidy_counter);
+        // asked for it (SQ-1124, SQ-0785, SQ-1548): a vocabulary offer lands above
+        // the prompt like any other assist and drops silently if the player has
+        // typed again, while a return-path answer goes on the map whenever it
+        // arrives — it is a fact about the world, not about this turn. The same
+        // call hands the return search its next question. Lives in the library
+        // now (`host::probe::poll`) so a headless host collects these too.
+        needs_redraw |= app::host::probe::poll(&mut state, &mut mapper, &mut bg_tidy_counter);
 
         // Draw — unless we're mid-drain of an input burst (skip_draw), in which
         // case the deferred redraw happens once the queue empties. last_panes and
@@ -1902,6 +2168,40 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                 // Carry this frame's modal list viewport so the next nav action
                 // can window/animate the open selection-list modal.
                 state.modal_list_viewport = panes.modal_list_viewport;
+                // Room dock body scroll (SQ-1280): sync the ACTIVE body's `ListScroll`
+                // to what the render pass just measured, mirroring `modal_list_viewport`
+                // above. A displayed-room change — a pin, an unpin-and-follow, a walk
+                // while following, or the dock closing (which reads as the room going
+                // to `None`) — resets BOTH bodies to the top rather than reclamping
+                // into a different room's content.
+                if state.room_dock_scroll_room != panes.room_dock_room {
+                    state.room_dock_info_scroll = app::list_scroll::ListScroll::new();
+                    state.room_dock_diag_scroll = app::list_scroll::ListScroll::new();
+                    state.room_dock_scroll_room = panes.room_dock_room;
+                }
+                state.room_dock_body_viewport = panes.room_dock_body_viewport;
+                let dock_scroll = match state.room_dock_view {
+                    app::state::RoomDockView::Info => &mut state.room_dock_info_scroll,
+                    app::state::RoomDockView::Diagnostics => &mut state.room_dock_diag_scroll,
+                };
+                if panes.room_dock_body_total as usize <= panes.room_dock_body_viewport as usize {
+                    // The body no longer overflows: nothing to scroll, so nothing stays scrolled.
+                    *dock_scroll = app::list_scroll::ListScroll::new();
+                } else {
+                    dock_scroll.len(panes.room_dock_body_total as usize);
+                }
+                // Inventory dock body scroll (SQ-1630): the same sync `RoomDockScroll`
+                // gets above, against `InventoryDockHits::body_total`/`body_viewport`
+                // rather than a `PaneRects` field — the dock has one body, not two, so
+                // there is no per-view scroll to pick between and no "displayed room"
+                // to reset against; a filter change resets it directly instead
+                // (`Action::SetInventoryFilter`).
+                state.inv_dock_body_viewport = panes.inventory_dock.body_viewport;
+                if panes.inventory_dock.body_total as usize <= panes.inventory_dock.body_viewport as usize {
+                    state.inv_dock_scroll = app::list_scroll::ListScroll::new();
+                } else {
+                    state.inv_dock_scroll.len(panes.inventory_dock.body_total as usize);
+                }
                 // Replay's idx is the source of truth; keep its (animated) list
                 // scroll following it. Skip while a scroll is easing so the tween
                 // isn't restarted each frame; select() is a no-op once settled.
@@ -1952,21 +2252,11 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             } else { false }
         };
         let base_poll_ms = if state.has_active_animation() || sound_active || timer_active || selecting_at_edge { TIDY_POLL_MS } else { 50 };
-        // Clamp to whichever clock is due first: the Z-machine timed-input deadline,
-        // the Glulx Glk-timer deadline, or the soonest pending Sound2 volume-ramp
-        // completion (any may be `None`/empty).
-        let next_volume_deadline = state.glulx_volume_notify.values().map(|(t, _)| *t).min();
-        let next_deadline = [
-            state.input_deadline,
-            state.glulx_timer_next_fire,
-            next_volume_deadline,
-            // …and the v6 picture pacer, so the loop wakes to land the next frame
-            // of a turn's picture sequence on time (SQ-0708).
-            state.picture_pace_next,
-        ]
-            .into_iter()
-            .flatten()
-            .min();
+        // Clamp to whichever clock is due first: the game's own (the Z-machine
+        // timed-input deadline, the Glulx Glk-timer deadline, the soonest pending
+        // Sound2 volume-ramp completion, or the v6 picture pacer's next frame —
+        // all folded into `host::clock::next_deadline` (SQ-1570).
+        let next_deadline = app::host::clock::next_deadline(&state);
         let poll_ms = match next_deadline {
             Some(dl) => {
                 let remaining = dl.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
@@ -2038,15 +2328,11 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                 }
             }
             // Finalize a completed smooth-scroll: snap the logical offset to the
-            // target and drop the animation. The next iteration redraws.
-            let done_to = state
-                .scroll_anim
-                .as_ref()
-                .filter(|a| a.done())
-                .map(|a| a.target());
-            if let Some(to) = done_to {
-                state.transcript_scroll = to as u16;
-                state.scroll_anim = None;
+            // target and drop the animation. The next iteration redraws. Shares
+            // the finalize path the SQ-1595 cancellation hook below uses to end
+            // one early, rather than forking a second copy of it.
+            if state.scroll_anim.as_ref().is_some_and(|a| a.done()) {
+                state.finalize_transcript_scroll_anim_now();
             }
             // Finalize each open scrollable surface's animation likewise. Each
             // finalize reports whether it just cleared a running anim; OR that
@@ -2078,6 +2364,10 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             // dregs of its opacity), so without this it never actually leaves
             // the screen. (SQ-0782)
             needs_redraw |= state.finalize_scrollbar_if_done();
+            // The sixel scroll-settle debounce needs the same settle frame: the
+            // window closing is itself the content change (footprint → full
+            // payload), so without this it never actually re-emits. (SQ-1198)
+            needs_redraw |= state.finalize_sixel_scroll_motion_if_done();
             continue;
         }
 
@@ -2140,23 +2430,42 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         if matches!(&event, Event::Key(k) if k.kind == KeyEventKind::Press)
             || matches!(&event, Event::Resize(_, _))
         {
-            loop_tick::settle_picture_pacing(&mut state, &mut *session);
+            app::host::clock::settle_picture_pacing(&mut state, &mut *session);
         }
 
-        // SQ-0988: a resize may have changed the CELL, not only the grid. The
-        // terminal's cell size was measured once, at launch, by a stdio query no
-        // one can safely repeat with the app in raw mode — so a font-size change
-        // left every fit running on the launch aspect ratio until restart, and
-        // the art looked stretched. `TIOCGWINSZ` re-derives it with no round
-        // trip; when it moves, everything fitted against the old cell goes.
-        //
-        // This sits AHEAD of the three `Event::Resize` arms below (each of which
-        // `continue`s after clearing), so it runs once per resize whichever arm
-        // that resize belongs to.
-        if matches!(&event, Event::Resize(_, _))
-            && state.game_picker.as_mut().is_some_and(picker_ui::refresh_cell_size)
-        {
-            state.graphics_render.borrow_mut().invalidate_cell_geometry();
+        // SQ-1595: the player outranks an in-flight transcript follow-ease too —
+        // any key press or mouse event (a wheel scroll counts same as a
+        // keystroke) finalizes it immediately rather than fighting whatever the
+        // reader is about to do. Non-consuming, same shape as the picture-pacing
+        // settle above: if the event itself is a scroll action, it arms its own
+        // fresh animation in its own handler, AFTER this, untouched.
+        if matches!(&event, Event::Key(k) if k.kind == KeyEventKind::Press) || matches!(&event, Event::Mouse(_)) {
+            state.finalize_transcript_scroll_anim_now();
+        }
+
+        // SQ-1511: a resize may have changed the CELL, not only the grid — mark
+        // it dirty; `loop_tick::poll_picker_requery` (Pre-input pollers, above)
+        // acts once the resize burst settles. Was a synchronous ioctl re-derive
+        // here (SQ-0988); see that poller's docs for why it moved to a settled
+        // stdio requery instead. Runs on every `Event::Resize`, ahead of the
+        // three arms below (each of which `continue`s after clearing), so no
+        // resize is missed whichever arm it belongs to.
+        if matches!(&event, Event::Resize(_, _)) {
+            picker_resize_dirty = Some(std::time::Instant::now());
+        }
+
+        // SQ-1340: a resize is also the only hook a dtach reattach gives us
+        // (`docker/serve-session.sh` runs the web image under `dtach -A ... -r
+        // winch`, and `-r winch` delivers SIGWINCH — a fresh `Event::Resize` —
+        // on every attach). The browser tab that just reattached has a brand
+        // new xterm.js instance that never saw the launch-time
+        // `EnableBracketedPaste`/`EnableMouseCapture` escapes, so touch
+        // scrolling, map dragging and divider dragging are dead until
+        // something re-sends them. Same shared fn as the launch site
+        // (`startup::reassert_terminal_modes`), so the two cannot drift; on an
+        // ordinary local resize this is a harmless idempotent re-send.
+        if matches!(&event, Event::Resize(_, _)) {
+            let _ = startup::reassert_terminal_modes(&mut stdout(), state.config.mouse);
         }
 
         // If more input is already queued behind this event, defer the next
@@ -2172,6 +2481,9 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // text field currently owns typing and does NOT submit — the user reads it
         // back and presses Enter.
         if let Event::Paste(text) = &event {
+            if state.recall_mode && !state.any_modal_overlay_open_except_recall() {
+                continue; // a recall preview never edits the game's prompt
+            }
             app::input::apply_paste(&mut state, text);
             continue;
         }
@@ -2188,7 +2500,20 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // it, then goes on to be handled normally.
         if let Event::Mouse(m) = &event {
             use app::pane_drag::DragOutcome;
-            match app::pane_drag::on_mouse(&mut state, m, &last_panes.pane_layout, &last_panes.boundaries, &last_panes.border_controls) {
+            // The room dock's view tabs (SQ-1265) sit on `Boundary::RoomDockTop`'s
+            // own grab row (the dock's top border IS the pane's bottom border),
+            // so they must be excluded from the drag the same way a border
+            // control is — otherwise a Down on "Room"/"Diagnostics" starts a
+            // resize instead of ever reaching `room_dock_mouse_action`.
+            let dock_chrome: Vec<Rect> = last_panes
+                .room_dock_tabs
+                .iter()
+                .map(|(_, r)| *r)
+                // The close box sits on the same border row as the tabs and needs
+                // the same exclusion, or a click on it starts a resize too.
+                .chain(last_panes.room_dock_close)
+                .collect();
+            match app::pane_drag::on_mouse(&mut state, m, &last_panes.pane_layout, &last_panes.boundaries, &last_panes.border_controls, &dock_chrome) {
                 DragOutcome::Ignored => {}
                 DragOutcome::Consumed => continue,
                 DragOutcome::Committed => {
@@ -2199,6 +2524,13 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         } else if app::pane_drag::interrupt(&mut state) {
             lifecycle::flush_pending_config_write(&mut state);
         }
+
+        // SQ-1378: a deferred v6 game click belongs to one press-drag-release
+        // gesture, so anything that is not a mouse event ends it — the same rule
+        // the boundary drag just above follows. A keypress can move the story to
+        // a different read entirely, and a click held over that would fire
+        // against a prompt it was never aimed at.
+        app::input::v6_click_interrupt(&mut state, &event);
 
         // ── Command-band quick-block hover (SQ-0677) ───────────────────────────
         // Mirrors `pane_drag::on_mouse`'s own Moved handling just above: pointer
@@ -2227,6 +2559,12 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                 state.control_hover = hover;
             }
         }
+
+        // ── Matrix-view room hover (SQ-1246) ────────────────────────────────────
+        matrix_update_hover(&mut state, &last_panes, &event);
+
+        // ── Drawn-view room-marker hover (SQ-1273) ──────────────────────────────
+        map_update_hover(&mut state, &last_panes, &event);
 
         // ── Common-dialog overlay intercept ladder (SQ-0307) ──────────────────
         // The aux / reset / save-name / text-entry / confirm-delete / quit /
@@ -2257,31 +2595,30 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                             "[Recording turn history. Rewind will have something to show after your next move.]",
                         );
                     }
-                    OverlayAct::FontCheck(nerdfont) => {
-                        // SQ-1104: the answer is a GLYPH decision, so it is
-                        // recorded in `style.toml` as preset names, not in
-                        // `config.toml`. Written, then reloaded, so the map
-                        // changes under the player's eyes rather than at the
-                        // next launch — which is also the only way they can see
-                        // whether they answered correctly.
+                    OverlayAct::FontCheck(nerdfont, diagonal) => {
+                        // SQ-1104/SQ-1245: both answers are GLYPH decisions, so
+                        // they are recorded in `style.toml` as preset names /
+                        // a bool, not in `config.toml`. Written, then reloaded,
+                        // so the map changes under the player's eyes rather
+                        // than at the next launch — which is also the only way
+                        // they can see whether they answered correctly.
                         let msg = match app::style::style_write_path(
                             state.config.style.as_deref(),
                             &state.config.user_dir,
                         ) {
-                            Some(path) => match app::style::write_font_check_answer(&path, nerdfont) {
+                            Some(path) => match app::style::write_font_check_answer(&path, nerdfont, diagonal) {
                                 Ok(()) => {
                                     let _ = app::reload::reload_style(&mut state);
-                                    if nerdfont {
-                                        format!(
-                                            "[Nerd Font icons on. Saved to {}; run-font-check asks again.]",
-                                            path.display()
-                                        )
-                                    } else {
-                                        format!(
-                                            "[Plain glyphs. Saved to {}; run-font-check asks again.]",
-                                            path.display()
-                                        )
-                                    }
+                                    let icons = if nerdfont { "Nerd Font icons on" } else { "Plain glyphs" };
+                                    let diag = match diagonal {
+                                        Some(true) => "; diagonal corners on",
+                                        Some(false) => "; diagonal corners off",
+                                        None => "",
+                                    };
+                                    format!(
+                                        "[{icons}{diag}. Saved to {}; run-font-check asks again.]",
+                                        path.display()
+                                    )
                                 }
                                 Err(e) => format!("[Could not save the font choice: {e}]"),
                             },
@@ -2349,6 +2686,8 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         let delete = state.overlays.reset_delete_data;
                         state.overlays.reset_dialog = false;
                         reset_game(&mut *session, &mut mapper, &mut state, &story_bytes, &story_path, &game_dir, clear, delete);
+                        // SQ-1504: see `loop_tick::reset_glulx_resize_trackers`.
+                        loop_tick::reset_glulx_resize_trackers(&mut vm_story_size, &mut story_size_seen, &mut resize_dirty);
                     }
                     OverlayAct::ResetCancel => {
                         state.overlays.reset_dialog = false;
@@ -2362,6 +2701,8 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         // Plain restart: keep the accumulated map and saved data.
                         state.overlays.game_over = false;
                         reset_game(&mut *session, &mut mapper, &mut state, &story_bytes, &story_path, &game_dir, false, false);
+                        // SQ-1504: see `loop_tick::reset_glulx_resize_trackers`.
+                        loop_tick::reset_glulx_resize_trackers(&mut vm_story_size, &mut story_size_seen, &mut resize_dirty);
                     }
                     OverlayAct::GameOverRestore => {
                         // Close the game-over overlay and open the saves manager (the
@@ -2394,19 +2735,13 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                             handle_save_as(
                                 value, &game_dir, &ifid, &mut mapper, &mut *session, &mut state, false,
                             );
-                            let quit = resolve_ingame_dialog(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map)
-                                || resolve_filename_request(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map);
-                            turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                            turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
+                            let quit = ingame_io::resolve_pending(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, map_view(last_panes.map));
                             if quit { break 'event_loop state.exit_target.into(); }
                         }
                     }
                     OverlayAct::SaveNameCancel => {
                         state.overlays.save_name_dialog = None;
-                        let quit = resolve_ingame_dialog(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map)
-                            || resolve_filename_request(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map);
-                        turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                        turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
+                        let quit = ingame_io::resolve_pending(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, map_view(last_panes.map));
                         if quit { break 'event_loop state.exit_target.into(); }
                     }
                     OverlayAct::TextEntrySubmit => {
@@ -2415,20 +2750,14 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         if let Some(dlg) = state.overlays.text_entry.take() {
                             apply_text_entry(dlg, &mut state, &mut mapper);
                         }
-                        let quit = resolve_ingame_dialog(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map)
-                            || resolve_filename_request(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map);
-                        turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                        turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
+                        let quit = ingame_io::resolve_pending(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, map_view(last_panes.map));
                         if quit { break 'event_loop state.exit_target.into(); }
                     }
                     OverlayAct::TextEntryCancel => {
                         // A cancelled CreateFile leaves pending_filename set with no
                         // dialog open → resolve_filename_request treats it as NULL.
                         state.overlays.text_entry = None;
-                        let quit = resolve_ingame_dialog(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map)
-                            || resolve_filename_request(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map);
-                        turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                        turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
+                        let quit = ingame_io::resolve_pending(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, map_view(last_panes.map));
                         if quit { break 'event_loop state.exit_target.into(); }
                     }
                     OverlayAct::ConfirmDelete(confirmed) => {
@@ -2455,10 +2784,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                         handle_save_as(
                                             value, &game_dir, &ifid, &mut mapper, &mut *session, &mut state, true,
                                         );
-                                        let quit = resolve_ingame_dialog(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map)
-                                            || resolve_filename_request(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map);
-                                        turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                                        turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
+                                        let quit = ingame_io::resolve_pending(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, map_view(last_panes.map));
                                         if quit { break 'event_loop state.exit_target.into(); }
                                     }
                                     // Cancelled: the save-name dialog is untouched behind
@@ -2488,7 +2814,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         // & quit"; carry the reason out so it can be printed once
                         // the terminal is back (SQ-0651).
                         quit_save_warning =
-                            lifecycle::quit_dialog_save(&mut *session, &mapper, &state, &ifid, &arc_file);
+                            lifecycle::quit_dialog_save(&mut *session, &mapper, &state, &ifid, &quick_save_file);
                         break 'event_loop state.exit_target.into();
                     }
                     OverlayAct::QuitQuit => {
@@ -2496,15 +2822,17 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     }
                     OverlayAct::QuitCancel => {
                         // Cancelling the dialog abandons the pending intent, so
-                        // reset the target to Exit — a later plain quit through the
-                        // same dialog must not inherit a stale Library. (SQ-0435)
+                        // reset the target back to this launch's default — a later
+                        // plain quit through the same dialog must not inherit
+                        // whatever a superseded `/quit-to-library` left behind.
+                        // (SQ-0435, SQ-1258)
                         state.overlays.quit_dialog = false;
-                        state.exit_target = app::state::ExitTarget::Exit;
+                        state.exit_target = app::state::ExitTarget::for_launch(state.launched_from_library);
                     }
                     OverlayAct::LaunchResume => {
                         if let Some((save, lines, kinds, screen)) = state.pending_resume.take() {
                             state.overlays.launch_dialog = false;
-                            turn::apply_launch_resume(&save, lines, kinds, screen, &mut *session, &mut mapper, &mut state, &last_panes, &arc_file);
+                            turn::apply_launch_resume(&save, lines, kinds, screen, &mut *session, &mut mapper, &mut state, map_view(last_panes.map), &resume_source_file);
                         }
                     }
                     OverlayAct::LaunchNewGame => {
@@ -2617,6 +2945,36 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             continue;
         }
 
+        // ── Recall preview — owns input until closed ──────────────────────────
+        if state.recall_mode && !state.any_modal_overlay_open_except_recall() {
+            let panel_area = recall_panel_area(&state, last_panes.story);
+            let max = app::render::recall_panel::max_scroll(&state, panel_area);
+            let page = panel_area.height.saturating_sub(3).max(1) as usize;
+            match &event {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    let action = recall_key_action(k.code, state.config.search.key_back, state.config.search.key_forward);
+                    match action {
+                        RecallKeyAction::Close => state.close_recall(),
+                        RecallKeyAction::Next | RecallKeyAction::Previous => {
+                            let forward = matches!(action, RecallKeyAction::Next);
+                            if let Some(pos) = state.search_next(forward) {
+                                state.transcript_scroll = scroll_for_recall_match(&state, &last_panes, pos);
+                            }
+                        }
+                        action => state.recall_preview_scroll = recall_preview_scroll(action, state.recall_preview_scroll, max, page),
+                    }
+                }
+                Event::Mouse(m) => {
+                    if let Some(delta) = app::input::wheel_delta(m.kind, state.config.mouse_wheel_invert) {
+                        state.recall_preview_scroll = recall_preview_scroll_delta(state.recall_preview_scroll, max, delta);
+                    }
+                }
+                Event::Resize(_, _) => clear_terminal(&mut terminal, &state),
+                _ => {}
+            }
+            continue; // every other event is swallowed; no VM input or move
+        }
+
         // ── Search-nav intercept — before normal action routing ───────────────
         // When a search is active and no modal is open, intercept the configured
         // back/forward keys and Esc to navigate matches.  Any other key clears
@@ -2631,11 +2989,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         KeyCode::Char(c) if c == key_back => {
                             if let Some(pos) = state.search_next(false) {
                                 let total_vis = state.visible_transcript_indices().len();
-                                let pane_rows = if last_panes.story.height > 0 {
-                                    last_panes.story.height as usize
-                                } else {
-                                    24
-                                };
+                                let pane_rows = if last_panes.story.height > 0 { last_panes.story.height as usize } else { 24 };
                                 state.transcript_scroll = scroll_for_match(pos, total_vis, pane_rows);
                             }
                             continue;
@@ -2643,11 +2997,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         KeyCode::Char(c) if c == key_forward => {
                             if let Some(pos) = state.search_next(true) {
                                 let total_vis = state.visible_transcript_indices().len();
-                                let pane_rows = if last_panes.story.height > 0 {
-                                    last_panes.story.height as usize
-                                } else {
-                                    24
-                                };
+                                let pane_rows = if last_panes.story.height > 0 { last_panes.story.height as usize } else { 24 };
                                 state.transcript_scroll = scroll_for_match(pos, total_vis, pane_rows);
                             }
                             continue;
@@ -2985,7 +3335,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         // Shogun's startup menu, hint menus, "press any key" — are
                         // unnavigable without arrows, so the char gate never withholds
                         // (SQ-0483). Kept as a call for symmetry with the line gate.
-                        let withhold_arrow = withhold_arrow_from_v6(
+                        let withhold_arrow = app::host::input::withhold_arrow_from_v6(
                             ki,
                             state.config.v6_arrow_keys,
                             zvm_session_opt(&*session).map_or(0, |z| z.machine.mem.version()),
@@ -2998,8 +3348,8 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                             })
                             {
                                 if turn::apply_game_driven_result(
-                                    &mut state, &mut mapper, &result, &game_dir, last_panes.map, &*session, app::pager::Driver::PlayerInput,
-                                ) {
+                                    &mut state, &mut mapper, &result, &game_dir, map_view(last_panes.map), &*session, app::pager::Driver::PlayerInput,
+                                ).quit {
                                     break 'event_loop state.exit_target.into();
                                 }
                             }
@@ -3022,7 +3372,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         // has seen the output that armed the pager.
         if !state.any_overlay_open()
             && !state.pager.active
-            && zvm_session_opt(&*session).is_some_and(|z| z.pending_input() == app::session::InputKind::Line)
+            && session.pending_input() == app::session::InputKind::Line
         {
             if let Event::Key(k) = &event {
                 if k.kind == KeyEventKind::Press {
@@ -3031,39 +3381,27 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
                     );
                     if plain {
-                        let ki = app::engine::key_event_to_input(*k);
-                        // Withheld v6 arrows never act as line terminators either
-                        // (SQ-0460): without this, a v6 game listing arrows in its
-                        // terminating-characters table still moved the player from
-                        // the line prompt regardless of the setting.
-                        let withheld = withhold_arrow_from_v6(
-                            ki,
-                            state.config.v6_arrow_keys,
-                            zvm_session_opt(&*session).map_or(0, |z| z.machine.mem.version()),
-                            true,
-                        );
-                        let term = if withheld { None } else {
-                            ki.and_then(|ki| zvm_session_opt(&*session).and_then(|z| z.line_key_terminator(&ki)))
-                        };
-                        if let Some(term) = term {
-                            let cmd = state.take_input();
-                            if !cmd.is_empty() {
-                                state.record_command(&cmd);
-                            }
-                            state.turns += 1;
-                            state.unsaved_progress = true;
-                            let result = zvm_session_opt_mut(&mut *session)
-                                .expect("z-machine line read is pending")
-                                .submit_line_with_terminator(&cmd, term);
-                            if turn::finish_command_turn(
-                                // The read ended on a listed terminating
-                                // character, not a newline (SQ-0881).
-                                &cmd, false, result, &mut state, &mut mapper, &mut *session,
-                                &game_dir, &ifid, &arc_file, last_panes.map, &mut bg_tidy_counter,
+                        // What a line-terminator key DOES — the v6-arrow
+                        // withholding gate (SQ-0460) and the story's own
+                        // terminating-characters table, applying the resulting
+                        // turn like a typed command — is the library's rule,
+                        // shared with every host (SQ-1610).
+                        if let Some(ki) = app::engine::key_event_to_input(*k) {
+                            let mut ctx = app::host::TurnCtx {
+                                game_dir: &game_dir,
+                                ifid: &ifid,
+                                arc_file: &arc_file,
+                                map_view: map_view(last_panes.map),
+                                bg_tidy_counter: &mut bg_tidy_counter,
+                            };
+                            if let Some(out) = app::host::input::deliver_line_key_terminator(
+                                &mut state, &mut mapper, &mut *session, &mut ctx, ki,
                             ) {
-                                break 'event_loop state.exit_target.into();
+                                if out.quit {
+                                    break 'event_loop state.exit_target.into();
+                                }
+                                continue 'event_loop;
                             }
-                            continue 'event_loop;
                         }
                     }
                 }
@@ -3079,10 +3417,13 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         let close_leader = state.overlays.hotkey_dialog;
                         // A palette-resolved command closes the palette after it runs.
                         let close_palette = state.overlays.palette.is_some();
+                        // Same for the room context menu (SQ-1265): Enter or an
+                        // item's own hotkey activates and dismisses in one motion.
+                        let close_room_menu = state.overlays.room_menu.is_some();
                         let outcome = slash::parse_in_context(&s, state.config.command_prefix, ctx);
                         let should_break = dispatch_slash_outcome(
                             outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                            &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                            &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                             last_panes.map, last_panes.story, true,
                         );
                         if close_leader {
@@ -3090,6 +3431,9 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         }
                         if close_palette {
                             state.overlays.palette = None;
+                        }
+                        if close_room_menu {
+                            state.overlays.room_menu = None;
                         }
                         lifecycle::flush_pending_config_write(&mut state);
                         if should_break {
@@ -3135,6 +3479,19 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     None => unreachable!("guarded by the match arm"),
                 }
             }
+            // ── Inventory dock (SQ-1244) ──────────────────────────────────────
+            // Same precedence as the command band above: claims exactly its own
+            // rect, matched before the general mouse handling, so a click on the
+            // inventory panel can never also reach the story pane behind it.
+            Event::Mouse(m) if inventory_mouse_action(&state, &last_panes, m).is_some() => {
+                match inventory_mouse_action(&state, &last_panes, m) {
+                    Some(other) => {
+                        apply_action(other, &mut state, &mut mapper);
+                        continue 'event_loop;
+                    }
+                    None => unreachable!("guarded by the match arm"),
+                }
+            }
             Event::Mouse(m) => {
                 // Glk mouse input: a left-Down inside a mouse-watching Glulx window
                 // is delivered to the game as an Evtype_MouseInput, not a UI action.
@@ -3164,11 +3521,12 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                         m.column, m.row,
                                         (s.x, s.y, s.width, s.height),
                                         &windows,
+                                        &last_panes.win_rects,
                                     ) {
                                         let result = gs.deliver_hyperlink(win, link);
                                         if turn::apply_game_driven_result(
-                                            &mut state, &mut mapper, &result, &game_dir, last_panes.map, &*session, app::pager::Driver::PlayerInput,
-                                        ) {
+                                            &mut state, &mut mapper, &result, &game_dir, map_view(last_panes.map), &*session, app::pager::Driver::PlayerInput,
+                                        ).quit {
                                             break 'event_loop state.exit_target.into();
                                         }
                                         continue 'event_loop;
@@ -3188,14 +3546,15 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                 m.column, m.row,
                                 (s.x, s.y, s.width, s.height),
                                 &windows,
+                                &last_panes.win_rects,
                                 gs.char_pixels(),
                                 mouse_sub_px,
                             );
                             if let Some((win, vx, vy)) = target {
                                 let result = gs.deliver_mouse(win, vx, vy);
                                 if turn::apply_game_driven_result(
-                                    &mut state, &mut mapper, &result, &game_dir, last_panes.map, &*session, app::pager::Driver::PlayerInput,
-                                ) {
+                                    &mut state, &mut mapper, &result, &game_dir, map_view(last_panes.map), &*session, app::pager::Driver::PlayerInput,
+                                ).quit {
                                     break 'event_loop state.exit_target.into();
                                 }
                                 continue 'event_loop;
@@ -3223,11 +3582,12 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                     .map(|p| p.command_line(spec.name))
                                     .unwrap_or_else(|| spec.name.to_string());
                                 state.overlays.palette = None;
-                                let outcome =
-                                    slash::parse_in_context(&cmd, state.config.command_prefix, spec.context);
+                                let outcome = slash::parse_in_context(
+                                    &cmd, state.config.command_prefix, live_slash_context(&state),
+                                );
                                 let should_break = dispatch_slash_outcome(
                                     outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                                    &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                                    &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                                     last_panes.map, last_panes.story, true,
                                 );
                                 lifecycle::flush_pending_config_write(&mut state);
@@ -3257,17 +3617,55 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         _ => continue 'event_loop,
                     }
                 }
+                // Room context menu (SQ-1265): owns the mouse while open, the
+                // same shape the picker's per-story menu takes — a click on an
+                // item runs it, its own frame is a miss (not a dismissal), and
+                // anywhere else (map or elsewhere) dismisses it. Checked before
+                // the room dock below so the popup always wins a click that
+                // happens to land over it too.
+                if state.overlays.room_menu.is_some() {
+                    if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = m.kind {
+                        let pt = ratatui::layout::Position { x: m.column, y: m.row };
+                        match last_panes.room_menu_items.iter().find(|(_, r)| r.contains(pt)) {
+                            Some((i, _)) => {
+                                let cmd = app::room_menu::ROOM_MENU.get(*i).map(|it| it.command);
+                                state.overlays.room_menu = None;
+                                if let Some(cmd) = cmd {
+                                    let outcome = slash::parse_in_context(
+                                        cmd, state.config.command_prefix, Context::Map,
+                                    );
+                                    let should_break = dispatch_slash_outcome(
+                                        outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
+                                        &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
+                                        last_panes.map, last_panes.story, true,
+                                    );
+                                    lifecycle::flush_pending_config_write(&mut state);
+                                    if should_break {
+                                        break 'event_loop state.exit_target.into();
+                                    }
+                                }
+                            }
+                            // Its own border is not "outside": a click that lands
+                            // on the frame is a miss, not a dismissal.
+                            None if last_panes.room_menu_area.contains(pt) => {}
+                            None => state.overlays.room_menu = None,
+                        }
+                    }
+                    continue 'event_loop;
+                }
                 // Room dock (SQ-0692): the dock owns every mouse event inside its
                 // rect. A left-click on one of its two view tabs switches the body;
-                // anything else inside it is simply swallowed, because the dock is
-                // carved out of the map pane and a click there is neither a map
-                // click nor a story selection — and must never reach the v6 mouse
-                // delivery path below.
+                // a wheel notch scrolls the active body (SQ-1280); anything else
+                // inside it is simply swallowed, because the dock is carved out of
+                // the map pane and a click there is neither a map click nor a story
+                // selection — and must never reach the v6 mouse delivery path below.
                 if !state.any_modal_overlay_open() {
                     if let Some(action) = app::input::room_dock_mouse_action(
                         last_panes.room_dock,
                         &last_panes.room_dock_tabs,
+                        last_panes.room_dock_close,
                         &m,
+                        state.config.mouse_wheel_invert,
                     ) {
                         // (`needs_redraw` was already set for this event above.)
                         apply_action(action, &mut state, &mut mapper);
@@ -3300,7 +3698,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         );
                         let should_break = dispatch_slash_outcome(
                             outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                            &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                            &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                             last_panes.map, last_panes.story, true,
                         );
                         lifecycle::flush_pending_config_write(&mut state);
@@ -3341,79 +3739,85 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                 // plus terminator 254, so the game can read the coordinates and move.
                 // Restricting delivery to `read_char` meant compass clicks did
                 // nothing except while a menu happened to be up.
-                if matches!(m.kind, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left))
-                    && !state.any_overlay_open()
-                {
-                    let pending = zvm_session_opt(&*session).map(|z| z.pending_input());
-                    let line_term =
-                        zvm_session_opt(&*session).and_then(|z| z.mouse_click_terminator());
-                    let deliver = match pending {
-                        Some(app::session::InputKind::Char) => true,
-                        Some(app::session::InputKind::Line) => line_term.is_some(),
-                        _ => false,
-                    };
-                    // Only a click that maps INTO the drawn v6 image reaches the VM;
-                    // the letterbox margin and everything outside the pane fall
-                    // through to the app's own story-pane handling (selection).
-                    let hit = deliver
-                        .then(|| {
-                            state
-                                .graphics_render
-                                .borrow()
-                                .last_v6_map
-                                .as_ref()
-                                .and_then(|cm| cm.map_click(m.column, m.row))
-                        })
+                // SQ-1378: the click is RECORDED here and delivered on the release,
+                // never on the Down. `map_click` covers the story text as well as
+                // the artwork, so delivering at once meant every press in a Zork
+                // Zero / Shogun / Arthur pane ended the line read as a click and
+                // `Action::StartSelection` never ran — mouse text selection did
+                // nothing at all in those games. The event therefore falls THROUGH
+                // to the story pane's own handling below, exactly as a press in the
+                // letterbox margin always did, and the deferred click either dies
+                // on a drag or fires on the Up (the two arms below this one). Same
+                // shape as the map's own `BeginMapDrag` / `EndDragPan` (SQ-1325).
+                // A modal owns the mouse outright, and a click deferred before it
+                // opened is not the player's answer to it.
+                if state.any_overlay_open() {
+                    state.pending_v6_click = None;
+                } else {
+                    let is_left_button = matches!(
+                        m.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                            | crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                            | crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                    );
+                    let read = is_left_button
+                        .then(|| zvm_session_opt(&*session).map(|z| z.pending_input()))
                         .flatten();
-                    if let Some((gx, gy)) = hit {
-                        if pending == Some(app::session::InputKind::Char) {
-                            let z = zvm_session_opt_mut(&mut *session)
-                                .expect("z-machine char read is pending");
-                            z.set_mouse(gy, gx); // engine stores (y, x)
-                            let result = z.submit_char(254); // ZSCII single-click (§3.8)
-                            if turn::apply_game_driven_result(
-                                &mut state, &mut mapper, &result, &game_dir, last_panes.map, &*session, app::pager::Driver::PlayerInput,
-                            ) {
+                    let line_term = is_left_button
+                        .then(|| zvm_session_opt(&*session).and_then(|z| z.mouse_click_terminator()))
+                        .flatten();
+                    // Only a press that maps INTO the game's own screen is a click
+                    // at all; the letterbox margin and everything outside the pane
+                    // are the app's story-pane handling (selection) alone.
+                    let hit = matches!(
+                        m.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                    )
+                    .then(|| {
+                        state
+                            .graphics_render
+                            .borrow()
+                            .last_v6_map
+                            .as_ref()
+                            .and_then(|cm| cm.map_click(m.column, m.row))
+                    })
+                    .flatten();
+                    match app::input::v6_mouse_outcome(state.pending_v6_click, read, line_term, hit, &m) {
+                        app::input::V6MouseOutcome::Route => {}
+                        app::input::V6MouseOutcome::ForgetAndRoute => state.pending_v6_click = None,
+                        // No `continue`: the press is still a selection anchor.
+                        app::input::V6MouseOutcome::DeferAndRoute(click) => {
+                            state.pending_v6_click = Some(click)
+                        }
+                        app::input::V6MouseOutcome::Deliver(click) => {
+                            state.pending_v6_click = None;
+                            // The press anchored a zero-length selection; it is not
+                            // a copy, so it must reach neither the clipboard nor a
+                            // "Copied 0 chars" line.
+                            app::input::discard_selection(&mut state);
+                            // What the click DOES — ZSCII 254 for a char read, the
+                            // click as a line terminator (with the echoed compass
+                            // direction adopted as the command) for a line read — is
+                            // the library's rule, shared with every host (SQ-1568).
+                            // `v6_mouse_outcome` only answers `Deliver` when the
+                            // pending read still takes the click, so the `None` arm
+                            // is a click with nothing left to answer it.
+                            let mut ctx = app::host::TurnCtx {
+                                game_dir: &game_dir,
+                                ifid: &ifid,
+                                arc_file: &arc_file,
+                                map_view: map_view(last_panes.map),
+                                bg_tidy_counter: &mut bg_tidy_counter,
+                            };
+                            if app::host::input::deliver_v6_click(
+                                &mut state, &mut mapper, &mut *session, &mut ctx, click.game_px,
+                            )
+                            .is_some_and(|out| out.quit)
+                            {
                                 break 'event_loop state.exit_target.into();
                             }
                             continue 'event_loop;
                         }
-                        // Line read: a real player turn, so it goes through the same
-                        // path as a typed command — history, turn count, mapping,
-                        // autosave — carrying whatever was already typed (usually
-                        // nothing) and the click as the terminator.
-                        let term = line_term.expect("gated by `deliver` above");
-                        let cmd = state.take_input();
-                        if !cmd.is_empty() {
-                            state.record_command(&cmd);
-                        }
-                        state.turns += 1;
-                        state.unsaved_progress = true;
-                        let result = {
-                            let z = zvm_session_opt_mut(&mut *session)
-                                .expect("z-machine line read is pending");
-                            z.set_mouse(gy, gx); // engine stores (y, x)
-                            z.submit_line_with_terminator(&cmd, term)
-                        };
-                        // SQ-0576: a compass click types nothing, but the game
-                        // echoes the command it synthesized ("north") at the head
-                        // of its output — adopt it so the turn maps (directional
-                        // edge, tried-exit) exactly like the typed command it
-                        // stands for.
-                        let cmd = if cmd.is_empty() {
-                            app::session::echoed_direction_command(&result.transcript)
-                                .unwrap_or_default()
-                                .to_string()
-                        } else {
-                            cmd
-                        };
-                        if turn::finish_command_turn(
-                            &cmd, true, result, &mut state, &mut mapper, &mut *session,
-                            &game_dir, &ifid, &arc_file, last_panes.map, &mut bg_tidy_counter,
-                        ) {
-                            break 'event_loop state.exit_target.into();
-                        }
-                        continue 'event_loop;
                     }
                 }
                 mouse_to_action(&state, m, last_panes.map, last_panes.story, &last_panes.room_rects, &last_panes.dialog)
@@ -3430,28 +3834,21 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             continue;
         }
 
-        // Snapshot working config before apply_action clears it on ConfigSave.
-        let config_to_save = if matches!(action, Action::ConfigSave) {
-            state.overlays.config_screen.as_ref().map(|cs| cs.working.clone())
-        } else {
-            None
-        };
-        // Mouse capture is established once at startup; note its pre-save value so a
-        // settings-screen change can be applied to the live terminal below.
-        let mouse_before_save = state.config.mouse;
-        // Likewise note command_bar so a settings-screen toggle re-applies the
-        // session's prompt-stripping live (else render mode and strip_prompt desync
-        // until the next @restart).
-        let command_bar_before_save = state.config.command_bar;
+        // A settings-screen Save's `AppState` half (SQ-1559): `host::settings::
+        // apply`'s report, finished by `host::settings::commit` below — after
+        // the same run-loop drains every other action gets.
+        let mut settings_applied: Option<app::host::settings::Applied> = None;
 
         match action {
             // ── Caller-handled actions ─────────────────────────────────────────
 
             Action::Quit => {
-                // A key-driven quit resolves the loop to Exit (never the library).
+                // Ctrl-Q/Ctrl-C (the only route to this action — `input.rs`'s
+                // hardwired step 1) resolves like every other way the run can end:
+                // back to the library when one exists, Exit otherwise (SQ-1258).
                 // Set it explicitly so a superseded `/quit-to-library` can't leave
-                // the target pointing at the library. (SQ-0435)
-                state.exit_target = app::state::ExitTarget::Exit;
+                // a stale target behind.
+                state.exit_target = app::state::ExitTarget::for_launch(state.launched_from_library);
                 if should_prompt_save_on_quit(&state) {
                     state.overlays.quit_dialog = true;
                     state.overlays.dialog_focus = 0;
@@ -3463,23 +3860,16 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             // Story-pane selection released: copy the text extracted by render from
             // the full wrapped transcript (off-screen rows included) via OSC 52.
             Action::EndSelection => {
-                state.selection = None;
-                state.selection_edge = 0;
-                let copied = state.selection_text.borrow_mut().take();
-                if let Some(text) = copied {
-                    if !text.trim().is_empty() {
-                        use std::io::Write;
-                        let seq = app::clipboard::osc52_copy_sequence(&text);
-                        let mut out = std::io::stdout();
-                        let _ = out.write_all(seq.as_bytes());
-                        let _ = out.flush();
-                        // Report the copy as a meta line in the story output rather
-                        // than a status-bar message (which has no natural dismissal).
-                        state.push_transcript_internal(
-                            &format!("Copied {} chars to clipboard", text.chars().count()),
-                            app::state::TranscriptKind::Meta,
-                        );
-                    }
+                // Clearing the selection and reporting the copy in the transcript
+                // live in `input::finish_selection` (SQ-1378), so the release half
+                // of a press-drag-release is reachable from a test; writing to the
+                // terminal stays here, where the terminal is.
+                if let Some(text) = app::input::finish_selection(&mut state) {
+                    use std::io::Write;
+                    let seq = app::clipboard::osc52_copy_sequence(&text);
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(seq.as_bytes());
+                    let _ = out.flush();
                 }
                 continue;
             }
@@ -3540,7 +3930,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         let outcome = slash::parse(body, state.config.command_prefix);
                         let should_break = dispatch_slash_outcome(
                             outcome, &mut state, &mut mapper, &mut *session, &mut style_watcher,
-                            &game_dir, &ifid, &arc_file, &story_bytes, &story_path,
+                            &game_dir, &ifid, &arc_file, &quick_save_file, &story_bytes, &story_path,
                             last_panes.map, last_panes.story, false,
                         );
                         lifecycle::flush_pending_config_write(&mut state);
@@ -3551,17 +3941,17 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     }
                 }
 
-                // Increment the session turn counter. Progress now exists that
-                // isn't captured in a Save State (drives the quit prompt).
-                state.turns += 1;
-                state.unsaved_progress = true;
+                // Turn count and unsaved-progress bookkeeping now live in
+                // `finish_command_turn` itself (SQ-1545) — the `record_command`
+                // above still has to run here too, since a slash command never
+                // reaches that function at all.
 
                 app::trace::hostio(&state.config.user_dir, state.config.trace.hostio, format!("input_line({cmd:?})"));
                 let result = session.submit(&cmd);
                 if turn::finish_command_turn(
                     &cmd, true, result, &mut state, &mut mapper, &mut *session,
-                    &game_dir, &ifid, &arc_file, last_panes.map, &mut bg_tidy_counter,
-                ) {
+                    &game_dir, &ifid, &arc_file, map_view(last_panes.map), &mut bg_tidy_counter,
+                ).quit {
                     break 'event_loop state.exit_target.into();
                 }
             }
@@ -3569,7 +3959,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             Action::SaveGame => {
                 // Dead post-unification: keys now route through SlashOutcome::Save. Retained as a no-cost match arm.
                 // Bundle map + game into a single .lanthorn archive, with turn metadata.
-                let (location, score) = crate::engine_helpers::save_summary(&*session, &state);
+                let (location, score) = app::engine_helpers::save_summary(&*session, &state);
                 let meta = app::archive::Meta {
                     format_version: app::archive::CURRENT_FORMAT_VERSION,
                     ifid: Some(ifid.clone()),
@@ -3588,11 +3978,12 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                     location,
                     score,
                     trigger: app::archive::SaveTrigger::HostState,
+                    source: state.source.clone(),
                 };
                 // v6 graphics canvases ride along (Lane P): empty for non-v6
                 // sessions, so the archive layout is unchanged for them.
                 let (v6_pics, v6_display, v6_ground, v6_diags) =
-                    crate::engine_helpers::v6_save_payload(&mut *session);
+                    app::engine_helpers::v6_save_payload(&mut *session);
                 for d in &v6_diags { state.note_v6_save(d); }
                 match app::archive::save_archive_meta_pics(&arc_file, &mapper, &session.save_state(), zvm_session_opt(&*session).map(|z| &z.machine.screen), session.aux_data(), meta, &app::archive::SessionRecord::of(&state), &v6_pics, v6_display.as_ref(), v6_ground.as_deref()) {
                     Ok(()) => {
@@ -3619,9 +4010,9 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                     if let Some(z) = zvm_session_opt_mut(&mut *session) { app::session::restore_screen(z, scr); }
                                 }
                                 // v6 graphics canvases (Lane P): no-op for non-v6 archives.
-                                crate::engine_helpers::apply_v6_pictures(&mut *session, &ac);
+                                app::engine_helpers::apply_v6_pictures(&mut *session, &ac);
                                 // Hand Glulx back the room it was saved in (SQ-0523); no-op for zvm.
-                                engine_helpers::seed_resumed_location(&mut *session, &ac.meta);
+                                app::engine_helpers::seed_resumed_location(&mut *session, &ac.meta);
                                 if state.config.aux_storage != app::config::AuxStorage::Global {
                                     session.set_aux_data(ac.aux.clone());
                                 }
@@ -3644,7 +4035,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                                 // a restore take back a word printed after the save.
                                 app::input::refresh_seen_words(&mut state, &*session);
                                 // After restore, re-observe current location.
-                                reobserve_location(&mut state, &mut mapper, &*session, last_panes.map);
+                                reobserve_location(&mut state, &mut mapper, &*session, map_view(last_panes.map));
                                 state.push_notice(&format!(
                                     "[Game restored from {}]",
                                     arc_file.display()
@@ -3663,8 +4054,8 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
 
             // SQ-0297: shared with the slash-command path via handle_map_export
             // (dispatch_slash_outcome never reaches this match).
-            a @ (Action::ExportSvg(_) | Action::ExportDot(_) | Action::ExportMap(_)) => {
-                handle_map_export(&a, &game_dir, &mapper, &mut state);
+            a @ (Action::ExportSvg(_) | Action::ExportDot(_) | Action::ExportMap(_) | Action::ExportJson(_)) => {
+                handle_map_export(&a, &game_dir, &mapper, &mut state, &*session, &story_bytes, &story_path);
             }
 
             // ── Saves-manager actions ─────────────────────────────────────────
@@ -3723,7 +4114,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                         match restore_game(&path, &mut zvm_session_mut(&mut *session).machine) {
                             Ok(()) => {
                                 // Re-observe current location (same as RestoreGame/SavesLoad).
-                                reobserve_location(&mut state, &mut mapper, &*session, last_panes.map);
+                                reobserve_location(&mut state, &mut mapper, &*session, map_view(last_panes.map));
                                 state.push_notice(&format!("[Imported: {}]", path.display()));
                             }
                             Err(e) => {
@@ -3741,166 +4132,32 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                 let load_info = state.overlays.saves.as_ref().and_then(|s| {
                     s.entries.get(s.scroll.selected).map(|e| (e.path.clone(), e.name.clone(), e.trigger))
                 });
-
-                // In-game restore of a GAME save — a bare .qzl from another
-                // interpreter, or a .lanthorn that lanthorn's own @save wrote
-                // (SQ-0531): feed the descriptor-PC bytes back into the
-                // suspended VM, completing the @restore. When they came out of
-                // an archive, its map/transcript/screen ride along too. A host
-                // Save State picked here instead falls through below to a full
-                // session resume (SQ-0227 Task 3).
-                if state.ingame_io == Some(app::session::PendingIo::Restore)
-                    && load_info.as_ref().is_some_and(|(_, _, t)| t.is_portable())
-                {
-                    let Some((path, entry_name, _)) = load_info else { continue };
-                    state.overlays.saves = None;
-                    state.ingame_io = None;
-                    let result = match app::archive::read_quetzal_from_file(&path) {
-                        Ok(bytes) => {
-                            // Reinstate the archive's session state BEFORE resuming,
-                            // so the game's own post-restore output lands at the end
-                            // of the restored scrollback instead of being wiped by it.
-                            if !app::persist_files::is_game_save(&path) {
-                                match app::archive::load_archive(&path) {
-                                    Ok(ac) => apply_archive_state(ac, &mut *session, &mut mapper, &mut state),
-                                    Err(e) => state.push_notice(&format!("[Save State sidecars unreadable: {}]", e)),
-                                }
-                            } else {
-                                // A bare .qzl carries no screen, so the restored
-                                // game's layout width has to be assumed
-                                // (`note_bare_quetzal_width`, SQ-0681). Raised on
-                                // the attempt: `resume_restore` reports a refused
-                                // save only as the game's own "Failed.", and the
-                                // guard only ever widens the declared screen.
-                                engine_helpers::note_bare_quetzal_width(&mut *session);
-                            }
-                            state.push_notice(&format!("[Game restored from {}]", entry_name));
-                            session.resume_restore(Some(&bytes))
-                        }
-                        Err(e) => {
-                            state.push_notice(&format!("[Restore failed: {}]", e));
-                            session.resume_restore(None)
-                        }
-                    };
-                    let quit = turn::finish_resumed_turn(result, &mut mapper, &mut state, &mut *session, &game_dir, &ifid, last_panes.map);
-                    turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                    turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
-                    if let Some(io) = state.ingame_io {
-                        open_ingame_saves(io, &game_dir, &mut state);
-                    }
-                    if quit { break 'event_loop state.exit_target.into(); }
-                    continue;
-                }
-
-                // Host Load (also reached for a .lanthorn picked while an
-                // in-game @restore is pending: that fully resumes, abandoning
-                // the pending call; on failure the pending @restore is still
-                // answered with resume_restore(None) so the VM isn't left
-                // blocked waiting for a result).
-                let ingame_restore_pending = state.ingame_io == Some(app::session::PendingIo::Restore);
-                if let Some((path, entry_name, _)) = load_info {
-                    match restore_from_file(&path, &mut *session) {
-                        Ok(RestoreOutcome::DescriptorCompleted(ac)) => {
-                            state.overlays.saves = None;
-                            // An in-game @save archive carries the whole session
-                            // alongside its game bytes (SQ-0531); a bare .qzl has
-                            // nothing but the bytes.
-                            if let Some(ac) = ac {
-                                state.ingame_io = None;
-                                state.pending_filename = None;
-                                apply_archive_state(*ac, &mut *session, &mut mapper, &mut state);
-                            }
-                            reobserve_location(&mut state, &mut mapper, &*session, last_panes.map);
-                            state.push_notice(&format!("[Game restored from {}]", entry_name));
-                        }
-                        Ok(RestoreOutcome::Resumed(ac)) => {
-                            state.ingame_io = None;
-                            // A restore abandons any suspended create_by_prompt in the
-                            // session, so the host-side request must not outlive it and
-                            // fire a spurious resume_filename turn.
-                            state.pending_filename = None;
-                            apply_archive_state(*ac, &mut *session, &mut mapper, &mut state);
-                            // Re-observe current location.
-                            reobserve_location(&mut state, &mut mapper, &*session, last_panes.map);
-                            state.push_notice(&format!("[Loaded save: {}]", entry_name));
-                            state.overlays.saves = None;
-                        }
-                        Err(e) => {
-                            state.push_notice(&format!("[Load failed: {}]", e));
-                            if ingame_restore_pending {
-                                state.overlays.saves = None;
-                                state.ingame_io = None;
-                                let result = session.resume_restore(None);
-                                let quit = turn::finish_resumed_turn(result, &mut mapper, &mut state, &mut *session, &game_dir, &ifid, last_panes.map);
-                                turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-                                turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
-                                if let Some(io) = state.ingame_io {
-                                    open_ingame_saves(io, &game_dir, &mut state);
-                                }
-                                if quit { break 'event_loop state.exit_target.into(); }
-                                continue;
-                            }
-                        }
-                    }
+                // Which kind of load this is — an in-game @restore answered with a
+                // game save, or a host load that resumes the whole session — is the
+                // library's rule (`host::persist::load_save`, SQ-1539).
+                if let Some((path, entry_name, trigger)) = load_info {
+                    let loaded = app::host::persist::load_save(
+                        &mut *session, &mut mapper, &mut state,
+                        (&path, &entry_name, trigger),
+                        &game_dir, &ifid, map_view(last_panes.map),
+                    );
+                    if loaded.quit { break 'event_loop state.exit_target.into(); }
+                    if loaded.answered_game { continue; }
                 }
             }
 
             // ── Replay/rewind: linear resume from the selected turn ────────────
             Action::ReplayResume => {
+                // What resuming from a picked turn does is the library's rule
+                // (`host::persist::resume_from_turn`, SQ-1619) — shared with every
+                // other host instead of hand-rolled here.
                 if let Some(r) = state.overlays.replay.take() {
-                    if r.idx < state.history.len() {
-                        let plan = app::history::resume_plan(&state.history, r.idx);
-                        // History snapshots come from the running engine; wrap them
-                        // with its tag so restore_state accepts them (both engines).
-                        let es = app::engine::EngineSave::new(engine_tag(&*session), 1, plan.save.clone());
-                        match session.restore_state(&es) {
-                            Ok(()) => {
-                                if let Some(json) = &plan.map_json {
-                                    if let Ok(m) = mapper::persist::from_json(json) {
-                                        mapper = m;
-                                    }
-                                }
-                                // Linear: discard later turns.
-                                state.history.truncate(r.idx + 1);
-                                let (lines, kinds) =
-                                    app::history::rebuild_transcript(&state.history, r.idx);
-                                state.transcript = lines;
-                                state.clear_anchor = None;
-                                state.transcript_kinds = kinds;
-                                // History replay carries no style runs; keep the
-                                // parallel vecs length-synced (unstyled, left rows).
-                                state.transcript_runs = vec![Vec::new(); state.transcript.len()];
-                                state.transcript_para = vec![app::state::ParaFmt::default(); state.transcript.len()];
-                                state.reset_transcript_sidecars();
-                                // Rebuilt from the replayed transcript (SQ-1135): a
-                                // rewind to turn 4 offers the words turn 4 had printed.
-                                app::input::refresh_seen_words(&mut state, &*session);
-                                state.turns = plan.turn;
-                                state.unsaved_progress = false; // resumed a past (saved) turn
-                                state.graph_gen = state.graph_gen.wrapping_add(1);
-                                // Resuming a past turn is a restore: the watch describes a death
-                                // in a timeline this one has replaced (SQ-0671, SQ-0673).
-                                state.death_watch = Default::default();
-                                // Re-observe current location (mirror the restore path).
-                                if let Some(snap) = session.current_location() {
-                                    let rid = snap.number as mapper::graph::RoomId;
-                                    let restore_result = TurnResult::observation(snap);
-                                    apply_turn(
-                                        &mut mapper,
-                                        "",
-                                        &restore_result,
-                                        &mut state.death_watch,
-                                    );
-                                    state.set_viewed_layer(None);
-                                    state.select_room(Some(rid));
-                                }
-                                state.push_notice(&format!("[Resumed from turn {}]", plan.turn));
-                            }
-                            Err(e) => {
-                                state.push_notice(&format!("[Resume failed: {}]", restore_error_msg(e)));
-                            }
-                        }
-                    }
+                    // Nothing left to react to: the event loop already forces a
+                    // redraw for every dispatched action, and a failed/out-of-range
+                    // resume already pushed its own notice.
+                    let _ = app::host::persist::resume_from_turn(
+                        &mut *session, &mut mapper, &mut state, r.idx, map_view(last_panes.map),
+                    );
                 }
             }
 
@@ -3916,6 +4173,18 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
             // the last-rendered transcript viewport height and max scroll.
             Action::TranscriptScrollPage(dir) => {
                 let target = app::input::page_scroll(
+                    state.transcript_scroll,
+                    dir,
+                    last_panes.transcript_viewport_rows,
+                    last_panes.transcript_max_scroll,
+                );
+                state.scroll_transcript_to(target);
+            }
+            // Half-page the transcript (Ctrl-D, vim convention; SQ-1228). Same
+            // shape as the full-page arm above, resolved here for the same
+            // reason: it needs the last-rendered viewport height and max scroll.
+            Action::TranscriptScrollHalfPage(dir) => {
+                let target = app::input::half_page_scroll(
                     state.transcript_scroll,
                     dir,
                     last_panes.transcript_viewport_rows,
@@ -3943,6 +4212,13 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
                 state.pager.active = false;
             }
 
+            // Same bookkeeping `apply_action`'s arm runs, but keeping the report
+            // so the terminal-only follow-up (mouse capture) and `commit` below
+            // know what changed.
+            Action::ConfigSave => {
+                settings_applied = app::input::config_save(&mut state);
+            }
+
             // ── apply_action handles everything else ───────────────────────────
             other => {
                 apply_action(other, &mut state, &mut mapper);
@@ -3965,10 +4241,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
 
         // After dispatch: resume an in-game (v4+) save/restore whose dialog was
         // just confirmed (flag-hop) or cancelled (overlay closed without confirm).
-        let quit = resolve_ingame_dialog(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map)
-            || resolve_filename_request(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, last_panes.map);
-        turn::persist_aux_after_turn(&mut *session, &mut state, &game_dir);
-        turn::persist_vfs_after_turn(&mut *session, &state, &game_dir);
+        let quit = ingame_io::resolve_pending(&mut *session, &mut mapper, &mut state, &game_dir, &ifid, map_view(last_panes.map));
         if quit {
             break 'event_loop state.exit_target.into();
         }
@@ -3980,39 +4253,27 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         lifecycle::flush_pending_config_write(&mut state);
 
         // After apply_action: if config screen was just saved, persist config.toml
-        // (created if missing). The settings screen edits no colours/symbols, and the
-        // live look was already re-resolved FROM style.toml in apply_action, so we do
-        // NOT touch style.toml here — writing it would clobber the seeded template.
-        if let Some(cfg_to_write) = config_to_save {
+        // (created if missing), sync the engine and re-resolve the live look —
+        // `host::settings::commit`, which owns that order (SQ-1161, SQ-1559). The
+        // settings screen edits no colours/symbols, so style.toml is NOT written
+        // here — writing it would clobber the seeded template.
+        if let Some(applied) = settings_applied {
+            let committed = app::host::settings::commit(&mut state, &mut *session, &applied);
             // Hitting Save on the settings screen and getting nothing is the worst
             // place to swallow this — surface the reason (SQ-0580).
-            if let Err(e) = app::config::write_config_file(&state.config) {
+            if let Err(e) = &committed.config_write {
                 state.push_notice(&format!("[config not saved: {e}]"));
             }
             // Apply a mouse-capture change live so the setting takes effect without a
             // restart (matching how audio/colours apply live on save).
-            if cfg_to_write.mouse != mouse_before_save {
-                let _ = if cfg_to_write.mouse {
+            if let Some(on) = applied.mouse {
+                let _ = if on {
                     execute!(stdout(), EnableMouseCapture)
                 } else {
                     execute!(stdout(), DisableMouseCapture)
                 };
             }
-            // Re-apply prompt stripping live so toggling the command bar on/off in
-            // Settings takes effect on the next turn without a restart (inline mode
-            // keeps the game's `>`, command-bar mode strips it).
-            if cfg_to_write.command_bar != command_bar_before_save {
-                session.set_strip_prompt(cfg_to_write.command_bar);
-            }
-            // SQ-1161: and re-resolve the live look, AFTER the write above. This is
-            // the single funnel the style watcher and `/reload-style` go through, so
-            // it is what makes the `period_look` row (and the theme layers, and this
-            // story's own style.toml and garglk.ini overlays) land on Save instead of
-            // waiting for the next launch. It must run after `write_config_file`,
-            // because it recomputes `honor_game_colours` from this story's sidecar and
-            // re-pins the key — and a pinned key is skipped by the writer, so running
-            // it first would drop the honour row's own edit out of the file.
-            if let app::reload::ReloadOutcome::Failed { msg } = app::reload::reload_style(&mut state) {
+            if let app::reload::ReloadOutcome::Failed { msg } = committed.style {
                 state.push_notice(&format!("[style not reloaded: {msg}]"));
             }
         }
@@ -4033,7 +4294,16 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
         eprintln!("{w}");
     }
 
-    lifecycle::exit_auto_save(&mut *session, &mapper, &state, &ifid, &arc_file);
+    // A clean, GAME-driven exit (the story's own quit) leaves no resume point
+    // rather than an auto-save of the turn it quit on (SQ-1342); every other
+    // exit — `/quit`, Ctrl+Q, "Save State & quit", a signal, a VM fault — still
+    // auto-saves exactly as before. `state.game_ended` is set only where
+    // `should_exit_on_turn` answers true (see `turn.rs`).
+    if state.game_ended {
+        lifecycle::exit_clear_resume_save(&mut *session, &mapper, &state, &ifid, &arc_file);
+    } else {
+        lifecycle::exit_auto_save(&mut *session, &mapper, &state, &ifid, &arc_file);
+    }
 
     // `--debug` (SQ-0449): persist the cumulative executed-PC coverage to the
     // per-story sidecar so a later `--debug`/`/debug` run resumes the blue lines.
@@ -4055,90 +4325,7 @@ fn run_event_loop(boot: startup::BootResult, launched_from_library: bool) -> Run
 // accumulated map is wiped first (same effect as `/reset map`) so only the
 // start room remains after the re-seed.
 
-/// Resolve the Pict/graphics blorb for a story the same way at launch and
-/// restart — the Glulx and Scott arms of both, where the Z-machine arm builds a
-/// [`app::graphics::PictSource`] instead.
-///
-/// **Through `graphics::resource_blorb`, not `blorb::resolve_resource_blorb`**
-/// (SQ-1085), so the two arms resolve from the same tiers. The bare `blorb`
-/// call knows the filesystem: a self-blorb, a same-stem sidecar, a directory
-/// scan. It does not know about the ZIP a player downloaded the game in — so a
-/// zipped `.gblorb` ran with no pictures and no sounds at all, which is the
-/// worse half of the same defect, since Glulx is the engine whose games most
-/// often ARE one big resource-carrying Blorb.
-///
-/// Nothing else moves: the extra tier only fires when `story_path` is a zip,
-/// and the build-mismatch refusal `graphics::resource_blorb` adds is inert here
-/// — it needs a story mounted off a release disk image with an identifiable
-/// build, which no Glulx or Scott game is.
-fn resolve_pict_blorb(story_path: &std::path::Path, images: bool) -> Option<blorb::Blorb> {
-    if images {
-        app::graphics::resource_blorb(story_path).found.map(|(b, _)| b)
-    } else {
-        None
-    }
-}
-
 // ── Utilities ─────────────────────────────────────────────────────────────────
-
-/// Whether the game echoed the just-submitted command itself at the start of its
-/// turn output (e.g. CounterfeitMonkey prints the command back in bold). Compared
-/// case-insensitively against the leading non-whitespace text, and only when the
-/// echo ends at a boundary (so `go` doesn't match a response starting `gospel`),
-/// so we don't add a second, redundant echo. An empty command never matches.
-fn game_echoes_command(transcript: &str, cmd: &str) -> bool {
-    let cmd = cmd.trim();
-    if cmd.is_empty() {
-        return false;
-    }
-    let mut head = transcript.trim_start().chars();
-    for cc in cmd.chars() {
-        match head.next() {
-            Some(hc) if hc.eq_ignore_ascii_case(&cc) => {}
-            _ => return false,
-        }
-    }
-    // The command must be followed by a boundary, not more word characters.
-    match head.next() {
-        None => true,
-        Some(c) => !c.is_alphanumeric(),
-    }
-}
-
-/// The current story's saves for the saves manager: `.lanthorn` Save States and
-/// `.qzl` game saves in `game_dir` merged into one list, sorted newest-first by
-/// save time. RFC3339 timestamps sort chronologically as strings; untimestamped/
-/// legacy saves (empty timestamp) sort to the bottom.
-fn combined_saves(game_dir: &std::path::Path) -> Vec<app::persist_files::SaveInfo> {
-    let mut entries = list_saves(game_dir);
-    entries.extend(app::persist_files::list_qzl(game_dir));
-    entries.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
-    entries
-}
-
-/// Format a Unix timestamp (seconds since epoch) as an RFC3339 UTC string.
-fn format_rfc3339(secs: u64) -> String {
-    let sec = secs % 60;
-    let min = (secs / 60) % 60;
-    let hour = (secs / 3600) % 24;
-    let days = secs / 86400;
-    let (year, month, day) = days_to_ymd_main(days);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, hour, min, sec)
-}
-
-fn days_to_ymd_main(mut days: u64) -> (u64, u64, u64) {
-    days += 719468;
-    let era = days / 146097;
-    let doe = days % 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
 
 /// Return (width, height) of the map pane, defaulting to (80, 24) when zero.
 fn map_pane_dims(area: Rect) -> (u16, u16) {
@@ -4147,40 +4334,11 @@ fn map_pane_dims(area: Rect) -> (u16, u16) {
     (w, h)
 }
 
-/// Re-observe the VM's current location after a restore/resume: fold the room into the
-/// map, deselect the viewed layer, select the room, and recenter the map pane on it.
-/// Produces no transcript output. Shared by every host restore/resume arm.
-fn reobserve_location(
-    state: &mut AppState,
-    mapper: &mut Mapper,
-    session: &dyn Engine,
-    map_rect: Rect,
-) {
-    // Every caller is a restore/resume/import: the live state now equals a saved
-    // one, so there is no unsaved progress to warn about on quit.
-    state.unsaved_progress = false;
-    // The caller has just swapped in a restored/imported mapper (or is about to
-    // re-observe into it); invalidate the map render memo so the loaded map shows
-    // this frame instead of the pre-restore one. Unconditional so even the
-    // no-current-location early-return below still invalidates. (SQ-0305)
-    state.bump_graph_gen();
-    // The restored game is not the one the death watch was watching: a death outstanding in the
-    // live session says nothing about the saved one, and the re-observation below is itself a room
-    // change with no passage behind it. Cleared before the early return, so a restore into a game
-    // that reports no location does not carry the old one's death either. (SQ-0671, SQ-0673)
-    state.death_watch = Default::default();
-    let Some(snap) = session.current_location() else { return };
-    let rid = snap.number as mapper::graph::RoomId;
-    let restore_result = TurnResult::observation(snap);
-    apply_turn(mapper, "", &restore_result, &mut state.death_watch);
-    state.set_viewed_layer(None);
-    state.select_room(Some(rid));
-    if let Some(room) = mapper.graph.room(rid) {
-        if let Some(pos) = room.pos {
-            let (pw, ph) = map_pane_dims(map_rect);
-            state.recenter_on(pos, pw, ph);
-        }
-    }
+/// The TUI's map pane as the library's per-turn `map_view` (SQ-1538): always a
+/// view, sized by [`map_pane_dims`], so a turn recenters exactly as it did when
+/// it took the `Rect` itself.
+fn map_view(area: Rect) -> Option<(u16, u16)> {
+    Some(map_pane_dims(area))
 }
 
 /// Build a `DialogStyle` from the current app colors.
@@ -4212,37 +4370,18 @@ fn is_slash(input: &str, prefix: char) -> bool {
 
 // ── Hints open helper ─────────────────────────────────────────────────────────
 
-/// The opening transcript for a freshly-booted hint companion, with the
-/// InvisiClues narrow-screen warning auto-skipped.
+/// Open the hints panel for the current story.
 ///
-/// The izm hint files open on a "your screen is only N characters wide…" banner
-/// and wait for a keypress before showing the topic menu (the menu lives in the
-/// upper window). When the boot output is that banner, press one key here so the
-/// player lands straight on the menu; the keypress erases the banner. If the
-/// output isn't the banner (or the file isn't waiting for a key), fall back to
-/// the raw opening — no harm, the banner just shows as before.
+/// If a panel is already open this is a no-op. Resolution, VM boot and the
+/// InvisiClues narrow-screen banner skip all live in
+/// [`app::host::hints::open`] now (SQ-1586) — this is the TUI's own caller,
+/// turning that `Result` into the status-message behaviour the TUI has always
+/// had: `Ok(None)` (nothing resolves automatically) shows
+/// [`app::host::hints::NO_HINT_MESSAGE`]; `Err` shows the failure's own text.
 ///
-/// Gated on `skip_warning` (the `hint_skip_screen_warning` config, default on);
-/// when off, the banner is left in place for the player to dismiss.
-fn hint_opening(vm: &mut app::session::GameSession, skip_warning: bool) -> String {
-    let opening = vm.take_transcript();
-    if skip_warning
-        && hints::is_narrow_screen_warning(&opening)
-        && matches!(vm.pending_input(), app::session::InputKind::Char)
-    {
-        return vm.submit_char(b' ').transcript;
-    }
-    opening
-}
-
-/// Open the hints panel for the current story, resolving the hint source.
-///
-/// If a panel is already open this is a no-op.  Discovery order:
-/// 1. Remembered per-IFID association.
-/// 2. Sibling hint file.
-/// 3. Inside a sibling ZIP.
-/// 4. AskUser: status message + TODO for file-browser wiring.
-/// 5. None: status "no hints found".
+/// TODO: wire the file browser to pick a hint file (.z3/.z5/.z8) for the
+/// `Ok(None)` case, then call `save_hint_assoc(user_dir, ifid, &picked)` and
+/// retry.
 fn open_hints(
     state: &mut AppState,
     story_path: &std::path::Path,
@@ -4253,94 +4392,16 @@ fn open_hints(
         return;
     }
 
-    // Built-in HINT detection: check story dictionary for "hint"/"hints".
-    // state.dict_words is populated at startup from the story's Z-machine dictionary.
-    let builtin_hint = hints::story_supports_hint(state.dict_words.iter().cloned());
-
     let index = hints::load_hint_index(user_dir);
-    let resolution = hints::resolve_hint_source(story_path, ifid, &index);
-
-    match resolution {
-        hints::HintResolution::File(p) => {
-            match hints::load_story_bytes(&p) {
-                Ok(bytes) => {
-                    match app::session::GameSession::new(bytes, state.config.honor_game_colours, false, state.config.interpreter_number) {
-                        Ok(mut vm) => {
-                            vm.machine.undo_cap = state.config.undo_levels;
-                            let opening = hint_opening(&mut vm, state.config.hint_skip_screen_warning);
-                            let transcript: Vec<String> =
-                                opening.split('\n').map(|l| l.to_owned()).collect();
-                            let label = p
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("Hints")
-                                .to_owned();
-                            state.overlays.hints = Some(app::state::HintSession {
-                                source: app::state::HintSource::Zcode(vm),
-                                transcript,
-                                scroll: 0,
-                                clear_anchor: None,
-                                scroll_anim: None,
-                                input: String::new(),
-                                label,
-                                builtin_hint,
-                            });
-                        }
-                        Err(e) => {
-                            state.set_status(format!("hints: failed to load hint VM: {:?}", e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    state.set_status(format!("hints: cannot read hint file: {}", e));
-                }
-            }
+    match app::host::hints::open(story_path, ifid, &index, &state.dict_words, &state.config) {
+        Ok(Some(session)) => {
+            state.overlays.hints = Some(session);
         }
-        hints::HintResolution::ZipEntry { zip_path, entry } => {
-            let pred = |name: &str| name == entry;
-            match hints::read_zip_entry(&zip_path, pred) {
-                Ok(Some(bytes)) => {
-                    match app::session::GameSession::new(bytes, state.config.honor_game_colours, false, state.config.interpreter_number) {
-                        Ok(mut vm) => {
-                            vm.machine.undo_cap = state.config.undo_levels;
-                            let opening = hint_opening(&mut vm, state.config.hint_skip_screen_warning);
-                            let transcript: Vec<String> =
-                                opening.split('\n').map(|l| l.to_owned()).collect();
-                            let label = entry.rsplit('/').next().unwrap_or(&entry).to_owned();
-                            state.overlays.hints = Some(app::state::HintSession {
-                                source: app::state::HintSource::Zcode(vm),
-                                transcript,
-                                scroll: 0,
-                                clear_anchor: None,
-                                scroll_anim: None,
-                                input: String::new(),
-                                label,
-                                builtin_hint,
-                            });
-                        }
-                        Err(e) => {
-                            state.set_status(format!("hints: failed to load hint VM: {:?}", e));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    state.set_status("hints: hint entry not found in zip");
-                }
-                Err(e) => {
-                    state.set_status(format!("hints: cannot read zip entry: {}", e));
-                }
-            }
+        Ok(None) => {
+            state.set_status(app::host::hints::NO_HINT_MESSAGE);
         }
-        hints::HintResolution::AskUser => {
-            // TODO: wire the file browser to pick a hint file (.z3/.z5/.z8), then call
-            // save_hint_assoc(user_dir, ifid, &picked) and restart as File path above.
-            // For now, surface a status message so the user knows what to do.
-            state.set_status(
-                "no hint file found — place <story>.hints.z5 next to the story, or use /hints <path>",
-            );
-        }
-        hints::HintResolution::None => {
-            state.set_status("no hints found");
+        Err(e) => {
+            state.set_status(e.to_string());
         }
     }
 }
@@ -4378,16 +4439,103 @@ fn scroll_for_match(match_visible_pos: usize, total_visible: usize, pane_rows: u
         .saturating_sub(pane_rows) as u16
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecallKeyAction {
+    Close, Next, Previous, Up, Down, PageUp, PageDown, Home, End, Ignore,
+}
+
+fn recall_key_action(code: crossterm::event::KeyCode, next: char, previous: char) -> RecallKeyAction {
+    use crossterm::event::KeyCode;
+    match code {
+        KeyCode::Esc => RecallKeyAction::Close,
+        KeyCode::Char(c) if c == next => RecallKeyAction::Next,
+        KeyCode::Char(c) if c == previous => RecallKeyAction::Previous,
+        KeyCode::Up => RecallKeyAction::Up,
+        KeyCode::Down => RecallKeyAction::Down,
+        KeyCode::PageUp => RecallKeyAction::PageUp,
+        KeyCode::PageDown => RecallKeyAction::PageDown,
+        KeyCode::Home => RecallKeyAction::Home,
+        KeyCode::End => RecallKeyAction::End,
+        _ => RecallKeyAction::Ignore,
+    }
+}
+
+fn recall_preview_scroll(action: RecallKeyAction, current: usize, max: usize, page: usize) -> usize {
+    let current = current.min(max);
+    match action {
+        RecallKeyAction::Up => current.saturating_sub(1),
+        RecallKeyAction::Down => current.saturating_add(1).min(max),
+        RecallKeyAction::PageUp => current.saturating_sub(page.max(1)),
+        RecallKeyAction::PageDown => current.saturating_add(page.max(1)).min(max),
+        RecallKeyAction::Home => 0,
+        RecallKeyAction::End => max,
+        _ => current.min(max),
+    }
+}
+
+fn recall_preview_scroll_delta(current: usize, max: usize, delta: isize) -> usize {
+    let current = current.min(max);
+    if delta < 0 { current.saturating_sub(delta.unsigned_abs() as usize) }
+    else { current.saturating_add(delta as usize).min(max) }
+}
+
+fn recall_panel_area(state: &app::state::AppState, fallback: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let painted = state.recall_panel_area.get();
+    if painted.width == 0 || painted.height == 0 { fallback } else { painted }
+}
+
+/// Place a ranked recall hit using the rows the renderer actually wrapped.
+/// A passage may occupy several terminal rows, so logical-line arithmetic can
+/// leave it outside the viewport even when its line number looked correct.
+fn scroll_for_recall_match(state: &app::state::AppState, panes: &PaneRects, visible_pos: usize) -> u16 {
+    let viewport = panes.transcript_viewport_rows as usize;
+    state.recall_scroll_for_match(visible_pos, viewport)
+        .unwrap_or_else(|| scroll_for_match(visible_pos, state.visible_transcript_indices().len(), viewport.max(1)))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-misc"))]
 mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
+    use crossterm::event::Event;
 
-    use super::{dim_area, is_slash, scroll_for_match, should_prompt_save_on_quit};
+    use super::{
+        dim_area, is_slash, map_update_hover, matrix_update_hover, scroll_for_match,
+        should_prompt_save_on_quit, PaneRects, RoomId, RunOutcome,
+    };
     use app::render::paneframe::{draw_pane_frame, draw_top_inset, InsetCaps, InsetSegment, PaneGlyphs};
+    use app::state::{AppState, ExitTarget};
+
+    // ── SQ-1258: a picker-launched run always resolves back to the library ─────
+
+    /// The outer loop's whole exit-resolution rule is `ExitTarget::for_launch`
+    /// plus this `From` — nothing else decides it (`run_event_loop` seeds
+    /// `exit_target` from it at boot; `Action::Quit`, `SlashOutcome::Quit`, and
+    /// `OverlayAct::QuitCancel` all resolve or restore through the same call). A
+    /// game's own clean quit never touches `exit_target` at all, so it inherits
+    /// whatever the boot default was — meaning "launched from the picker + the
+    /// GAME quit" and "launched from the picker + the player's own `quit`
+    /// command / Ctrl-Q" reach the identical answer this pins.
+    #[test]
+    fn library_launch_always_resolves_to_the_library() {
+        assert_eq!(
+            RunOutcome::from(ExitTarget::for_launch(true)),
+            RunOutcome::ToLibrary,
+            "a picker launch returns to the list on ANY way the run ends"
+        );
+    }
+
+    #[test]
+    fn command_line_launch_always_resolves_to_exit() {
+        assert_eq!(
+            RunOutcome::from(ExitTarget::for_launch(false)),
+            RunOutcome::Exit,
+            "no picker exists to return to — every ending leaves lanthorn"
+        );
+    }
 
     // ── SQ-0649: the panic hook must not tear down a live session ──────────────
 
@@ -4416,6 +4564,169 @@ mod tests {
         assert!(super::panic_is_fatal(worker_id, None));
     }
 
+    // ── SQ-1246: matrix-view room hover ─────────────────────────────────────────
+
+    fn moved_at(col: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    fn matrix_panes(room: RoomId, rect: Rect) -> PaneRects {
+        PaneRects {
+            room_rects: vec![(room, rect)],
+            map_view: mapper::layer::MapView::Matrix,
+            ..Default::default()
+        }
+    }
+
+    /// The headline case: pointer motion over a published rect in the matrix view resolves the
+    /// room it names; motion elsewhere clears it.
+    #[test]
+    fn matrix_hover_resolves_over_a_published_rect_and_clears_off_it() {
+        let rect = Rect::new(0, 2, app::render::matrix::LABEL_W, 1);
+        let panes = matrix_panes(3, rect);
+        let mut st = AppState::default();
+
+        matrix_update_hover(&mut st, &panes, &moved_at(2, 2));
+        assert_eq!(st.matrix_hover, Some((3, rect)), "the pointer sits inside the rect");
+
+        matrix_update_hover(&mut st, &panes, &moved_at(50, 2));
+        assert_eq!(st.matrix_hover, None, "moved off the rect: cleared");
+    }
+
+    /// A rect this frame's room_rects never published (an empty cell, `·`/`×`) resolves to no
+    /// hover no matter where the pointer lands.
+    #[test]
+    fn matrix_hover_is_none_over_a_point_with_no_published_rect() {
+        let rect = Rect::new(0, 2, app::render::matrix::LABEL_W, 1);
+        let panes = matrix_panes(3, rect);
+        let mut st = AppState::default();
+        matrix_update_hover(&mut st, &panes, &moved_at(80, 20));
+        assert_eq!(st.matrix_hover, None, "no rect at that point: no tooltip");
+    }
+
+    /// The drawn (non-matrix) map view publishes `room_rects` too — its room boxes — and those
+    /// must never populate `matrix_hover`; that view's hover behaviour is out of scope for this
+    /// feature and untouched.
+    #[test]
+    fn matrix_hover_stays_none_in_the_drawn_map_view() {
+        let rect = Rect::new(0, 2, app::render::matrix::LABEL_W, 1);
+        let mut panes = matrix_panes(3, rect);
+        panes.map_view = mapper::layer::MapView::Drawn;
+        let mut st = AppState::default();
+        matrix_update_hover(&mut st, &panes, &moved_at(2, 2));
+        assert_eq!(st.matrix_hover, None, "the drawn view's room boxes are not a matrix hover");
+    }
+
+    /// A modal dialog owns the pointer; hover resolution must not populate `matrix_hover`
+    /// underneath it, even over an otherwise-valid rect.
+    #[test]
+    fn matrix_hover_is_suppressed_while_a_modal_overlay_is_open() {
+        let rect = Rect::new(0, 2, app::render::matrix::LABEL_W, 1);
+        let panes = matrix_panes(3, rect);
+        let mut st = AppState::default();
+        st.overlays.hotkey_dialog = true;
+        matrix_update_hover(&mut st, &panes, &moved_at(2, 2));
+        assert_eq!(st.matrix_hover, None, "a modal overlay must suppress the hover");
+    }
+
+    /// A non-`Moved` mouse event (a click, say) must not disturb whatever hover a prior `Moved`
+    /// left in place — this handler only ever reacts to motion.
+    #[test]
+    fn matrix_hover_ignores_non_moved_events() {
+        let rect = Rect::new(0, 2, app::render::matrix::LABEL_W, 1);
+        let panes = matrix_panes(3, rect);
+        let mut st = AppState::default();
+        matrix_update_hover(&mut st, &panes, &moved_at(2, 2));
+        assert_eq!(st.matrix_hover, Some((3, rect)));
+
+        let click = Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        matrix_update_hover(&mut st, &panes, &click);
+        assert_eq!(st.matrix_hover, Some((3, rect)), "a click leaves the hover exactly as it was");
+    }
+
+    // ── SQ-1273: room-box marker hover ───────────────────────────────────────
+
+    fn marker_panes(
+        room: RoomId,
+        kind: app::render::map::MarkerKind,
+        rect: Rect,
+    ) -> PaneRects {
+        PaneRects { map_marker_rects: vec![(room, kind, rect)], ..Default::default() }
+    }
+
+    /// The headline case: pointer motion over a published alias-marker rect resolves it; motion
+    /// elsewhere clears it — same shape as `matrix_hover_resolves_over_a_published_rect_and_clears_off_it`.
+    #[test]
+    fn map_hover_resolves_over_a_published_alias_rect_and_clears_off_it() {
+        let rect = Rect::new(5, 1, 1, 1);
+        let panes = marker_panes(3, app::render::map::MarkerKind::Alias, rect);
+        let mut st = AppState::default();
+
+        map_update_hover(&mut st, &panes, &moved_at(5, 1));
+        assert_eq!(st.map_hover, Some((3, app::render::map::MarkerKind::Alias, rect)));
+
+        map_update_hover(&mut st, &panes, &moved_at(50, 10));
+        assert_eq!(st.map_hover, None, "moved off the rect: cleared");
+    }
+
+    /// A `?` random-exit stub's rect resolves to the `Random` kind carrying the same direction
+    /// the marker was drawn for.
+    #[test]
+    fn map_hover_resolves_over_a_published_random_stub_rect() {
+        let rect = Rect::new(10, 2, 1, 1);
+        let kind = app::render::map::MarkerKind::Random(mapper::direction::Direction::E);
+        let panes = marker_panes(1, kind, rect);
+        let mut st = AppState::default();
+
+        map_update_hover(&mut st, &panes, &moved_at(10, 2));
+        assert_eq!(st.map_hover, Some((1, kind, rect)));
+    }
+
+    /// The `●` notes marker's rect resolves to the `Notes` kind (SQ-1386) — same shape as the
+    /// alias/random cases above, over the notes marker's own rect.
+    #[test]
+    fn map_hover_resolves_over_a_published_notes_rect() {
+        let rect = Rect::new(15, 3, 1, 1);
+        let kind = app::render::map::MarkerKind::Notes;
+        let panes = marker_panes(2, kind, rect);
+        let mut st = AppState::default();
+
+        map_update_hover(&mut st, &panes, &moved_at(15, 3));
+        assert_eq!(st.map_hover, Some((2, kind, rect)));
+    }
+
+    /// A point this frame's `map_marker_rects` never published resolves to no hover.
+    #[test]
+    fn map_hover_is_none_over_a_point_with_no_published_rect() {
+        let rect = Rect::new(5, 1, 1, 1);
+        let panes = marker_panes(3, app::render::map::MarkerKind::Alias, rect);
+        let mut st = AppState::default();
+        map_update_hover(&mut st, &panes, &moved_at(80, 20));
+        assert_eq!(st.map_hover, None, "no rect at that point: no tooltip");
+    }
+
+    /// A modal dialog owns the pointer; hover resolution must not populate `map_hover`
+    /// underneath it, even over an otherwise-valid rect.
+    #[test]
+    fn map_hover_is_suppressed_while_a_modal_overlay_is_open() {
+        let rect = Rect::new(5, 1, 1, 1);
+        let panes = marker_panes(3, app::render::map::MarkerKind::Alias, rect);
+        let mut st = AppState::default();
+        st.overlays.hotkey_dialog = true;
+        map_update_hover(&mut st, &panes, &moved_at(5, 1));
+        assert_eq!(st.map_hover, None, "a modal overlay must suppress the hover");
+    }
+
     // ── SQ-0651 / SQ-0644: the watchdog must not kill an exit save in flight ───
 
     #[test]
@@ -4434,59 +4745,6 @@ mod tests {
         // The cap must leave room beyond the fixed grace, or the extension is a
         // no-op; both are consts, so this is checked at compile time.
         const { assert!(TERM_WATCHDOG_HARD_CAP_MS > TERM_WATCHDOG_GRACE_MS) };
-    }
-
-    // ── SQ-0650: game clocks must not be starved by a busy event stream ────────
-
-    #[test]
-    fn deadline_due_only_once_armed_and_elapsed() {
-        let now = std::time::Instant::now();
-        assert!(!super::deadline_due(None, now), "not armed: never due");
-        assert!(
-            super::deadline_due(Some(now - std::time::Duration::from_millis(1)), now),
-            "elapsed deadline is due"
-        );
-        assert!(super::deadline_due(Some(now), now), "exactly at the deadline is due");
-        assert!(
-            !super::deadline_due(Some(now + std::time::Duration::from_secs(1)), now),
-            "a future deadline is not due yet"
-        );
-    }
-
-    /// The Glulx timer arm of the clock dispatch, driven with a non-Glulx engine:
-    /// an elapsed deadline must DISARM and report a redraw regardless of which
-    /// engine is running, which is what makes the loop-top dispatch safe to run on
-    /// every path. (The engine-specific delivery is covered by the Glulx suites.)
-    #[test]
-    fn due_game_clocks_disarm_an_elapsed_glulx_timer() {
-        let mut state = app::state::AppState::default();
-        let mut mapper = mapper::mapper::Mapper::default();
-        let mut engine = ClocklessEngine;
-        state.glulx_timer_next_fire = Some(std::time::Instant::now() - std::time::Duration::from_millis(5));
-
-        let (redraw, quit) = super::dispatch_due_game_clocks(
-            &mut state,
-            &mut mapper,
-            &mut engine,
-            std::path::Path::new("/nonexistent"),
-            Rect::default(),
-        );
-        assert!(redraw, "a fired timer repaints");
-        assert!(!quit);
-        assert!(state.glulx_timer_next_fire.is_none(), "an elapsed deadline must disarm, not refire every tick");
-
-        // A future deadline is left alone.
-        let future = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        state.glulx_timer_next_fire = Some(future);
-        let (redraw, _) = super::dispatch_due_game_clocks(
-            &mut state,
-            &mut mapper,
-            &mut engine,
-            std::path::Path::new("/nonexistent"),
-            Rect::default(),
-        );
-        assert!(!redraw, "nothing due: no repaint");
-        assert_eq!(state.glulx_timer_next_fire, Some(future), "still armed");
     }
 
     /// Minimal engine that is neither a Z-machine nor a Glulx session, so the
@@ -4535,62 +4793,6 @@ mod tests {
         super::TERM_SIGNUM.store(0, Ordering::SeqCst);
     }
 
-    // ── SQ-0460: withhold arrow keys from v6 stories ───────────────────────────
-
-    #[test]
-    fn forward_arrow_to_v6_gates_only_v6_when_disabled() {
-        // v6_arrow_keys = true: every version forwards arrows.
-        assert!(super::forward_arrow_to_v6(true, 6));
-        assert!(super::forward_arrow_to_v6(true, 5));
-        assert!(super::forward_arrow_to_v6(true, 0));
-
-        // v6_arrow_keys = false (the default, SQ-1087): only version 6 is
-        // withheld; v1-5 and the Glulx/no-session placeholder (version 0) still
-        // forward arrows.
-        assert!(!super::forward_arrow_to_v6(false, 6));
-        assert!(super::forward_arrow_to_v6(false, 5));
-        assert!(super::forward_arrow_to_v6(false, 3));
-        assert!(super::forward_arrow_to_v6(false, 0));
-    }
-
-    #[test]
-    fn withhold_arrow_from_v6_covers_all_arrows_and_only_arrows() {
-        use app::engine::KeyInput;
-        // The SQ-0188 line-terminator gate uses this predicate with
-        // is_line_input = true — v6 games list arrows as line terminators for
-        // movement, so gating read_char alone left arrows moving the player.
-        for arrow in [KeyInput::Up, KeyInput::Down, KeyInput::Left, KeyInput::Right] {
-            assert!(super::withhold_arrow_from_v6(Some(arrow), false, 6, true), "{arrow:?} withheld on v6 when off");
-            assert!(!super::withhold_arrow_from_v6(Some(arrow), true, 6, true), "{arrow:?} forwarded when on");
-            assert!(!super::withhold_arrow_from_v6(Some(arrow), false, 5, true), "{arrow:?} forwarded on v5");
-        }
-        // Non-arrows and no-input keys are never withheld.
-        assert!(!super::withhold_arrow_from_v6(Some(KeyInput::Enter), false, 6, true));
-        assert!(!super::withhold_arrow_from_v6(Some(KeyInput::Func(1)), false, 6, true));
-        assert!(!super::withhold_arrow_from_v6(None, false, 6, true));
-    }
-
-    #[test]
-    fn withhold_arrow_from_v6_never_withholds_during_char_input() {
-        use app::engine::KeyInput;
-        // SQ-0483: the char-input (read_char) gate calls the predicate with
-        // is_line_input = false. Menus (Shogun's startup menu, hint menus,
-        // "press any key") are unnavigable without arrows, so v6 arrows are
-        // ALWAYS delivered there — the setting has no say during char input.
-        for arrow in [KeyInput::Up, KeyInput::Down, KeyInput::Left, KeyInput::Right] {
-            // (a) setting off + char input pending → arrow IS delivered.
-            assert!(
-                !super::withhold_arrow_from_v6(Some(arrow), false, 6, false),
-                "{arrow:?} must reach a v6 menu even with the setting off",
-            );
-            // (c) setting on → delivered during char input too.
-            assert!(!super::withhold_arrow_from_v6(Some(arrow), true, 6, false));
-        }
-        // Contrast (b): the SAME arrow + setting off IS withheld at a line
-        // prompt — that path is covered above with is_line_input = true.
-        assert!(super::withhold_arrow_from_v6(Some(KeyInput::Up), false, 6, true));
-    }
-
     // ── SQ-0297: map-export slash commands must actually write the file ────────
 
     #[test]
@@ -4605,17 +4807,23 @@ mod tests {
 
         let mapper = Mapper::default();
         let mut state = AppState::default();
+        let engine = ClocklessEngine;
+        let story_bytes: &[u8] = &[];
+        let story_path = std::path::Path::new("test.z5");
 
-        assert!(super::handle_map_export(&Action::ExportSvg(None), &dir, &mapper, &mut state));
+        assert!(super::handle_map_export(&Action::ExportSvg(None), &dir, &mapper, &mut state, &engine, story_bytes, story_path));
         assert!(dir.join("map.svg").exists(), "SVG export must write map.svg into the game dir");
 
-        assert!(super::handle_map_export(&Action::ExportDot(Some("mymap".into())), &dir, &mapper, &mut state));
+        assert!(super::handle_map_export(&Action::ExportDot(Some("mymap".into())), &dir, &mapper, &mut state, &engine, story_bytes, story_path));
         assert!(dir.join("mymap.dot").exists(), "DOT export with a bare-name arg must land in the game dir");
 
-        assert!(super::handle_map_export(&Action::ExportMap(None), &dir, &mapper, &mut state));
+        assert!(super::handle_map_export(&Action::ExportMap(None), &dir, &mapper, &mut state, &engine, story_bytes, story_path));
         assert!(dir.join("map.txt").exists(), "dump export must write map.txt into the game dir");
 
-        assert!(!super::handle_map_export(&Action::ToggleWatch, &dir, &mapper, &mut state),
+        assert!(super::handle_map_export(&Action::ExportJson(None), &dir, &mapper, &mut state, &engine, story_bytes, story_path));
+        assert!(dir.join("map.json").exists(), "JSON export must write map.json into the game dir");
+
+        assert!(!super::handle_map_export(&Action::ToggleWatch, &dir, &mapper, &mut state, &engine, story_bytes, story_path),
             "a non-export action must not be treated as handled");
 
         let _ = fs::remove_dir_all(&dir);
@@ -4672,35 +4880,9 @@ mod tests {
             "newest first; untimestamped/legacy saves sort to the bottom");
     }
 
-    /// Minimal v4 story: `read_char` (store->G0) at 0x40, then `@save` (store
-    /// form, ->G0) at 0x44, then `quit` at 0x46. Mirrors session.rs's
-    /// (crate-private) `read_char_then_save_v4` fixture, duplicated here
-    /// since this test lives in the separate `app` *binary* crate. Shared by
-    /// `engine_helpers`'s restore-dispatch test and `turn`'s resume tests.
-    pub(crate) fn read_char_then_save_v4_story() -> Vec<u8> {
-        let mut buf = vec![0u8; 0x0800];
-        buf[0x00] = 4; // version 4 (0OP save/restore store form lives here)
-        buf[0x04] = 0x04; buf[0x05] = 0x00; // high_mem_base = 0x0400
-        buf[0x06] = 0x00; buf[0x07] = 0x40; // initial_pc = 0x0040
-        buf[0x08] = 0x00; buf[0x09] = 0x80; // dictionary = 0x0080 (empty)
-        buf[0x0080] = 0; buf[0x0081] = 4; buf[0x0082] = 0; buf[0x0083] = 0;
-        buf[0x0A] = 0x01; buf[0x0B] = 0x00; // object_table = 0x0100
-        buf[0x0C] = 0x03; buf[0x0D] = 0x00; // global_vars = 0x0300
-        buf[0x0E] = 0x04; buf[0x0F] = 0x00; // static_mem_base = 0x0400
-        buf[0x18] = 0x00; buf[0x19] = 0x60; // abbrev_table = 0x0060
-        buf[0x0040] = 0xF6; // VAR read_char
-        buf[0x0041] = 0x7F; // type: small(01), omit(11), omit(11), omit(11)
-        buf[0x0042] = 1;    // operand: device=1
-        buf[0x0043] = 0x10; // store -> G0
-        buf[0x0044] = 0xB5; // 0OP:0x05 save (store form)
-        buf[0x0045] = 0x10; // store -> G0
-        buf[0x0046] = 0xBA; // quit
-        buf
-    }
-
     #[test]
     fn game_echoes_command_detects_self_echo() {
-        use super::game_echoes_command;
+        use app::host::turn::game_echoes_command;
         // CounterfeitMonkey shape: the turn output starts with the command (bold),
         // then the response — case-insensitive, boundary-terminated.
         assert!(game_echoes_command("yes\n\nGood, you're conscious.", "yes"));
@@ -4713,6 +4895,12 @@ mod tests {
         assert!(!game_echoes_command("anything", ""), "empty command never matches");
         // Boundary: a command must not match a longer word it is a prefix of.
         assert!(!game_echoes_command("gospel music plays.", "go"));
+        // SQ-1546: a room heading that merely STARTS WITH the command word (Zork
+        // I's "North of House" after `north`) is not a self-echo — only a first
+        // line that IS the command, not one that merely begins with it, counts.
+        assert!(!game_echoes_command("North of House\nYou are facing the north side of a white house.", "north"));
+        // Trailing whitespace before the newline still counts as a genuine echo.
+        assert!(game_echoes_command("look  \nA room.", "look"), "trailing whitespace on the echoed line is ok");
     }
 
     #[test]
@@ -4794,12 +4982,12 @@ mod tests {
         std::fs::write(&blorb_path, build_sidecar_blorb(&png_bytes())).expect("write sidecar");
 
         assert!(
-            super::resolve_pict_blorb(&ulx_path, true).is_some(),
+            app::host::resolve_pict_blorb(&ulx_path, true).is_some(),
             "sidecar .blorb next to a bare .ulx must resolve (regression: the old \
              bytes-only logic returned None for a non-self-contained story)"
         );
         assert!(
-            super::resolve_pict_blorb(&ulx_path, false).is_none(),
+            app::host::resolve_pict_blorb(&ulx_path, false).is_none(),
             "images disabled must resolve to None regardless of sidecar"
         );
 
@@ -4810,7 +4998,7 @@ mod tests {
         let lone_ulx = no_sidecar_dir.join("lone.ulx");
         std::fs::write(&lone_ulx, &ulx_bytes).expect("write lone.ulx");
         assert!(
-            super::resolve_pict_blorb(&lone_ulx, true).is_none(),
+            app::host::resolve_pict_blorb(&lone_ulx, true).is_none(),
             "no sidecar present must resolve to None"
         );
 
@@ -4898,11 +5086,11 @@ mod tests {
             "the zipped .ulx must load as Glulx",
         );
         // …and the session is handed the artwork that came with it.
-        let blorb = super::resolve_pict_blorb(&zip_path, true)
+        let blorb = app::host::resolve_pict_blorb(&zip_path, true)
             .expect("the Blorb inside the zip must reach the Glulx session");
         assert_eq!(blorb.resources().len(), 1, "its one Pict is indexed");
         assert!(
-            super::resolve_pict_blorb(&zip_path, false).is_none(),
+            app::host::resolve_pict_blorb(&zip_path, false).is_none(),
             "images disabled still resolves to None",
         );
 
@@ -4919,7 +5107,7 @@ mod tests {
         // Resolve the default look from DEFAULT_STYLE_TOML (same path as startup).
         let doc = app::style::parse_style_toml(app::style::DEFAULT_STYLE_TOML)
             .expect("DEFAULT_STYLE_TOML must parse");
-        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."));
+        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."), zvm::screen::Palette::Standard);
 
         let area = Rect::new(0, 0, 20, 10);
         let mut buf = Buffer::empty(area);
@@ -4941,7 +5129,7 @@ mod tests {
         // Resolve the default look from DEFAULT_STYLE_TOML (same path as startup).
         let doc = app::style::parse_style_toml(app::style::DEFAULT_STYLE_TOML)
             .expect("DEFAULT_STYLE_TOML must parse");
-        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."));
+        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."), zvm::screen::Palette::Standard);
 
         let area = Rect::new(0, 0, 40, 15);
         let mut buf = Buffer::empty(area);
@@ -4988,7 +5176,7 @@ mod tests {
         use app::render::panel::{draw_panel, PanelSpec, PanelStrip};
         let doc = app::style::parse_style_toml(app::style::DEFAULT_STYLE_TOML)
             .expect("DEFAULT_STYLE_TOML must parse");
-        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."));
+        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."), zvm::screen::Palette::Standard);
 
         let area = Rect::new(0, 0, 40, 15);
         let mut buf = Buffer::empty(area);
@@ -5035,7 +5223,7 @@ mod tests {
         // Resolve the default theme from DEFAULT_STYLE_TOML (same path as startup).
         let doc = app::style::parse_style_toml(app::style::DEFAULT_STYLE_TOML)
             .expect("DEFAULT_STYLE_TOML must parse");
-        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."));
+        let (cs, _set, _warnings) = app::style::resolve(&doc, std::path::Path::new("."), zvm::screen::Palette::Standard);
 
         let area = Rect::new(0, 0, 20, 10);
 
@@ -5345,6 +5533,44 @@ mod tests {
         assert_eq!(scroll_for_match(0, 5, 10), 0);
     }
 
+    #[test]
+    fn recall_n_moves_to_the_next_ranked_hit() {
+        use crossterm::event::KeyCode;
+        let mut state = app::state::AppState::default();
+        state.recall_mode = true;
+        state.search_matches = vec![8, 3, 14];
+        state.recall_preview_scroll = 5;
+        assert_eq!(super::recall_key_action(KeyCode::Char('n'), 'n', 'N'), super::RecallKeyAction::Next);
+        assert_eq!(state.search_next(true), Some(3));
+        assert_eq!(state.recall_preview_scroll, 0);
+        assert_eq!(super::recall_key_action(KeyCode::Char('N'), 'n', 'N'), super::RecallKeyAction::Previous);
+        assert_eq!(state.search_next(false), Some(8));
+    }
+
+    #[test]
+    fn recall_preview_scroll_clamps_and_other_keys_do_not_reach_the_game() {
+        use crossterm::event::KeyCode;
+        assert_eq!(super::recall_key_action(KeyCode::Char('l'), 'n', 'N'), super::RecallKeyAction::Ignore);
+        assert_eq!(super::recall_key_action(KeyCode::Esc, 'n', 'N'), super::RecallKeyAction::Close);
+        assert_eq!(super::recall_preview_scroll(super::RecallKeyAction::PageDown, 0, 12, 5), 5);
+        assert_eq!(super::recall_preview_scroll(super::RecallKeyAction::PageDown, 10, 12, 5), 12);
+        assert_eq!(super::recall_preview_scroll(super::RecallKeyAction::PageUp, 3, 12, 5), 0);
+        assert_eq!(super::recall_preview_scroll(super::RecallKeyAction::End, 0, 12, 5), 12);
+        assert_eq!(super::recall_preview_scroll_delta(5, 12, -2), 3);
+        assert_eq!(super::recall_preview_scroll_delta(11, 12, 3), 12);
+    }
+
+    #[test]
+    fn recall_controls_use_the_painted_panel_area() {
+        let state = app::state::AppState::default();
+        let fallback = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let painted = ratatui::layout::Rect::new(0, 5, 80, 19);
+        assert_eq!(super::recall_panel_area(&state, fallback), fallback);
+        state.recall_panel_area.set(painted);
+        assert_eq!(super::recall_panel_area(&state, fallback), painted);
+    }
+
+
     // ── is_slash ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -5362,7 +5588,11 @@ mod tests {
         use app::state::AppState;
 
         let mut s = AppState::default();
-        // Default: auto_save = false, prompt_save_on_quit = true, unsaved_progress = false
+        // SQ-1624 flipped the config default to auto_save = true; this case is
+        // about the auto_save=false branch specifically, so set it explicitly
+        // rather than relying on what the default happens to be.
+        s.config.auto_save = false;
+        // auto_save = false, prompt_save_on_quit = true, unsaved_progress = false
         // No prompt with no unsaved progress (fresh, or just saved/loaded).
         assert!(!should_prompt_save_on_quit(&s), "no unsaved progress => no prompt");
 
@@ -5557,11 +5787,11 @@ mod tests {
     /// (SQ-0811).
     #[test]
     fn the_seed_line_tells_an_unpinned_run_how_to_keep_itself() {
-        let line = super::random_seed_line(20250811, false);
+        let line = app::host::random_seed_line(20250811, false);
         assert!(line.contains("20250811"), "names the seed: {line}");
         assert!(line.contains("random_seed = 20250811"), "spells the config key: {line}");
 
-        let pinned = super::random_seed_line(20250811, true);
+        let pinned = app::host::random_seed_line(20250811, true);
         assert!(pinned.contains("20250811"), "names the seed: {pinned}");
         assert!(pinned.contains("config.toml"), "says where it came from: {pinned}");
     }

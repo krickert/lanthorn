@@ -39,6 +39,7 @@ pub fn glk_style_bits(style: GlkStyle) -> u8 {
         | GlkStyle::BlockQuote
         | GlkStyle::User1
         | GlkStyle::User2 => 0,
+        _ => 0,
     }
 }
 
@@ -164,7 +165,7 @@ pub fn theme_style_colours(colors: &crate::colors::ColorScheme) -> GlkStylePairs
 type GridBufCell = (char, u8, u32, u32, u32, u8);
 
 /// A text-grid window's cell buffer (cells keyed by 0-based `(row, col)`).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct GridBuf {
     width: u32,
     height: u32,
@@ -175,6 +176,7 @@ struct GridBuf {
 }
 
 /// One entry in a text-buffer window's ordered output log.
+#[derive(Clone)]
 enum BufElem {
     /// A run of printed text with its style bits, packed colours, Glk hyperlink
     /// value (0 = no link), paragraph layout format (SQ-0330) and Glk style class
@@ -185,7 +187,7 @@ enum BufElem {
 }
 
 /// A text-buffer window's ordered output log (text runs + inline images).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct BufBuf {
     log: Vec<BufElem>,
     /// Number of leading log entries already drained by `take_transcript*`.
@@ -205,6 +207,39 @@ struct SoundChannel {
     /// cleared by `schannel_unpause`, and snapshotted into each `Play` op so a
     /// sound played on a channel paused while empty starts paused.
     paused: bool,
+}
+
+/// Everything a question asked behind the player's back must put back (SQ-1293).
+///
+/// `Machine::restore_state` rolls back *gvm's* Glk model, and none of this: the
+/// backend keeps its own copies of what every window holds, and the app renders
+/// from those, not from gvm. So a silent `look` whose VM is restored still leaves
+/// its room description in `buffers[*].log` — where `screen_model` and
+/// `window_dump_lines` both read the WHOLE log, not the undrained tail — and its
+/// status-line rewrite in `grids[*].cells`, on a screen whose transcript never saw
+/// either. Draining is not undoing: `take_transcript_elems` only advances
+/// `drained`.
+///
+/// The buffer logs are cloned whole rather than remembered by length, because a
+/// window the question CLEARS shrinks rather than grows and a length cannot undo
+/// that. It is affordable because it is rare — see
+/// [`crate::glulx_session::GlulxSession::silent_look`] for what limits how often a
+/// question is asked at all.
+///
+/// `layout` and `layout_tree` are here too, and for the same reason they look
+/// redundant: `refresh_screen`'s `sync_window_tree` re-pushes gvm's own tree after
+/// the restore, so the tree ends up gvm's either way — but the flat `layout` has no
+/// such re-push, and a story that reopens a window on `look` would otherwise leave
+/// the hit-test rectangles describing a screen that never happened.
+pub(crate) struct DisplaySnapshot {
+    layout: Vec<(u32, WinType, GlkRect, Option<bool>)>,
+    layout_tree: Option<WinTree>,
+    grids: BTreeMap<u32, GridBuf>,
+    buffers: BTreeMap<u32, BufBuf>,
+    scans: BTreeMap<u32, StoryScan>,
+    graphics: BTreeMap<u32, crate::graphics::Canvas>,
+    primary: Option<u32>,
+    primary_cleared: bool,
 }
 
 /// The app Glk display backend (see the module docs).
@@ -230,13 +265,115 @@ pub struct AppGlk {
     /// by `finish_turn` into `TurnResult.erase_lower` so the app pins the reprint
     /// to a fresh screen instead of appending a fresh copy each time. (SQ-0403)
     primary_cleared: bool,
-    /// Accumulator for the current run of `Subheader` text in the primary
-    /// window (the Inform 7 room heading, captured char-by-char).
+    /// The room-heading / read-prompt scan, **one per buffer window** (SQ-1241).
+    ///
+    /// It has to be per-window rather than per-`primary`, because which buffer
+    /// is primary can change *after* the text that answers the question has
+    /// already been written. City of Secrets (GWindows) prints its whole
+    /// prologue — title, `Subheader` "City Train Station", room description and
+    /// read prompt — into a second buffer it opens mid-turn, while `primary` is
+    /// still the splash window it opened first; `set_input_window` only re-points
+    /// primary at the end of that turn, from `finish_turn`. Scanning only the
+    /// window that was primary AT WRITE TIME therefore missed the opening room
+    /// heading outright, and judged the banner test against the splash window's
+    /// read prompt (which there was none of) — so the story ran for four turns
+    /// with no location at all. Every buffer is scanned as it is written and
+    /// [`take_room_heading`](Self::take_room_heading) reads whichever scan
+    /// belongs to the primary of the moment, so a window that becomes the story
+    /// window brings its own history with it.
+    scans: BTreeMap<u32, StoryScan>,
+    /// Graphics-window pixel canvases, keyed by window id.
+    graphics: std::collections::BTreeMap<u32, crate::graphics::Canvas>,
+    /// The `(width, height)` of one text-grid cell in pixels, for pixel↔cell
+    /// layout of graphics windows.
+    ///
+    /// Fractional (SQ-1603) — see `TerminalFacts::glk_cell_px`'s doc for why:
+    /// a host's real cell need not land on a whole device pixel, and rounding
+    /// it before it reaches here would force every graphics window's canvas
+    /// through one shared pre-rounded ratio. Stored at full precision;
+    /// `canvas_size` rounds PER WINDOW at the multiplication site, and
+    /// `char_pixels()` (the `GlkBackend` trait boundary gvm's own layout math
+    /// and every game-visible pixel report read through) rounds once.
+    char_px: (f64, f64),
+    /// Resolves + caches Blorb `Pict` resources for `graphics_draw_image`.
+    picts: crate::graphics::PictSource,
+    /// Live sound channels, keyed by Glk channel ref (BTree for stable iterate).
+    schannels: BTreeMap<u32, SoundChannel>,
+    /// Next channel ref to hand out (pre-incremented; first create → 1).
+    next_schannel: u32,
+    /// Buffered per-turn sound operations, drained by `take_sound_ops`.
+    sound_ops: Vec<crate::session::SchannelOp>,
+    /// The theme's rendered default `(fg, bg)` per Glk style class, by window
+    /// type, as `0x00RRGGBB`; `None` per channel = terminal default (unknowable
+    /// — no guess). See [`GlkStylePairs`]. Reported to the game through
+    /// `glk_style_measure` via `GlkBackend::default_style_colours` so it can
+    /// detect a dark background (SQ-0315) or probe what we paint for one style
+    /// class (SQ-0803). Pushed by the app on boot and kept fresh each loop pass
+    /// (live style reload).
+    theme_styles: GlkStylePairs,
+    /// The per-game borderless-windows preference (SQ-0341/SQ-1402): `true`
+    /// makes every split abut with no reserved gutter cell and no reported
+    /// border, overriding a story's own `winmethod_Border` request the way
+    /// Gargoyle's own preference does. Reported through
+    /// [`gvm::glk::GlkBackend::borderless`]; gvm asks for it fresh at every
+    /// relayout, so this is the single source of truth — nothing on the gvm
+    /// side needs to preserve it across `@restart`/`restore_state` any more.
+    borderless: bool,
+}
+
+impl Default for AppGlk {
+    fn default() -> Self {
+        AppGlk::new(80, 24)
+    }
+}
+
+/// How much output after the blank line following a heading candidate is kept.
+/// Only enough to recognise a bare read prompt; anything longer is prose.
+const HEADING_TAIL_CAP: usize = 32;
+
+/// How much of a window's trailing output is kept in
+/// `StoryScan::prompt_tail`. Only enough to see a read prompt and the newline that
+/// puts it at line start.
+const PROMPT_TAIL_CAP: usize = 32;
+
+/// How much of the candidate's OWN line, after the bold run ends, is kept in
+/// `StoryScan::heading_line_rest`. Only enough to see whether a word follows —
+/// see [`StoryScan::line_rest_disqualifies`].
+const HEADING_LINE_REST_CAP: usize = 24;
+
+/// Where a window's output stream sits relative to the heading
+/// candidate held in `StoryScan::heading_pending` — the states of the "is this
+/// heading joined to a room description, or set off as a banner?" test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadingTail {
+    /// No candidate is awaiting a verdict.
+    Idle,
+    /// Still on the candidate's own line (a heading run can end before the line
+    /// does — Inform prints "Kitchen" in `Subheader` and the "(on the chair)"
+    /// parenthetical after it in roman).
+    Line,
+    /// The candidate's line just ended; the very next character decides.
+    LineEnd,
+    /// A blank line followed the candidate, so it stands apart from whatever
+    /// comes next. `heading_tail_text` collects that "whatever".
+    Detached,
+}
+
+/// One buffer window's room-heading and read-prompt scan (SQ-1241).
+///
+/// Every field here used to sit on [`AppGlk`] and be fed only for the window
+/// that was `primary` at write time; see the doc on `AppGlk::scans` for why that
+/// lost City of Secrets' opening room. The state machine itself is unchanged —
+/// it simply now belongs to the window whose stream it describes.
+#[derive(Clone)]
+struct StoryScan {
+    /// Accumulator for the current run of `Subheader` text (the Inform room
+    /// heading, captured char-by-char).
     heading_acc: String,
     /// The last completed `Subheader` line seen since the previous drain — the
     /// current room heading (`None` if this turn printed none).
     last_heading: Option<String>,
-    /// Whether the primary window's output stream is at the start of a line.
+    /// Whether this window's output stream is at the start of a line.
     /// A room heading is a `Subheader` run that BEGINS here; `Subheader` runs
     /// beginning mid-line are inline hyperlinks (e.g. Superluminal's command
     /// hints), not rooms.
@@ -255,64 +392,96 @@ pub struct AppGlk {
     /// Set once `heading_tail_text` hit the cap: whatever follows the blank line
     /// is far too long to be a bare read prompt, so it is prose.
     heading_tail_prose: bool,
-    /// The last [`PROMPT_TAIL_CAP`] chars written to the primary buffer window,
-    /// kept only to answer "does the stream end at the game's read prompt?" —
-    /// the test for a parser command prompt rather than a bare line read.
+    /// What followed the bold run on the candidate's OWN line, capped at
+    /// [`HEADING_LINE_REST_CAP`] chars — the evidence for
+    /// [`StoryScan::line_rest_disqualifies`].
+    heading_line_rest: String,
+    /// A candidate that a `Subheader` run opening the line BELOW it displaced
+    /// before anything could settle it — see [`StoryScan::capture_heading`]
+    /// (SQ-1295). Confirmed by [`StoryScan::reject_heading`] when the line that
+    /// displaced it turns out to be prose, dropped when that line turns out to
+    /// own itself (another banner).
+    heading_displaced: Option<String>,
+    /// The last [`PROMPT_TAIL_CAP`] chars written to this window, kept only to
+    /// answer "does the stream end at the game's read prompt?" — the test for a
+    /// parser command prompt rather than a bare line read.
     prompt_tail: String,
-    /// Graphics-window pixel canvases, keyed by window id.
-    graphics: std::collections::BTreeMap<u32, crate::graphics::Canvas>,
-    /// The `(width, height)` of one text-grid cell in pixels, for pixel↔cell
-    /// layout of graphics windows.
-    char_px: (u32, u32),
-    /// Resolves + caches Blorb `Pict` resources for `graphics_draw_image`.
-    picts: crate::graphics::PictSource,
-    /// Live sound channels, keyed by Glk channel ref (BTree for stable iterate).
-    schannels: BTreeMap<u32, SoundChannel>,
-    /// Next channel ref to hand out (pre-incremented; first create → 1).
-    next_schannel: u32,
-    /// Buffered per-turn sound operations, drained by `take_sound_ops`.
-    sound_ops: Vec<crate::session::SchannelOp>,
-    /// The theme's rendered default `(fg, bg)` per Glk style class, by window
-    /// type, as `0x00RRGGBB`; `None` per channel = terminal default (unknowable
-    /// — no guess). See [`GlkStylePairs`]. Reported to the game through
-    /// `glk_style_measure` via `GlkBackend::default_style_colours` so it can
-    /// detect a dark background (SQ-0315) or probe what we paint for one style
-    /// class (SQ-0803). Pushed by the app on boot and kept fresh each loop pass
-    /// (live style reload).
-    theme_styles: GlkStylePairs,
+    /// The prose captured alongside the CURRENT heading candidate, once
+    /// [`Self::advance_heading_tail`] has decided it is joined-or-detached body text rather
+    /// than the candidate's own line (SQ-1625) — the same evidence
+    /// [`Self::heading_tail_text`]/[`Self::heading_tail_prose`] classify, just kept in full
+    /// rather than capped at [`HEADING_TAIL_CAP`]: once something is worth classifying as
+    /// prose, the whole of it is worth keeping, however long. Cleared everywhere
+    /// `heading_tail_text` is (a rejection, a displaced candidate's fresh replacement, a
+    /// window clear, and — critically — every [`Self::take_room_heading`] drain, confirmed
+    /// or discarded alike), so it can never describe a candidate other than the one that
+    /// was just settled.
+    body_acc: String,
+    /// Whether [`Self::advance_heading_tail`] is currently inside `body_acc`'s window: true
+    /// from the first body character onward (either the joined case's very next char after
+    /// the candidate's own line, or the first char past the blank line that detaches it),
+    /// false again the moment that candidate is settled one way or the other. Needed because
+    /// the JOINED case confirms the heading (and resets [`Self::heading_tail`] to `Idle`)
+    /// after only ONE character of the body — every character after that flows through the
+    /// no-op `Idle` arm of `advance_heading_tail`, and this is what keeps `body_acc` growing
+    /// through it regardless.
+    capturing_body: bool,
+    /// The body text [`Self::take_room_heading`] resolved for THIS turn's confirmed heading,
+    /// if any — `None` on a turn that confirmed no heading, or confirmed one with nothing
+    /// following it (SQ-1625). Read once, right after `take_room_heading`, by
+    /// [`AppGlk::take_room_description`].
+    last_description: Option<String>,
+    /// The name of the FIRST own-line `Subheader` candidate this turn to reach
+    /// [`HeadingTail::LineEnd`] — i.e. the first run that validly owned its own
+    /// line, whatever became of it afterwards. Set once per turn (cleared by the
+    /// next [`Self::take_room_heading`] drain) and never touched by
+    /// [`Self::reject_heading`]/[`Self::confirm_heading`], which only ever move
+    /// `last_heading` (SQ-1653).
+    ///
+    /// A real Inform 7 room-arrival turn prints exactly one own-line heading. A
+    /// story that stacks a page title above a list of joined name+value entries —
+    /// Superluminal Vagrant Twin's `map` prints `"VISITED WORLDS"` then, still in
+    /// the same turn, `"Other Worlds\nBoony (not yet landed)"`, styled and shaped
+    /// identically to a real room heading joined to its description — prints TWO.
+    /// Neither `capture_heading`'s displacement parking (which only engages from
+    /// `LineEnd`, one character from confirmation) nor [`Self::confirm_heading`]
+    /// (which just overwrites `last_heading` — "the last heading in a turn wins"
+    /// by design) notices a SECOND, differently-named entry arriving after the
+    /// first: the first is silently displaced or silently overwritten, either way
+    /// without ever being judged a banner. [`Self::take_room_heading`] is where
+    /// this is caught: a turn's final answer that differs from the first own-line
+    /// candidate it saw is a listing, not an arrival, and is refused wholesale —
+    /// the same refusal shape a banner already gets (SQ-0732).
+    heading_seen_this_turn: Option<String>,
+    /// Whether the heading [`Self::take_room_heading`] just returned differed from
+    /// the FIRST own-line candidate this turn saw (SQ-1653) — set on every drain,
+    /// read once by [`Self::heading_is_a_later_distinct_entry`]. See
+    /// `heading_seen_this_turn`'s doc for what this is evidence of and why the
+    /// verdict is left to the caller.
+    heading_multi_this_turn: bool,
 }
 
-impl Default for AppGlk {
+impl Default for StoryScan {
     fn default() -> Self {
-        AppGlk::new(80, 24)
+        StoryScan {
+            heading_acc: String::new(),
+            last_heading: None,
+            at_line_start: true,
+            in_heading: false,
+            heading_pending: None,
+            heading_tail: HeadingTail::Idle,
+            heading_tail_text: String::new(),
+            heading_tail_prose: false,
+            heading_line_rest: String::new(),
+            heading_displaced: None,
+            prompt_tail: String::new(),
+            body_acc: String::new(),
+            capturing_body: false,
+            last_description: None,
+            heading_seen_this_turn: None,
+            heading_multi_this_turn: false,
+        }
     }
-}
-
-/// How much output after the blank line following a heading candidate is kept.
-/// Only enough to recognise a bare read prompt; anything longer is prose.
-const HEADING_TAIL_CAP: usize = 32;
-
-/// How much of the primary window's trailing output is kept in
-/// `AppGlk::prompt_tail`. Only enough to see a read prompt and the newline that
-/// puts it at line start.
-const PROMPT_TAIL_CAP: usize = 32;
-
-/// Where the primary window's output stream sits relative to the heading
-/// candidate held in `AppGlk::heading_pending` — the states of the "is this
-/// heading joined to a room description, or set off as a banner?" test.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HeadingTail {
-    /// No candidate is awaiting a verdict.
-    Idle,
-    /// Still on the candidate's own line (a heading run can end before the line
-    /// does — Inform prints "Kitchen" in `Subheader` and the "(on the chair)"
-    /// parenthetical after it in roman).
-    Line,
-    /// The candidate's line just ended; the very next character decides.
-    LineEnd,
-    /// A blank line followed the candidate, so it stands apart from whatever
-    /// comes next. `heading_tail_text` collects that "whatever".
-    Detached,
 }
 
 /// One styled text chunk drained by `take_transcript`: `(char_count, style-bits,
@@ -325,7 +494,7 @@ impl AppGlk {
     /// A backend reporting a `cols × rows` display. Stylehint colour is always
     /// recorded; the `honor_game_colours` gate is applied at render time.
     pub fn new(cols: u32, rows: u32) -> AppGlk {
-        AppGlk::with_graphics(cols, rows, (1, 1), crate::graphics::PictSource::new(None))
+        AppGlk::with_graphics(cols, rows, (1.0, 1.0), crate::graphics::PictSource::new(None))
     }
 
     /// A backend also carrying the char-cell pixel size and a `Pict` source,
@@ -333,7 +502,7 @@ impl AppGlk {
     pub fn with_graphics(
         cols: u32,
         rows: u32,
-        char_px: (u32, u32),
+        char_px: (f64, f64),
         picts: crate::graphics::PictSource,
     ) -> AppGlk {
         AppGlk {
@@ -345,15 +514,7 @@ impl AppGlk {
             buffers: BTreeMap::new(),
             primary: None,
             primary_cleared: false,
-            heading_acc: String::new(),
-            last_heading: None,
-            at_line_start: true,
-            in_heading: false,
-            heading_pending: None,
-            heading_tail: HeadingTail::Idle,
-            heading_tail_text: String::new(),
-            heading_tail_prose: false,
-            prompt_tail: String::new(),
+            scans: BTreeMap::new(),
             graphics: BTreeMap::new(),
             char_px,
             picts,
@@ -361,7 +522,29 @@ impl AppGlk {
             next_schannel: 0,
             sound_ops: Vec::new(),
             theme_styles: [[(None, None); 11]; 2],
+            borderless: false,
         }
+    }
+
+    /// Set the per-game borderless-windows preference (see the field doc).
+    /// Takes effect at the next relayout — the caller re-lays the tree out
+    /// (e.g. `Machine::rearrange`) for it to show immediately.
+    pub fn set_borderless(&mut self, on: bool) {
+        self.borderless = on;
+    }
+
+    /// The per-game borderless-windows preference currently in force.
+    pub fn borderless(&self) -> bool {
+        self.borderless
+    }
+
+    /// Set the `(width, height)` in pixels of one text-grid cell, used to size
+    /// every graphics window's canvas (`canvas_size`) — SQ-1598. Takes effect
+    /// at the next relayout — the caller re-lays the tree out (e.g.
+    /// `Machine::rearrange`) for it to show immediately, exactly as
+    /// `set_borderless` above does for its own field.
+    pub fn set_char_px(&mut self, char_px: (f64, f64)) {
+        self.char_px = char_px;
     }
 
     /// Update the theme's rendered default colours reported through
@@ -374,7 +557,13 @@ impl AppGlk {
     }
 
     /// The pixel size of a graphics window `win` as laid out, from `layout` ×
-    /// `char_px`. Does not borrow `self.graphics`, so it can be called while
+    /// `char_px` — except on the axis `layout_tree` reports a pixel-exact
+    /// split for (`WinTree::Pair::split_px`, SQ-1565), which is used in
+    /// place of the cell-rounded figure on that axis: a fixed-pixel or
+    /// proportional graphics split (Kerkerkruip's 2-3px title rules) then
+    /// gets a canvas sized to the pixels the game actually asked for, not
+    /// rounded up to the whole cell row/column `layout` reserved for it.
+    /// Does not borrow `self.graphics`, so it can be called while
     /// `self.graphics.entry(..)` is held.
     fn canvas_size(&self, win: u32) -> (u32, u32) {
         let cells = self
@@ -383,7 +572,46 @@ impl AppGlk {
             .find(|&&(id, _, _, _)| id == win)
             .map(|&(_, _, r, _)| (r.width, r.height))
             .unwrap_or((1, 1));
-        (cells.0 * self.char_px.0, cells.1 * self.char_px.1)
+        // SQ-1603: rounds PER WINDOW, at this multiplication, rather than
+        // sharing one pre-rounded `char_px` across every window's canvas — a
+        // fractional cell size multiplied by different cell counts must be
+        // allowed to round differently window to window, or the error
+        // compounds unevenly against the host's real, uniform cell grid.
+        let (mut cw, mut ch) = (
+            (cells.0 as f64 * self.char_px.0).round() as u32,
+            (cells.1 as f64 * self.char_px.1).round() as u32,
+        );
+        if let Some((vertical, px)) = self.graphics_split_px(win) {
+            if vertical {
+                ch = px;
+            } else {
+                cw = px;
+            }
+        }
+        (cw, ch)
+    }
+
+    /// `win`'s enclosing split's pixel-exact footprint on the split axis, when
+    /// `win` is a graphics window occupying the FIRST (top/left) side of that
+    /// split — the fact `WinTree::Pair::split_px` carries and `canvas_size`
+    /// uses in place of the cell-rounded number (SQ-1565). Returns
+    /// `(vertical, pixels)`; `None` when `win` isn't a first-positioned
+    /// graphics child of a resolved split, or no tree has been built yet.
+    fn graphics_split_px(&self, win: u32) -> Option<(bool, u32)> {
+        fn walk(t: &WinTree, win: u32) -> Option<(bool, u32)> {
+            match t {
+                WinTree::Pair { vertical, split_px, first, second, .. } => {
+                    if let WinTree::Leaf { id, wintype: WinType::Graphics, .. } = first.as_ref() {
+                        if *id == win {
+                            return split_px.map(|px| (*vertical, px));
+                        }
+                    }
+                    walk(first, win).or_else(|| walk(second, win))
+                }
+                WinTree::Leaf { .. } => None,
+            }
+        }
+        self.layout_tree.as_ref().and_then(|t| walk(t, win))
     }
 
     /// Update the reported display size (the host story-pane size each frame).
@@ -452,6 +680,7 @@ impl AppGlk {
                         WinType::TextBuffer => "Buffer",
                         WinType::Graphics => "Graphics",
                         WinType::Pair => "Pair",
+                        _ => "Unknown",
                     };
                     let prim = if primary == Some(*id) { " (primary)" } else { "" };
                     let ginfo = if *wintype == WinType::Graphics {
@@ -573,7 +802,7 @@ impl AppGlk {
     /// as a game's `glk_image_draw` into the buffer window would (a resolvable
     /// Pict needs a Blorb the unit harness lacks). Lets a `GlulxSession` test
     /// exercise the banner/startup image path without a Blorb.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "t-session"))]
     pub(crate) fn test_push_primary_image(&mut self, img: crate::inline_image::InlineImage) {
         if let Some(pid) = self.primary {
             if let Some(buf) = self.buffers.get_mut(&pid) {
@@ -582,7 +811,172 @@ impl AppGlk {
         }
     }
 
-    /// Feed one primary-window output run into the room-heading detector.
+    /// The scan belonging to one buffer window, created on first write.
+    fn scan(&mut self, win: u32) -> &mut StoryScan {
+        self.scans.entry(win).or_default()
+    }
+
+    /// The scan of the window that is primary *right now* — the story window as
+    /// of this moment, which is not necessarily the one the text was written to
+    /// (see `Self::scans`).
+    fn primary_scan(&mut self) -> Option<&mut StoryScan> {
+        let pid = self.primary?;
+        Some(self.scans.entry(pid).or_default())
+    }
+
+    /// Take a [`DisplaySnapshot`] of everything a silent question could disturb.
+    /// Paired with [`Self::restore_display_snapshot`]; see the snapshot's own docs
+    /// for what is in it and why (SQ-1293).
+    pub(crate) fn display_snapshot(&self) -> DisplaySnapshot {
+        DisplaySnapshot {
+            layout: self.layout.clone(),
+            layout_tree: self.layout_tree.clone(),
+            grids: self.grids.clone(),
+            buffers: self.buffers.clone(),
+            scans: self.scans.clone(),
+            graphics: self.graphics.clone(),
+            primary: self.primary,
+            primary_cleared: self.primary_cleared,
+        }
+    }
+
+    /// Put a [`DisplaySnapshot`] back, wholesale. Windows the question opened go
+    /// with it, because the map is replaced rather than merged — and gvm's own
+    /// model, restored alongside, does not have them either.
+    pub(crate) fn restore_display_snapshot(&mut self, snap: DisplaySnapshot) {
+        self.layout = snap.layout;
+        self.layout_tree = snap.layout_tree;
+        self.grids = snap.grids;
+        self.buffers = snap.buffers;
+        self.scans = snap.scans;
+        self.graphics = snap.graphics;
+        self.primary = snap.primary;
+        self.primary_cleared = snap.primary_cleared;
+    }
+
+    /// Whether the story window's output currently ends at the game's read
+    /// prompt — the last thing an Inform parser prints before reading a command.
+    ///
+    /// `pub(crate)` for `glulx_session`'s silent `look`, which must not type a
+    /// command at a page that is asking the player a question (SQ-1293).
+    pub(crate) fn ends_at_read_prompt(&mut self) -> bool {
+        self.primary_scan().is_some_and(|s| s.ends_at_read_prompt())
+    }
+
+    /// Mark every window as though a fresh display line has just begun — called
+    /// once, right before a player's typed COMMAND (a line of input) reaches the
+    /// story (SQ-1639).
+    ///
+    /// The read prompt a turn ends on is a bare `">"`, never followed by the
+    /// story's own newline — so `StoryScan::at_line_start` is left `false` when
+    /// that turn's drain settles, and stays `false` into the next one. A real
+    /// terminal always shows the player's own line and their Enter key as a
+    /// newline right there, even though neither ever reaches `put_text`; without
+    /// this, a story whose next room print does not ALSO lead with its own blank
+    /// line — Anchorhead reprints "Outside the Real Estate Office" on a bare
+    /// `look` with no leading `\n` at all, unlike the Inform 7 library's own
+    /// room-name rule — has that very heading's `Subheader` run graded as
+    /// beginning MID-LINE, the same test that correctly ignores an inline
+    /// hyperlink (`capture_heading`'s own doc). `heading_acc` never opens,
+    /// `last_heading` never gets set, and every LOOK after the first loses both
+    /// the heading and the SQ-1625 body paired with it — not merely one game's
+    /// quirk: any story that omits that leading blank line hits this the moment
+    /// a second command reprints its heading.
+    ///
+    /// Not called for a bare keypress (`submit_key`/char-input turns): those
+    /// deliberately keep whatever a banner/cutscene page left behind
+    /// (SQ-0732/SQ-0733's own detached-tail handling already covers that
+    /// boundary), and forcing it here too is no part of what this fix is for.
+    pub fn begin_command_line(&mut self) {
+        for scan in self.scans.values_mut() {
+            scan.at_line_start = true;
+        }
+    }
+
+    /// Return and clear the last `Subheader` room heading the STORY window
+    /// captured since the previous call, applying the banner test below to it.
+    /// Drained once per turn, alongside `take_transcript`.
+    pub fn take_room_heading(&mut self, awaiting_line_input: bool) -> Option<String> {
+        let at_command_prompt = awaiting_line_input && self.ends_at_read_prompt();
+        self.primary_scan()?.take_room_heading(at_command_prompt)
+    }
+
+    /// Return and clear the prose [`Self::take_room_heading`] found joined to the heading it
+    /// just drained (SQ-1625) — `None` when that call confirmed no heading, or confirmed one
+    /// with nothing following it. **Must be called AFTER `take_room_heading`, on the same
+    /// drain** — the scan's own `take_room_description` only ever has something to return
+    /// once `take_room_heading` has just settled this turn's candidate one way or the other;
+    /// called on its own, or before `take_room_heading`, it can only see what an EARLIER
+    /// drain left behind.
+    pub fn take_room_description(&mut self) -> Option<String> {
+        self.primary_scan()?.take_room_description()
+    }
+
+    /// Return and clear whether the heading [`Self::take_room_heading`] just
+    /// returned was a SECOND, differently-named own-line `Subheader` candidate
+    /// this turn (SQ-1653) — a page title stacked above a list of joined
+    /// name+value entries, styled and shaped identically to a real room heading
+    /// joined to its description (Superluminal Vagrant Twin's `map`:
+    /// `"VISITED WORLDS"` then `"Other Worlds\nBoony (not yet landed)"`).
+    ///
+    /// `false` when this turn printed no heading, printed exactly one, or
+    /// reprinted the same name twice (a maze, or a plain repeated `look`) — a
+    /// game's OWN title banner joined to its credits block, stacked above the
+    /// real opening room on the very turn a title menu is dismissed, is this
+    /// exact shape too (*King of Shreds and Patches*), so the caller must weigh
+    /// this against whatever room is already known before refusing the heading —
+    /// see `GlulxSession::refuse_a_later_distinct_entry_in_a_list`. Must be
+    /// called AFTER `take_room_heading`, on the same drain, exactly like
+    /// [`Self::take_room_description`].
+    pub fn heading_is_a_later_distinct_entry(&mut self) -> bool {
+        self.primary_scan().is_some_and(|s| s.heading_is_a_later_distinct_entry())
+    }
+
+    /// The room name painted on the game's STATUS LINE — its first text-grid
+    /// window — or `None` if it holds nothing that could be one (SQ-1302).
+    ///
+    /// A Glk story does not have to print a room heading. *The Wizard Sniffer*
+    /// (release 1 / serial 171007 / Inform 7 build 6L38) never prints one in any
+    /// style: its whole presentation puts the room name in a two-row status grid
+    /// — `" Atop a Mountain"` over `" Exit: north"` — and the buffer carries the
+    /// description alone, so [`Self::take_room_heading`] has nothing to read and
+    /// the map stayed empty for the entire game. Measured across the 60 Glulx
+    /// files in `stories/`, three more do the same (*Brain Guzzlers from Beyond!*,
+    /// *Zozzled*, and Counterfeit Monkey before its first `look`).
+    ///
+    /// This is the Glk twin of `zvm::location::status_line_room_name`, which has
+    /// read the Z-machine's upper window this way since long before — the parse is
+    /// the same one, on the other engine's grid: the FIRST row of the LOWEST-id
+    /// grid window (the status line Inform splits off first), its first non-blank
+    /// segment (text between runs of 2+ spaces, which is what separates a room
+    /// name from the score block beside it, and what finds a CENTERED title), with
+    /// any qualifier after the first comma dropped ("Back Alley, noon").
+    ///
+    /// The caller decides *when* this may be believed; see
+    /// `GlulxSession::status_line_room`. What it decides HERE is only whether the
+    /// segment could be a name at all — the same job [`StoryScan::line_rest_disqualifies`]
+    /// does for a bold run, and needed for the same reason. A status line is not
+    /// always a room: City of Secrets paints `" For instructions and information
+    /// type ABOUT and press return."` there, and FooFoo's single row is the bare
+    /// label `" Exits:"`. Neither is a noun phrase, so neither is a room.
+    pub(crate) fn status_room_name(&self) -> Option<String> {
+        let grid = self.grids.values().next()?;
+        // Row 0 from the CELLS rather than from `width`, so a status line painted
+        // before the window has been laid out still reads.
+        let last = grid.cells.range((0, 0)..(1, 0)).next_back().map(|(&(_, c), _)| c)?;
+        let row: String = (0..=last).map(|c| grid.cells.get(&(0, c)).map_or(' ', |cell| cell.0)).collect();
+        let segment = row.split("  ").map(str::trim).find(|s| !s.is_empty())?;
+        let name = segment.split(',').next().unwrap_or(segment).trim();
+        // A room name is a noun phrase. A sentence (it ends in stops) and a bare
+        // field label (it ends in a colon) are the two things a status line holds
+        // instead, and both are banners the map must not mint a room from.
+        let shaped = name.chars().any(char::is_alphanumeric) && !name.ends_with([':', '.', '!', '?']);
+        shaped.then(|| name.to_string())
+    }
+}
+
+impl StoryScan {
+    /// Feed one output run from this window into the room-heading detector.
     ///
     /// The Inform 7 room heading is a `Subheader` run printed on its OWN line, so
     /// a heading is a `Subheader` run that begins at line start (tracked by
@@ -599,6 +993,10 @@ impl AppGlk {
     /// [`Self::advance_heading_tail`] — that is the test THE BAT needs, whose
     /// title page and prologue each print two own-line `Subheader` banners before
     /// play begins (SQ-0732).
+    ///
+    /// And the candidate must own its LINE, not merely open it: see
+    /// [`Self::line_rest_disqualifies`], the test a game that bolds its object
+    /// names needs (SQ-1285).
     fn capture_heading(&mut self, style: GlkStyle, s: &str) {
         let is_sub = style == GlkStyle::Subheader;
         for ch in s.chars() {
@@ -613,6 +1011,36 @@ impl AppGlk {
             }
             if is_sub {
                 if self.at_line_start && !self.in_heading {
+                    // A `Subheader` run opening the line DIRECTLY BELOW a candidate
+                    // that is one character from confirmation would otherwise displace
+                    // it unsettled: `finalize_heading` overwrites `heading_pending`,
+                    // and SQ-1285's rule then rejects the newcomer and takes the real
+                    // heading with it. Counterfeit Monkey with HIGHLIGHT on prints
+                    // exactly that — "**Brown's Lab**" and then "**Professor Brown**,
+                    // the Reification of Abstracts researcher, is …" (SQ-1295).
+                    //
+                    // The verdict cannot be reached HERE, because it depends on what
+                    // the displacing line turns out to be: prose opened by a bolded
+                    // noun (so the candidate above it was a heading joined to its
+                    // description) or a line the newcomer owns outright (so the two
+                    // are stacked banners, THE BAT's title page — SQ-0732). So the
+                    // candidate is parked and settled once the newcomer's own line
+                    // has been judged; see `reject_heading` and `advance_heading_tail`.
+                    if self.heading_tail == HeadingTail::LineEnd {
+                        self.heading_displaced = self.heading_pending.take();
+                        self.heading_tail = HeadingTail::Idle;
+                        self.heading_tail_text.clear();
+                        self.heading_tail_prose = false;
+                        self.heading_line_rest.clear();
+                    }
+                    // SQ-1625: a fresh candidate starting supersedes whatever body text was
+                    // captured for whatever preceded it, the same way it is about to supersede
+                    // `heading_pending` — "the LAST heading in a turn wins" applies to the body
+                    // that follows it too. Always empty here in the `heading_displaced` case
+                    // above (that candidate never reached the body-capture states below), so this
+                    // is a safe no-op there.
+                    self.body_acc.clear();
+                    self.capturing_body = false;
                     self.in_heading = true; // a heading begins only at line start
                 }
                 if self.in_heading {
@@ -645,16 +1073,44 @@ impl AppGlk {
     /// [`Self::take_room_heading`] decides from there.
     fn advance_heading_tail(&mut self, ch: char) {
         match self.heading_tail {
-            HeadingTail::Idle => {}
+            // SQ-1625: once a joined body's very first character has flipped `capturing_body`
+            // on (in the `LineEnd` arm below), `confirm_heading` resets `heading_tail` back to
+            // `Idle` immediately — every character of the body AFTER that first one arrives
+            // here, not through `LineEnd`/`Detached` again, so this is where the rest of a
+            // joined body is actually collected.
+            HeadingTail::Idle => {
+                if self.capturing_body {
+                    self.body_acc.push(ch);
+                }
+            }
             HeadingTail::Line => {
                 if ch == '\n' {
-                    self.heading_tail = HeadingTail::LineEnd;
+                    if self.line_rest_disqualifies() {
+                        self.reject_heading();
+                    } else {
+                        // This candidate owns its own line, so anything it displaced
+                        // was a banner stacked above a banner rather than a heading
+                        // above its description (SQ-1295).
+                        self.heading_displaced = None;
+                        self.heading_tail = HeadingTail::LineEnd;
+                        // SQ-1653: the first own-line candidate a turn settles, whatever
+                        // becomes of it afterwards — see the field's own doc.
+                        if self.heading_seen_this_turn.is_none() {
+                            self.heading_seen_this_turn = self.heading_pending.clone();
+                        }
+                    }
+                } else if self.heading_line_rest.chars().count() < HEADING_LINE_REST_CAP {
+                    self.heading_line_rest.push(ch);
                 }
             }
             HeadingTail::LineEnd => {
                 if ch == '\n' {
                     self.heading_tail = HeadingTail::Detached;
                 } else {
+                    // SQ-1625: the heading and its description share one paragraph with no
+                    // blank line between them — this character is the description's first.
+                    self.capturing_body = true;
+                    self.body_acc.push(ch);
                     self.confirm_heading();
                 }
             }
@@ -664,11 +1120,17 @@ impl AppGlk {
                 } else {
                     self.heading_tail_prose = true;
                 }
+                // SQ-1625: unbounded, unlike `heading_tail_text` above — kept speculatively for
+                // every detached tail, even ones `take_room_heading` goes on to discard as a
+                // banner/cutscene page (which clears it there); classifying WHETHER this is
+                // prose is `heading_tail_text`'s job, not this field's.
+                self.capturing_body = true;
+                self.body_acc.push(ch);
             }
         }
     }
 
-    /// Keep the last [`PROMPT_TAIL_CAP`] chars of the primary window's output.
+    /// Keep the last [`PROMPT_TAIL_CAP`] chars of this window's output.
     fn note_prompt_tail(&mut self, s: &str) {
         self.prompt_tail.push_str(s);
         let n = self.prompt_tail.chars().count();
@@ -688,14 +1150,66 @@ impl AppGlk {
         crate::session::ends_with_read_prompt(&self.prompt_tail)
     }
 
+    /// Whether the roman text that followed the bold run on the candidate's OWN
+    /// line rules it out as a room heading.
+    ///
+    /// An Inform room heading owns its line: the name in bold, and at most the
+    /// library's roman parenthetical after it ("Kitchen (on the chair)"). A bold
+    /// run that opens a SENTENCE does not — and once a game bolds the names of
+    /// its objects, sentences that open with one are everywhere. Counterfeit
+    /// Monkey's HIGHLIGHT (`boldening`, an accessibility option the game
+    /// advertises) prints every object name in bold type, which Glk carries as
+    /// `Subheader` — the very style the heading is printed in. Its `get all`
+    /// listing then reads
+    ///
+    /// ```text
+    /// ale: We acquire the ale.
+    /// ear: We take the ear.
+    /// ```
+    ///
+    /// with `ale` and `ear` bold at line start, followed by the parser's command
+    /// prompt — which is exactly the shape [`Self::take_room_heading`] accepts,
+    /// so `get all` in the Midway minted a room called "ear" (SQ-1285). The same
+    /// bolding opens paragraphs elsewhere ("**The Aquarium Bookstore** is to the
+    /// east."), so the rule has to be about the LINE, not about that one listing.
+    ///
+    /// Anything but a word disqualifies nothing: trailing spaces, a lone full
+    /// stop, the library's `(on the chair)`. It is a WORD following the name on
+    /// its own line that says "this is a sentence, not a heading".
+    fn line_rest_disqualifies(&self) -> bool {
+        let rest = self.heading_line_rest.trim();
+        !rest.is_empty() && !rest.starts_with('(') && rest.chars().any(char::is_alphanumeric)
+    }
+
+    /// Throw the pending candidate away: it was never a room heading. Leaves any
+    /// heading already CONFIRMED this turn standing.
+    fn reject_heading(&mut self) {
+        // The rejected candidate opened a line of PROSE, which is exactly the thing
+        // that confirms a heading sitting above it — so a candidate it displaced was
+        // a room heading joined to its description after all (SQ-1295).
+        if let Some(displaced) = self.heading_displaced.take() {
+            self.last_heading = Some(displaced);
+        }
+        self.heading_pending = None;
+        self.heading_tail = HeadingTail::Idle;
+        self.heading_tail_text.clear();
+        self.heading_tail_prose = false;
+        self.heading_line_rest.clear();
+    }
+
     /// Accept the pending candidate as this turn's room heading.
     fn confirm_heading(&mut self) {
+        // A confirmed candidate supersedes whatever it displaced, and the parked one
+        // is not confirmed in its own right — see `reject_heading` for the case that
+        // promotes it (SQ-1295).
+        self.heading_displaced = None;
         if let Some(name) = self.heading_pending.take() {
             self.last_heading = Some(name);
         }
         self.heading_tail = HeadingTail::Idle;
         self.heading_tail_text.clear();
         self.heading_tail_prose = false;
+        self.heading_line_rest.clear();
     }
 
     /// Promote the accumulated `Subheader` text (if any, trimmed non-empty) to
@@ -708,6 +1222,7 @@ impl AppGlk {
             self.heading_tail = HeadingTail::Line;
             self.heading_tail_text.clear();
             self.heading_tail_prose = false;
+            self.heading_line_rest.clear();
         }
     }
 
@@ -735,28 +1250,107 @@ impl AppGlk {
     /// Adventure in `superbrief` prints "Inside Building", a blank line and then
     /// only its object list, while a room heading can perfectly well be followed
     /// by a cutscene that ends on a keypress.
-    pub fn take_room_heading(&mut self, awaiting_line_input: bool) -> Option<String> {
+    fn take_room_heading(&mut self, at_command_prompt: bool) -> Option<String> {
         if self.in_heading {
             self.finalize_heading(); // flush a heading with no trailing separator yet
             self.in_heading = false;
+        }
+        // A candidate whose own line never ended still has to answer for what
+        // shares that line with it — the turn simply stopped before the newline
+        // arrived (SQ-1285).
+        if self.heading_tail == HeadingTail::Line && self.line_rest_disqualifies() {
+            self.reject_heading();
         }
         // The read prompt the game printed on its way to asking for input is not
         // prose: in `superbrief` a room is the heading, a blank line and ">".
         let detached = self.heading_tail == HeadingTail::Detached
             && (self.heading_tail_prose
                 || !crate::session::strip_read_prompt(&self.heading_tail_text).trim().is_empty());
-        let at_command_prompt = awaiting_line_input && self.ends_at_read_prompt();
         if detached && !at_command_prompt {
             self.heading_pending = None;
             self.heading_tail = HeadingTail::Idle;
             self.heading_tail_text.clear();
             self.heading_tail_prose = false;
+            // SQ-1625: a banner/cutscene page, not a room — whatever body text was
+            // speculatively captured alongside it describes nothing.
+            self.body_acc.clear();
+            self.capturing_body = false;
+            self.last_description = None;
+        } else {
+            self.confirm_heading();
+            // SQ-1625: this turn's confirmed heading's body, if any followed it — the joined
+            // case's body may have started many characters (even many `capture_heading` calls)
+            // before this drain, growing through the `Idle` arm of `advance_heading_tail` the
+            // whole way; the detached case's body is exactly what was just classified as prose
+            // above. Either way, drained and reset here so it can never leak into next turn's
+            // drain. `strip_read_prompt` takes off the same trailing "\n>" the classification
+            // above already looks past (`superbrief`'s bare prompt) — the read prompt is the
+            // interpreter's own chrome, never room content.
+            let body = crate::session::strip_read_prompt(&self.body_acc).trim();
+            self.last_description = (!body.is_empty()).then(|| body.to_string());
+            self.body_acc.clear();
+            self.capturing_body = false;
+        }
+        // A parked candidate is per-turn evidence; it must never be promoted by a
+        // rejection that happens on some later turn (SQ-1295).
+        self.heading_displaced = None;
+        let result = self.last_heading.take();
+        // SQ-1653: record whether this turn's answer differs from the FIRST own-line
+        // candidate it saw — see `heading_seen_this_turn`'s own doc — for
+        // `Self::heading_is_a_later_distinct_entry` to read right after this call. Not
+        // acted on here: a game's opening turn legitimately stacks its OWN title banner
+        // (own-line, joined to a credits paragraph) above the real arrival room — *King
+        // of Shreds and Patches* is exactly this shape — so refusing the SECOND heading
+        // outright is only safe once the caller knows whether a room was already known.
+        let seen_first = self.heading_seen_this_turn.take();
+        self.heading_multi_this_turn =
+            matches!((&result, &seen_first), (Some(name), Some(first)) if name != first);
+        result
+    }
+
+    /// Return and clear the body text [`Self::take_room_heading`] resolved for THIS turn's
+    /// confirmed heading (SQ-1625) — `None` on a turn that confirmed no heading, or confirmed
+    /// one with nothing following it. Must be called AFTER `take_room_heading` for the same
+    /// turn (which is the only thing that ever sets it); [`AppGlk::take_room_description`] is
+    /// the one caller, right after `AppGlk::take_room_heading`.
+    fn take_room_description(&mut self) -> Option<String> {
+        self.last_description.take()
+    }
+
+    /// Return and clear whether the heading [`Self::take_room_heading`] just
+    /// returned differed from the FIRST own-line `Subheader` candidate this turn
+    /// saw (SQ-1653) — see `heading_multi_this_turn`'s own doc. Must be called
+    /// AFTER `take_room_heading`, on the same drain, exactly like
+    /// [`Self::take_room_description`].
+    fn heading_is_a_later_distinct_entry(&mut self) -> bool {
+        std::mem::take(&mut self.heading_multi_this_turn)
+    }
+
+    /// Reset what a `glk_window_clear` on this window invalidates: the cursor is
+    /// back at line start, any partial heading run was wiped with the text, and
+    /// the read prompt that stood there is gone. A heading already CONFIRMED
+    /// stands — the wiped window carried away the blank line that would have
+    /// judged a pending candidate, so settle it now.
+    fn on_clear(&mut self) {
+        self.at_line_start = true;
+        self.in_heading = false;
+        self.heading_acc.clear();
+        self.prompt_tail.clear();
+        // SQ-1625: whatever body text was captured before the clear is exactly what the wiped
+        // window just carried away with it — unlike the heading NAME just below (a short, stable
+        // fact `confirm_heading` may still promote here), there is no reliable "body" left to
+        // hand `take_room_description` once the screen it was printed on is gone.
+        self.body_acc.clear();
+        self.capturing_body = false;
+        if self.heading_tail == HeadingTail::Line && self.line_rest_disqualifies() {
+            self.reject_heading(); // a sentence, not a heading — settle it that way
         } else {
             self.confirm_heading();
         }
-        self.last_heading.take()
     }
+}
 
+impl AppGlk {
     /// Project the recorded Glk state onto the neutral [`ScreenModel`] by walking
     /// gvm's live window tree (`layout_tree`). Content is looked up by window id
     /// (unchanged); the tree's position-ordered children and border hints carry
@@ -765,9 +1359,11 @@ impl AppGlk {
         let (root, content_size) = match &self.layout_tree {
             None => (WinNode::Blank, (0u16, 0u16)),
             Some(tree) => {
-                // Root rect = gvm's snapped screen (incl. any border gutters); the
-                // composite clamps to it so no leaf absorbs the blank margin gvm
-                // leaves when it snaps proportional splits to whole cells (SQ-0303).
+                // Root rect = gvm's laid-out screen (incl. any border gutters).
+                // Since SQ-1220 that is the whole pane — a proportional split
+                // keeps its own undividable cell rather than the screen shrinking
+                // to avoid one — so the composite clamp below (SQ-0303) no longer
+                // has a margin to withhold, and is kept as the bound it always was.
                 let r = tree.rect();
                 let size = (r.width.min(u16::MAX as u32) as u16, r.height.min(u16::MAX as u32) as u16);
                 (self.convert_tree(tree), size)
@@ -828,16 +1424,39 @@ impl AppGlk {
                     })
                 }
                 WinType::Pair => unreachable!("pair windows are never tree leaves"),
+                _ => {
+                    let mut b = self.buffer_node(*id);
+                    b.bg = *bg;
+                    b.fg = *fg;
+                    WinNode::Buffer(b)
+                }
             },
-            WinTree::Pair { vertical, border, split, key_bg, key_fg, first, second, .. } => WinNode::Pair {
-                vertical: *vertical,
-                split: Split { fixed: *split as u16 },
-                border: *border,
-                key_bg: *key_bg,
-                key_fg: *key_fg,
-                first: Box::new(self.convert_tree(first)),
-                second: Box::new(self.convert_tree(second)),
-            },
+            WinTree::Pair { vertical, border, split, split_px, key_bg, key_fg, first, second, .. } => {
+                // `second`'s own resolved rect already carries gvm's real,
+                // independently-floored cell count for it (`layout_window` /
+                // `split_rect`) — read it here instead of letting a consumer
+                // compute "whatever's left" and swallow the split's withheld
+                // slack cell into it (SQ-1605). This is unconditional (even for
+                // a `winmethod_NoBorder` split, whose real geometry can still
+                // carry the same one-cell proportional remainder): `render_node`
+                // and `collect_graphics_rects` already force NO separator cell
+                // for a `border: false` pair regardless of theme, so
+                // `split_area_bordered`'s reclaim step (see its doc comment)
+                // always hands that pair's WHOLE gutter back to `second` —
+                // reproducing the borderless abut guarantee (SQ-0341) without
+                // this call site needing to special-case it.
+                let second_rect = second.rect();
+                let rest = Some((if *vertical { second_rect.height } else { second_rect.width }) as u16);
+                WinNode::Pair {
+                    vertical: *vertical,
+                    split: Split { fixed: *split as u16, fixed_px: *split_px, rest },
+                    border: *border,
+                    key_bg: *key_bg,
+                    key_fg: *key_fg,
+                    first: Box::new(self.convert_tree(first)),
+                    second: Box::new(self.convert_tree(second)),
+                }
+            }
         }
     }
 
@@ -854,6 +1473,7 @@ impl AppGlk {
             }
         }
         GridWindow {
+            win: id,
             fill: None, // v6-only erase fill (SQ-0584)
             cols,
             rows,
@@ -878,12 +1498,12 @@ impl AppGlk {
         if self.primary == Some(id) {
             // The primary buffer is mirrored by the app transcript; carry no
             // inline content (the renderer draws it via the transcript path).
-            return BufferWindow { primary: true, ..Default::default() };
+            return BufferWindow { win: id, primary: true, ..Default::default() };
         }
         let buf = self.buffers.get(&id);
         let (lines, runs, para, images) = buf.map(|b| log_to_lines(&b.log)).unwrap_or_default();
         let scroll = buf.map(|b| b.scroll).unwrap_or(0);
-        BufferWindow { lines, runs, para, images, scroll, primary: false, bg: None, fg: None, panel: false, px_runs: Vec::new(), reads_input: false }
+        BufferWindow { win: id, lines, runs, para, images, scroll, primary: false, bg: None, fg: None, panel: false, px_runs: Vec::new(), reads_input: false }
     }
 }
 
@@ -976,6 +1596,10 @@ impl GlkBackend for AppGlk {
         (self.cols, self.rows)
     }
 
+    fn borderless(&self) -> bool {
+        self.borderless
+    }
+
     fn window_open(&mut self, id: u32, wintype: WinType) {
         match wintype {
             WinType::TextGrid => {
@@ -989,12 +1613,14 @@ impl GlkBackend for AppGlk {
             }
             WinType::Pair => {}
             WinType::Graphics => {}
+            _ => {}
         }
     }
 
     fn window_close(&mut self, id: u32) {
         self.grids.remove(&id);
         self.buffers.remove(&id);
+        self.scans.remove(&id);
         self.graphics.remove(&id);
         self.layout.retain(|&(wid, _, _, _)| wid != id);
         if self.primary == Some(id) {
@@ -1011,18 +1637,29 @@ impl GlkBackend for AppGlk {
                 g.height = rect.height;
             }
         }
-        for &(id, ty, rect, _border) in wins {
-            if ty == WinType::Graphics {
-                let (cw, ch) = (rect.width * self.char_px.0, rect.height * self.char_px.1);
-                if let Some(c) = self.graphics.get_mut(&id) {
-                    c.resize(cw, ch);
-                }
-            }
-        }
+        // Graphics-canvas resizing moved to `window_tree` below (SQ-1565): it
+        // needs `layout_tree` (for `canvas_size`'s pixel-exact split), which
+        // isn't set until `window_tree` runs — always right after this, in
+        // `relayout_glk` — so resizing here would still read the PREVIOUS
+        // tree's split_px.
     }
 
     fn window_tree(&mut self, tree: Option<WinTree>) {
         self.layout_tree = tree;
+        // Resize any already-open graphics canvas to its freshly resolved
+        // footprint — pixel-exact on the split axis when gvm reports one
+        // (SQ-1565), cell-rounded otherwise (see `canvas_size`). Must run
+        // AFTER `layout_tree` is set just above, since `canvas_size` reads it.
+        // `Canvas::resize` is a cheap no-op when the size is unchanged, so
+        // this costs little on the frequent colour-only `sync_window_tree`
+        // re-push (no structural change → no size change).
+        let ids: Vec<u32> = self.graphics.keys().copied().collect();
+        for id in ids {
+            let (cw, ch) = self.canvas_size(id);
+            if let Some(c) = self.graphics.get_mut(&id) {
+                c.resize(cw, ch);
+            }
+        }
     }
 
     fn put_text(&mut self, win: u32, style: GlkStyle, s: &str) {
@@ -1030,10 +1667,12 @@ impl GlkBackend for AppGlk {
     }
 
     fn put_text_attr(&mut self, win: u32, style: GlkStyle, colour: StyleColour, attrs: StyleAttrs, link: u32, s: &str) {
-        if Some(win) == self.primary {
-            self.capture_heading(style, s);
-            self.note_prompt_tail(s);
-        }
+        // Every buffer is scanned, not just today's primary: the window a game
+        // prints its story into can become the primary only at the END of the
+        // turn it opened in (SQ-1241 — see `AppGlk::scans`).
+        let scan = self.scan(win);
+        scan.capture_heading(style, s);
+        scan.note_prompt_tail(s);
         let (bits, fg, bg) = resolve_glk_colour(style, colour, attrs);
         let para = resolve_glk_para(attrs);
         let buf = self.buffers.entry(win).or_default();
@@ -1068,21 +1707,14 @@ impl GlkBackend for AppGlk {
             let (w, h) = (c.img.width(), c.img.height());
             c.erase_rect(0, 0, w, h);
         }
-        // A cleared primary window puts the cursor back at line start, so a
-        // heading printed at the top of the fresh window is a valid line-start
-        // heading. Reset the detector; discard any partial heading run whose
-        // text was just wiped.
+        // A cleared window puts the cursor back at line start, so a heading
+        // printed at the top of the fresh window is a valid line-start heading.
+        // Reset that window's own scan (SQ-1241) — a window that is not primary
+        // today may be the story window tomorrow.
+        if let Some(scan) = self.scans.get_mut(&win) {
+            scan.on_clear();
+        }
         if Some(win) == self.primary {
-            self.at_line_start = true;
-            self.in_heading = false;
-            self.heading_acc.clear();
-            // The wiped window took its read prompt with it: the stream no longer
-            // ends at one, whatever stood there before the clear.
-            self.prompt_tail.clear();
-            // The wiped window carries away the blank line that would have judged
-            // a pending candidate, so settle it now: a heading already printed
-            // stands, exactly as it did before the candidate slot existed.
-            self.confirm_heading();
             // Signal the app to pin the upcoming reprint to a fresh screen
             // instead of appending a fresh copy (menu redraws). (SQ-0403)
             self.primary_cleared = true;
@@ -1103,7 +1735,13 @@ impl GlkBackend for AppGlk {
     }
 
     fn char_pixels(&self) -> (u32, u32) {
-        self.char_px
+        // SQ-1603: the ONE boundary where the fractional host-stated cell
+        // size is rounded — gvm's own layout math (`Glk::relayout`,
+        // `window_pixel_size`, and every game-visible pixel report such as
+        // `glk_window_get_size`) is integer, and stays that way; only
+        // `canvas_size` below reads `self.char_px` at full precision, and it
+        // rounds PER WINDOW rather than sharing this one pre-rounded value.
+        (self.char_px.0.round() as u32, self.char_px.1.round() as u32)
     }
 
     fn image_info(&mut self, resnum: u32) -> Option<(u32, u32)> {
@@ -1124,6 +1762,7 @@ impl GlkBackend for AppGlk {
             WinType::TextBuffer => 0,
             WinType::TextGrid => 1,
             WinType::Pair | WinType::Graphics => return None,
+            _ => return None,
         };
         self.theme_styles[row].get(style as usize).copied()
     }
@@ -1152,7 +1791,7 @@ impl GlkBackend for AppGlk {
             .set_background(color);
     }
 
-    fn graphics_draw_image(&mut self, win: u32, resnum: u32, x: i32, y: i32, scale: Option<(u32, u32)>) -> bool {
+    fn graphics_draw_image(&mut self, win: u32, resnum: u32, x: i32, y: i32, scale: Option<(u32, u32)>, link: u32) -> bool {
         // Buffer-window target: `x` is really the Glk imagealign flag; the image
         // flows inline with the window's text rather than onto a pixel canvas.
         if self.buffers.contains_key(&win) {
@@ -1160,7 +1799,8 @@ impl GlkBackend for AppGlk {
             let img = crate::inline_image::InlineImage {
                 pixels: std::sync::Arc::new(src.to_rgba8()),
                 align: crate::inline_image::ImageAlign::from_glk(x as u32),
-                scaled: scale, margin_px: None,
+                scaled: scale, margin_px: None, rule: None, link,
+                resource: Some(resnum),
             };
             if let Some(buf) = self.buffers.get_mut(&win) {
                 buf.log.push(BufElem::Image(img));
@@ -1174,6 +1814,47 @@ impl GlkBackend for AppGlk {
             .entry(win)
             .or_insert_with(|| crate::graphics::Canvas::new(cw, ch))
             .draw_image(&src, x, y, scale);
+        true
+    }
+
+    /// `glk_image_draw_scaled_ext` into a TEXT BUFFER window (Glk 0.7.6;
+    /// SQ-1424). gvm hands us the RULE rather than a size, and we store it on
+    /// the inline image untouched — `window_width_px` is gvm's own view of the
+    /// window and is deliberately *not* used to resolve anything here, because
+    /// the width that matters is the transcript band's, which
+    /// `InlineImage::fitted_cells` reads afresh on every layout.
+    ///
+    /// That is what makes the ratio standing rather than one-shot: resolving
+    /// now would freeze the picture at whatever width the game happened to draw
+    /// it at, and a later terminal resize could not recover the proportion.
+    fn buffer_draw_image_ext(
+        &mut self,
+        win: u32,
+        resnum: u32,
+        align: u32,
+        rule: gvm::glk::ImageRule,
+        _window_width_px: u32,
+        link: u32,
+    ) -> bool {
+        // Only a text-buffer window has an inline flow to put this in; gvm
+        // routes graphics windows through `graphics_draw_image` with a size
+        // already resolved, so anything else here is a window we cannot draw in.
+        if !self.buffers.contains_key(&win) {
+            return false;
+        }
+        let Some(src) = self.picts.image(resnum) else { return false };
+        let img = crate::inline_image::InlineImage {
+            pixels: std::sync::Arc::new(src.to_rgba8()),
+            align: crate::inline_image::ImageAlign::from_glk(align),
+            scaled: None,
+            margin_px: None,
+            rule: Some(rule),
+            link,
+            resource: Some(resnum),
+        };
+        if let Some(buf) = self.buffers.get_mut(&win) {
+            buf.log.push(BufElem::Image(img));
+        }
         true
     }
 
@@ -1254,7 +1935,7 @@ impl GlkBackend for AppGlk {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-session"))]
 mod tests {
     use super::*;
 
@@ -1285,14 +1966,59 @@ mod tests {
     /// child's row count.
     fn vpair(split: u32, first: WinTree, second: WinTree) -> WinTree {
         let rect = union(first.rect(), second.rect());
-        WinTree::Pair { vertical: true, border: false, split, rect, key_bg: None, key_fg: None, first: Box::new(first), second: Box::new(second) }
+        WinTree::Pair {
+            vertical: true, border: false, split, split_px: None, rect,
+            key_bg: None, key_fg: None, first: Box::new(first), second: Box::new(second),
+        }
     }
 
     /// Test helper: a Left/Right (horizontal) pair; `split` = the first (left)
     /// child's column count.
     fn hpair(split: u32, first: WinTree, second: WinTree) -> WinTree {
         let rect = union(first.rect(), second.rect());
-        WinTree::Pair { vertical: false, border: false, split, rect, key_bg: None, key_fg: None, first: Box::new(first), second: Box::new(second) }
+        WinTree::Pair {
+            vertical: false, border: false, split, split_px: None, rect,
+            key_bg: None, key_fg: None, first: Box::new(first), second: Box::new(second),
+        }
+    }
+
+    /// Test helper: an Above/Below pair carrying gvm's pixel-exact split
+    /// footprint alongside the cell one (SQ-1565) — for the graphics-canvas
+    /// pixel-sizing tests, where `vpair` above (always `split_px: None`)
+    /// can't express the fact under test.
+    fn vpair_px(split: u32, split_px: Option<u32>, first: WinTree, second: WinTree) -> WinTree {
+        let rect = union(first.rect(), second.rect());
+        WinTree::Pair {
+            vertical: true, border: false, split, split_px, rect,
+            key_bg: None, key_fg: None, first: Box::new(first), second: Box::new(second),
+        }
+    }
+
+    /// SQ-1515: `gvm::Machine::restore_state` tells `AppGlk` every OLD window
+    /// closed, then every NEW window opened in ascending (= original
+    /// open-time) id order. `primary` is set to the first `TextBuffer`
+    /// `window_open` is told about (see [`GlkBackend::window_open`]), so this
+    /// checks that sequence actually derives the RESTORED run's own primary
+    /// buffer rather than leaving the OLD one (now-closed) or landing on
+    /// whichever window happens to reopen first.
+    #[test]
+    fn primary_follows_the_restored_runs_first_text_buffer() {
+        let mut glk = AppGlk::new(80, 24);
+        // This session's own pre-restore windows: buffer 4 (primary), grid 6.
+        glk.window_open(4, WinType::TextBuffer);
+        glk.window_open(6, WinType::TextGrid);
+        assert_eq!(glk.primary(), Some(4));
+
+        // The archive's windows land on higher, unrelated ids (a long play
+        // session's window-id counter never resets and never reuses a freed
+        // slot) — buffer 81 opened before grid 83, exactly as gvm's restore
+        // notifies in ascending id order.
+        glk.window_close(4);
+        glk.window_close(6);
+        assert_eq!(glk.primary(), None, "the old primary must not survive its window closing");
+        glk.window_open(81, WinType::TextBuffer);
+        glk.window_open(83, WinType::TextGrid);
+        assert_eq!(glk.primary(), Some(81), "primary follows the archive's own first text buffer");
     }
 
     #[test]
@@ -1435,6 +2161,7 @@ mod tests {
             pixels: std::sync::Arc::new(image::RgbaImage::new(3, 3)),
             align: crate::inline_image::ImageAlign::InlineUp,
             scaled: None, margin_px: None,
+            rule: None, link: 0, resource: None,
         };
         let log = &mut glk.buffers.get_mut(&2).unwrap().log;
         log.push(BufElem::Text { bits: 0, fg: 0, bg: 0, link: 0, para: crate::state::ParaFmt::default(), glk_style: 0, text: "a\n".into() });
@@ -1819,7 +2546,7 @@ mod tests {
 
     #[test]
     fn appglk_graphics_fill_composites_into_canvas() {
-        let mut g = AppGlk::with_graphics(80, 24, (2, 2), crate::graphics::PictSource::new(None));
+        let mut g = AppGlk::with_graphics(80, 24, (2.0, 2.0), crate::graphics::PictSource::new(None));
         // Simulate a laid-out graphics window id=1 occupying 4x4 cells → 8x8 px.
         g.window_open(1, gvm::glk::WinType::Graphics);
         g.window_layout(&[(1, gvm::glk::WinType::Graphics, gvm::glk::Rect { left: 0, top: 0, width: 4, height: 4 }, Some(true))]);
@@ -1829,9 +2556,107 @@ mod tests {
         assert_eq!(canvas.img.get_pixel(0, 0).0, [0xFF, 0, 0, 0xFF]);
     }
 
+    // SQ-1565: a fixed-pixel graphics split (Kerkerkruip's 2-3px coloured
+    // title rules, drawn ABOVE the panel text) reserves a whole 16px cell row
+    // for LAYOUT, but the canvas the game actually draws into must be sized
+    // to the exact pixels it asked for — otherwise the rule's own paint runs
+    // (2px tall) land in a 16px-tall buffer whose other 14 rows are whatever
+    // the canvas's initial fill happens to be, reading as a solid block.
+    #[test]
+    fn appglk_graphics_canvas_uses_pixel_exact_split_height() {
+        let mut g = AppGlk::with_graphics(30, 24, (8.0, 16.0), crate::graphics::PictSource::new(None));
+        g.window_open(1, gvm::glk::WinType::Graphics);
+        g.window_open(2, gvm::glk::WinType::TextBuffer);
+        // Cell-rounded footprint: a 2px rule still reserves one whole 16px row.
+        g.window_layout(&[
+            (1, gvm::glk::WinType::Graphics, gvm::glk::Rect { left: 0, top: 0, width: 30, height: 1 }, Some(true)),
+            (2, gvm::glk::WinType::TextBuffer, gvm::glk::Rect { left: 0, top: 1, width: 30, height: 23 }, Some(true)),
+        ]);
+        // gvm's tree carries the pixel-exact 2px fact alongside it.
+        g.window_tree(Some(vpair_px(
+            1,
+            Some(2),
+            leaf(1, WinType::Graphics, rect(0, 0, 30, 1)),
+            leaf(2, WinType::TextBuffer, rect(0, 1, 30, 23)),
+        )));
+        g.graphics_fill_rect(1, 0x00FF_0000, 0, 0, 240, 2);
+        let canvas = g.graphics.get(&1).unwrap();
+        assert_eq!(
+            canvas.img.dimensions(),
+            (240, 2),
+            "canvas height must be the exact 2px the game asked for, not the cell-rounded 16px row"
+        );
+    }
+
+    /// The same fact reaches the render-neutral `WinNode` tree too
+    /// (`Split::fixed_px`, SQ-1565) — a pixel-aware host reading `screen_model`
+    /// sees it without needing gvm's own `WinTree`. The cell-rounded `fixed`
+    /// stays exactly as before: the TUI's own layout is unaffected.
+    #[test]
+    fn screen_model_split_carries_pixel_exact_footprint() {
+        let mut g = AppGlk::with_graphics(30, 24, (8.0, 16.0), crate::graphics::PictSource::new(None));
+        g.window_open(1, gvm::glk::WinType::Graphics);
+        g.window_open(2, gvm::glk::WinType::TextBuffer);
+        g.window_layout(&[
+            (1, gvm::glk::WinType::Graphics, gvm::glk::Rect { left: 0, top: 0, width: 30, height: 1 }, Some(true)),
+            (2, gvm::glk::WinType::TextBuffer, gvm::glk::Rect { left: 0, top: 1, width: 30, height: 23 }, Some(true)),
+        ]);
+        g.window_tree(Some(vpair_px(
+            1,
+            Some(2),
+            leaf(1, WinType::Graphics, rect(0, 0, 30, 1)),
+            leaf(2, WinType::TextBuffer, rect(0, 1, 30, 23)),
+        )));
+        let model = g.screen_model();
+        match model.root {
+            crate::engine::WinNode::Pair { split, .. } => {
+                assert_eq!(split.fixed, 1, "the cell-based layout figure is unchanged");
+                assert_eq!(split.fixed_px, Some(2), "Split also carries the pixel-exact figure");
+            }
+            other => panic!("expected a pair root, got {other:?}"),
+        }
+    }
+
+    /// SQ-1605: `second`'s own real cell count — gvm's independently-floored
+    /// fact, read straight off its own `WinTree` rect — reaches `Split::rest`,
+    /// not "whatever's left of the pair's own (union) rect". Content 78
+    /// (extent 80, border 1) at a 50/50 split floors both halves to 39 apiece,
+    /// one cell short of the content (gvm's documented at-most-one-cell
+    /// remainder, see `layout_window`'s doc comment): `first` sits at columns
+    /// 0..39, `second` at 41..80, leaving columns 39 (border) and 40 (slack)
+    /// unclaimed — exactly gvm's own `split_rect` anchoring.
+    #[test]
+    fn screen_model_split_carries_second_childs_true_cell_count() {
+        let mut g = AppGlk::new(80, 24);
+        g.window_open(1, WinType::TextBuffer);
+        g.window_open(2, WinType::TextBuffer);
+        g.window_layout(&[
+            (1, WinType::TextBuffer, rect(0, 0, 39, 24), Some(true)),
+            (2, WinType::TextBuffer, rect(41, 0, 39, 24), Some(true)),
+        ]);
+        g.window_tree(Some(hpair(
+            39,
+            leaf(1, WinType::TextBuffer, rect(0, 0, 39, 24)),
+            leaf(2, WinType::TextBuffer, rect(41, 0, 39, 24)),
+        )));
+        let model = g.screen_model();
+        match model.root {
+            crate::engine::WinNode::Pair { split, .. } => {
+                assert_eq!(split.fixed, 39, "the first child's cell count is unchanged");
+                assert_eq!(split.rest, Some(39), "the second child's own true cell count reaches Split::rest");
+                // The buggy computation this fixes: the pair's own (union) rect
+                // spans columns 0..80, so "extent minus fixed minus a 1-cell
+                // border" gives 40 — one cell too many, the slack this bug drew
+                // into `second`.
+                assert_ne!(split.rest, Some(40), "must not fall back to area-minus-fixed-minus-border");
+            }
+            other => panic!("expected a pair root, got {other:?}"),
+        }
+    }
+
     #[test]
     fn screen_model_emits_graphics_leaf() {
-        let mut g = AppGlk::with_graphics(80, 24, (1, 1), crate::graphics::PictSource::new(None));
+        let mut g = AppGlk::with_graphics(80, 24, (1.0, 1.0), crate::graphics::PictSource::new(None));
         g.window_open(1, gvm::glk::WinType::Graphics);
         g.window_layout(&[(1, gvm::glk::WinType::Graphics, gvm::glk::Rect { left: 0, top: 0, width: 10, height: 4 }, Some(true))]);
         g.window_tree(Some(leaf(1, WinType::Graphics, rect(0, 0, 10, 4))));
@@ -1856,7 +2681,7 @@ mod tests {
     #[test]
     fn screen_model_survives_zero_area_window() {
         use gvm::glk::{Rect, WinType};
-        let mut g = AppGlk::with_graphics(80, 24, (9, 19), crate::graphics::PictSource::new(None));
+        let mut g = AppGlk::with_graphics(80, 24, (9.0, 19.0), crate::graphics::PictSource::new(None));
         g.window_open(1, WinType::TextBuffer);
         g.window_open(2, WinType::TextGrid);
         g.window_open(4, WinType::Graphics);
@@ -1918,7 +2743,7 @@ mod tests {
         let mut glk = AppGlk::new(80, 24);
         glk.window_open(1, WinType::TextBuffer); // primary buffer
         glk.put_text(1, GlkStyle::Normal, "before\n");
-        glk.graphics_draw_image(1, /*resnum*/ 0, /*imagealign*/ 1, 0, None);
+        glk.graphics_draw_image(1, /*resnum*/ 0, /*imagealign*/ 1, 0, None, 0);
         glk.put_text(1, GlkStyle::Normal, "after");
         let elems = glk.take_transcript_elems();
         let kinds: Vec<&str> = elems
@@ -1947,6 +2772,7 @@ mod tests {
             pixels: std::sync::Arc::new(image::RgbaImage::new(3, 3)),
             align: crate::inline_image::ImageAlign::InlineUp,
             scaled: None, margin_px: None,
+            rule: None, link: 0, resource: None,
         };
         let log = &mut glk.buffers.get_mut(&pid).unwrap().log;
         log.push(BufElem::Text { bits: 0, fg: 0, bg: 0, link: 0, para: crate::state::ParaFmt::default(), glk_style: 0, text: "foo".into() });
@@ -1979,7 +2805,7 @@ mod tests {
         // a Canvas via the existing graphics path.
         let mut glk = AppGlk::new(80, 24);
         glk.window_open(5, WinType::Graphics);
-        glk.graphics_draw_image(5, 0, 10, 10, None);
+        glk.graphics_draw_image(5, 0, 10, 10, None, 0);
         // No primary buffer is open → elems empty.
         assert!(glk.take_transcript_elems().is_empty());
     }
@@ -2000,10 +2826,10 @@ mod tests {
         // so the backend must report false rather than always claiming success.
         let mut glk = AppGlk::new(80, 24);
         glk.window_open(1, WinType::TextBuffer);
-        assert!(!glk.graphics_draw_image(1, 0, 1, 0, None), "buffer window, missing image");
+        assert!(!glk.graphics_draw_image(1, 0, 1, 0, None, 0), "buffer window, missing image");
 
         glk.window_open(5, WinType::Graphics);
-        assert!(!glk.graphics_draw_image(5, 0, 10, 10, None), "graphics window, missing image");
+        assert!(!glk.graphics_draw_image(5, 0, 10, 10, None, 0), "graphics window, missing image");
     }
 
     #[test]
@@ -2011,14 +2837,55 @@ mod tests {
         // A resnum backed by a real, decodable Pict in the Blorb must report
         // true on both the buffer-window and graphics-window draw paths.
         let blorb = crate::graphics::test_blorb_with_pict(1, &png_bytes());
-        let mut glk = AppGlk::with_graphics(80, 24, (1, 1), crate::graphics::PictSource::new(Some(blorb)));
+        let mut glk = AppGlk::with_graphics(80, 24, (1.0, 1.0), crate::graphics::PictSource::new(Some(blorb)));
         glk.window_open(1, WinType::TextBuffer);
-        assert!(glk.graphics_draw_image(1, /*resnum*/ 1, /*imagealign*/ 1, 0, None), "buffer window, resolvable image");
+        assert!(glk.graphics_draw_image(1, /*resnum*/ 1, /*imagealign*/ 1, 0, None, 0), "buffer window, resolvable image");
 
         let blorb2 = crate::graphics::test_blorb_with_pict(1, &png_bytes());
-        let mut glk2 = AppGlk::with_graphics(80, 24, (1, 1), crate::graphics::PictSource::new(Some(blorb2)));
+        let mut glk2 = AppGlk::with_graphics(80, 24, (1.0, 1.0), crate::graphics::PictSource::new(Some(blorb2)));
         glk2.window_open(5, WinType::Graphics);
-        assert!(glk2.graphics_draw_image(5, /*resnum*/ 1, 10, 10, None), "graphics window, resolvable image");
+        assert!(glk2.graphics_draw_image(5, /*resnum*/ 1, 10, 10, None, 0), "graphics window, resolvable image");
+    }
+
+    /// SQ-1503: a picture drawn into a TEXT BUFFER window with a nonzero
+    /// `link` must carry it on the `InlineImage` it pushes — the field that
+    /// lets a later render pass make the clicked-on picture deliver a
+    /// hyperlink event, exactly like linked text. A graphics-window draw has
+    /// no such destination (a canvas isn't a stream), so its `link` argument
+    /// is simply unused there — asserted by `image_draw_to_graphics_window_still_hits_canvas`
+    /// above continuing to pass with link 0.
+    #[test]
+    fn image_draw_to_buffer_window_carries_its_link() {
+        let blorb = crate::graphics::test_blorb_with_pict(1, &png_bytes());
+        let mut glk = AppGlk::with_graphics(80, 24, (1.0, 1.0), crate::graphics::PictSource::new(Some(blorb)));
+        glk.window_open(1, WinType::TextBuffer);
+        assert!(
+            glk.graphics_draw_image(1, /*resnum*/ 1, /*imagealign*/ 1, 0, None, /*link*/ 77),
+            "buffer window, resolvable image"
+        );
+        let log = &glk.buffers.get(&1).unwrap().log;
+        let img = log.iter().find_map(|e| match e {
+            BufElem::Image(img) => Some(img),
+            _ => None,
+        });
+        assert_eq!(img.map(|i| i.link), Some(77), "the drawn image carries the link it was drawn under");
+    }
+
+    /// SQ-1561: a buffer-window draw's `InlineImage` carries the Blorb `Pict`
+    /// resource number it was decoded from, so an embedding host can serve the
+    /// story's own PNG/JPEG chunk by number instead of re-encoding `pixels`.
+    #[test]
+    fn image_draw_to_buffer_window_carries_its_resource_number() {
+        let blorb = crate::graphics::test_blorb_with_pict(5, &png_bytes());
+        let mut glk = AppGlk::with_graphics(80, 24, (1.0, 1.0), crate::graphics::PictSource::new(Some(blorb)));
+        glk.window_open(1, WinType::TextBuffer);
+        assert!(glk.graphics_draw_image(1, /*resnum*/ 5, /*imagealign*/ 1, 0, None, 0));
+        let log = &glk.buffers.get(&1).unwrap().log;
+        let img = log.iter().find_map(|e| match e {
+            BufElem::Image(img) => Some(img),
+            _ => None,
+        });
+        assert_eq!(img.map(|i| i.resource), Some(Some(5)), "the drawn image carries the resnum it was decoded from");
     }
 
     #[test]
@@ -2126,7 +2993,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-session"))]
 mod heading_tests {
     use super::*;
     use gvm::glk::{GlkBackend, GlkStyle, Rect as GlkRect, WinType};
@@ -2155,10 +3022,15 @@ mod heading_tests {
 
     #[test]
     fn last_subheader_wins_over_banner_title() {
+        // The heading ends its own line — Inform's room description heading rule is
+        // `[bold type][printed name][roman type]` and the body text follows a paragraph
+        // break, so the description never shares the line. The fixture used to run the
+        // two together, which made it indistinguishable from the banner above it once
+        // `line_rest_disqualifies` existed to tell them apart (SQ-1285).
         let mut b = primary_backend();
         put(&mut b, GlkStyle::Subheader, "Coloratura");
         put(&mut b, GlkStyle::Normal, " by lynnea glasser\n");
-        put(&mut b, GlkStyle::Subheader, "Inside the Cellarium");
+        put(&mut b, GlkStyle::Subheader, "Inside the Cellarium\n");
         put(&mut b, GlkStyle::Normal, "A white structure.\n");
         assert_eq!(b.take_room_heading(true).as_deref(), Some("Inside the Cellarium"));
     }
@@ -2287,6 +3159,90 @@ mod heading_tests {
         assert_eq!(b.take_room_heading(true).as_deref(), Some("Railway Platform"));
     }
 
+    // ── SQ-1625: the description text joined to a confirmed heading ──────────
+
+    /// The joined case (no blank line): the body may run to many characters, well past
+    /// [`HEADING_TAIL_CAP`]'s 32 — unlike the classification-only `heading_tail_text`, the full
+    /// body is kept. Must be called AFTER `take_room_heading`, on the same drain.
+    #[test]
+    fn a_heading_joined_to_its_description_captures_the_whole_body() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Master's Bedroom\n");
+        put(&mut b, GlkStyle::Normal,
+            "To the west, you could enter the upstairs corridor. A four-poster bed dominates \
+             the room, and moonlight streams in through a tall window overlooking the garden.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Master's Bedroom"));
+        let desc = b.take_room_description();
+        assert_eq!(
+            desc.as_deref(),
+            Some(
+                "To the west, you could enter the upstairs corridor. A four-poster bed dominates \
+                 the room, and moonlight streams in through a tall window overlooking the garden."
+            )
+        );
+    }
+
+    /// The detached case (a blank line, then prose, then the command prompt): the prose between
+    /// the blank line and the prompt is the description, with the prompt itself excluded.
+    #[test]
+    fn a_detached_heading_at_the_command_prompt_captures_its_description() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Railway Platform");
+        put(&mut b, GlkStyle::Normal, "\n\nYou stand on a platform. There is a wooden bench, ");
+        put(&mut b, GlkStyle::Normal, "a storage locker, and a vending machine.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Railway Platform"));
+        assert_eq!(
+            b.take_room_description().as_deref(),
+            Some("You stand on a platform. There is a wooden bench, a storage locker, and a vending machine.")
+        );
+    }
+
+    /// A banner on a keypress page is not a room at all (SQ-0732) — falsified by the discard
+    /// branch alone: revert it to always fall into the confirm branch and this fails by
+    /// returning `Some` instead of `None`.
+    #[test]
+    fn a_rejected_banner_captures_no_description() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Prologue • ACT I • Interlude • Epilogue");
+        put(&mut b, GlkStyle::Normal, " \n\n[Please press any key to continue.]\n");
+        assert_eq!(b.take_room_heading(false), None);
+        assert_eq!(b.take_room_description(), None, "no room means no description either");
+    }
+
+    /// A confirmed heading with nothing at all following it (a superbrief empty room: heading,
+    /// blank line, bare prompt) has no description — an empty body is `None`, not `Some("")`.
+    #[test]
+    fn a_heading_with_nothing_following_it_has_no_description() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "At End Of Road\n");
+        put(&mut b, GlkStyle::Normal, "\n>");
+        assert_eq!(b.take_room_heading(false).as_deref(), Some("At End Of Road"));
+        assert_eq!(b.take_room_description(), None);
+    }
+
+    /// SQ-1625: the map keeps only the MOST RECENT description — a second turn's capture (a LOOK
+    /// after the room changed, or simply the next arrival) must replace the first, never
+    /// accumulate alongside it. Exercises `capturing_body`/`body_acc` actually resetting on drain.
+    #[test]
+    fn a_second_turns_description_replaces_the_first_not_accumulates() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Kitchen\n");
+        put(&mut b, GlkStyle::Normal, "A dark kitchen. You smell gas.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Kitchen"));
+        assert_eq!(b.take_room_description().as_deref(), Some("A dark kitchen. You smell gas."));
+
+        // Next turn: a LOOK re-prints the SAME room with different text (the lamp is now lit).
+        put(&mut b, GlkStyle::Subheader, "Kitchen\n");
+        put(&mut b, GlkStyle::Normal, "A well-lit kitchen. There is a lamp here.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Kitchen"));
+        let desc = b.take_room_description();
+        assert_eq!(desc.as_deref(), Some("A well-lit kitchen. There is a lamp here."));
+        assert!(
+            !desc.unwrap().contains("dark kitchen"),
+            "the previous turn's text must not survive alongside the new one"
+        );
+    }
+
     #[test]
     fn a_cleared_window_carries_its_read_prompt_away() {
         // A prompt printed before a `glk_window_clear` is no longer on screen, so it
@@ -2312,6 +3268,279 @@ mod heading_tests {
     }
 
     #[test]
+    fn a_bolded_object_name_opening_a_take_listing_is_not_a_room() {
+        // SQ-1285. Counterfeit Monkey's HIGHLIGHT option (`boldening`) prints every
+        // object name in bold type, which Glk carries as `Subheader`. Its `get all`
+        // listing therefore opens each line with a bold noun, and the turn ends at the
+        // parser's own command prompt — everything the old rule asked for. The room the
+        // player is standing in is the Midway; "ear" is a severed ear in their hands.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "ale");
+        put(&mut b, GlkStyle::Normal, ": We acquire the ");
+        put(&mut b, GlkStyle::Subheader, "ale");
+        put(&mut b, GlkStyle::Normal, ".\n");
+        put(&mut b, GlkStyle::Subheader, "ear");
+        put(&mut b, GlkStyle::Normal, ": We take the ");
+        put(&mut b, GlkStyle::Subheader, "ear");
+        put(&mut b, GlkStyle::Normal, ".\n\n>");
+        assert_eq!(b.take_room_heading(true), None);
+    }
+
+    #[test]
+    fn a_bolded_object_name_opening_a_paragraph_is_not_a_room() {
+        // The same bolding opens ordinary prose all over that game — an initial
+        // appearance is a paragraph, so its first word sits at line start too.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "The Aquarium Bookstore");
+        put(&mut b, GlkStyle::Normal, " is to the east. It's dim inside.\n\n>");
+        assert_eq!(b.take_room_heading(true), None);
+    }
+
+    #[test]
+    fn a_heading_keeps_its_roman_parenthetical() {
+        // What may share the heading's line: the library's "(on the chair)", printed in
+        // roman after the bold name. That is still a room.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Studio Apartment");
+        put(&mut b, GlkStyle::Normal, " (on the bed)\n");
+        put(&mut b, GlkStyle::Normal, "You climb out of bed.\n");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Studio Apartment"));
+    }
+
+    #[test]
+    fn a_room_bolded_by_the_same_option_still_reads_as_a_room() {
+        // Non-vacuity for the two rejections above: with HIGHLIGHT on, Counterfeit
+        // Monkey's own room description bolds every noun in it, and only the heading
+        // owns its line. The room must still be found.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Midway\n");
+        put(&mut b, GlkStyle::Normal, "Here in front of the ");
+        put(&mut b, GlkStyle::Subheader, "pharmacy");
+        put(&mut b, GlkStyle::Normal, ", various contests have been set up.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Midway"));
+    }
+
+    #[test]
+    fn an_earlier_room_survives_a_sentence_that_opens_with_a_bolded_name() {
+        // Rejecting a candidate must not take the heading already confirmed this turn
+        // with it: the walk into the room comes first, its bolded description after.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Midway\n");
+        put(&mut b, GlkStyle::Normal, "Contests have been set up.\n\n");
+        put(&mut b, GlkStyle::Subheader, "The barker");
+        put(&mut b, GlkStyle::Normal, " is holding a tube.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Midway"));
+    }
+
+    #[test]
+    fn a_bolded_name_on_the_line_below_does_not_take_the_heading_with_it() {
+        // SQ-1295. The case above has a blank line between the heading and the bolded
+        // sentence, so the heading is confirmed by the description before the sentence
+        // is even seen. Counterfeit Monkey's Brown's Lab has NO such line: the NPC's
+        // bolded name is the first thing on the line directly below the heading.
+        //
+        // That candidate was one character from confirmation, and the character that
+        // arrived opened a new `Subheader` run — which used to start a fresh heading
+        // run, leaving "Brown's Lab" to be overwritten by `finalize_heading` and then
+        // thrown away with "Professor Brown" when `line_rest_disqualifies` rejected it.
+        // The turn reported NO room at all, which cost the map the room's name and, one
+        // layer up, the Glulx room lock (see `app::glulx_roomlock`).
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Brown's Lab\n");
+        put(&mut b, GlkStyle::Subheader, "Professor Brown");
+        put(&mut b, GlkStyle::Normal, ", the Reification of Abstracts researcher, is hunched over his work table.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Brown's Lab"));
+    }
+
+    // ── SQ-1653: a second, distinct own-line heading in one turn ─────────────
+
+    #[test]
+    fn a_page_title_over_a_list_entry_flags_a_later_distinct_entry() {
+        // Superluminal Vagrant Twin's `map`: a page title ("VISITED WORLDS", detached
+        // by a blank line) stacked over a list entry ("Other Worlds", joined
+        // immediately to its one-line status) — styled and shaped identically to a
+        // real room heading joined to its description. `capture_heading` has no way
+        // to tell the two apart on its own (that is the whole of this quest); the
+        // heading it returns is unchanged (still "Other Worlds", "the last heading in
+        // a turn wins"), but the flag says a caller with more context (whether a room
+        // is already known) should weigh refusing it.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "VISITED WORLDS\n");
+        put(&mut b, GlkStyle::Normal, "\n");
+        put(&mut b, GlkStyle::Subheader, "Other Worlds\n");
+        put(&mut b, GlkStyle::Normal, "Boony (not yet landed)\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Other Worlds"));
+        assert!(b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn stacked_joined_records_flag_a_later_distinct_entry() {
+        // Superluminal's `prospects`: two records, EACH joined immediately to its own
+        // one-line body ("Known Merchants:\n-None", then "Other Opportunities:\n-None
+        // known") — unlike the case above, the FIRST one here is fully confirmed
+        // (`confirm_heading`) before the second overwrites it; the flag catches this
+        // shape too, not just the detached-then-overwritten one.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Known Merchants:\n");
+        put(&mut b, GlkStyle::Normal, "-None\n");
+        put(&mut b, GlkStyle::Normal, "\n");
+        put(&mut b, GlkStyle::Subheader, "Other Opportunities:\n");
+        put(&mut b, GlkStyle::Normal, "-None known");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Other Opportunities:"));
+        assert!(b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn an_ordinary_single_heading_turn_does_not_flag_a_later_distinct_entry() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Orbiting Boony"));
+        assert!(!b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn the_same_heading_printed_twice_in_one_turn_does_not_flag_a_later_distinct_entry() {
+        // A boot banner and an echoed LOOK can both print the SAME room's heading
+        // within one turn (Superluminal's own opening does this) — repeating a name is
+        // not a second, DISTINCT entry.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n");
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Orbiting Boony"));
+        assert!(!b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn a_flag_from_one_turn_never_leaks_into_the_next() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "VISITED WORLDS\n");
+        put(&mut b, GlkStyle::Normal, "\n");
+        put(&mut b, GlkStyle::Subheader, "Other Worlds\n");
+        put(&mut b, GlkStyle::Normal, "Boony (not yet landed)\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Other Worlds"));
+        assert!(b.heading_is_a_later_distinct_entry(), "the drain that saw it");
+
+        // The turn ended at a bare ">" with no trailing newline — a real command line
+        // resets `at_line_start` for what the player types next (SQ-1639); without it
+        // the next heading would begin "mid-line" by a stale reckoning.
+        b.begin_command_line();
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Orbiting Boony"));
+        assert!(!b.heading_is_a_later_distinct_entry(), "an ordinary turn right after it");
+    }
+
+    /// A single-leaf `WinTree` for this module (the other test module has its own).
+    fn win_leaf(id: u32, wintype: WinType, width: u32, height: u32) -> WinTree {
+        WinTree::Leaf {
+            id,
+            wintype,
+            rect: GlkRect { left: 0, top: 0, width, height },
+            bg: None,
+            fg: None,
+            reverse: false,
+        }
+    }
+
+    /// Every character the grid windows of `b`'s screen model hold, row by row.
+    fn grid_text(b: &AppGlk) -> String {
+        fn walk(n: &crate::engine::WinNode, out: &mut String) {
+            match n {
+                crate::engine::WinNode::Pair { first, second, .. } => {
+                    walk(first, out);
+                    walk(second, out);
+                }
+                crate::engine::WinNode::Grid(g) => {
+                    for row in 1..=g.rows {
+                        for col in 1..=g.cols {
+                            out.push(g.cell(row, col).ch);
+                        }
+                        out.push('\n');
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        walk(&b.screen_model().root, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_display_snapshot_puts_back_what_a_silent_question_wrote() {
+        // SQ-1293. `GlulxSession::silent_look` types a command nobody asked for and
+        // restores the VM afterwards — but the VM is only half the game's state. The
+        // backend keeps what every window CONTAINS and the app renders from that, so
+        // the question has to be undone here too. Every assertion below names one
+        // thing a VM-only restore leaves behind.
+        let mut b = primary_backend();
+        b.window_open(2, WinType::TextGrid);
+        let two_windows = [
+            (2, WinType::TextGrid, GlkRect { left: 0, top: 0, width: 80, height: 1 }, Some(true)),
+            (1, WinType::TextBuffer, GlkRect { left: 0, top: 1, width: 80, height: 23 }, Some(true)),
+        ];
+        b.window_layout(&two_windows);
+        b.window_tree(Some(win_leaf(2, WinType::TextGrid, 80, 1)));
+        b.grid_put(2, 0, 0, GlkStyle::Normal, "Maze                Score: 0");
+        put(&mut b, GlkStyle::Subheader, "Maze\n");
+        put(&mut b, GlkStyle::Normal, "You are in a maze.\n\n>");
+        // The real turn drains its own output and reads its own room, exactly as
+        // `finish_turn` does before the question is asked.
+        let _ = b.take_transcript_elems();
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Maze"), "the real turn's own room");
+        let before_dump = b.window_dump_lines();
+        let before_grid = grid_text(&b);
+
+        // Ask the question: more prose, a rewritten status line, a window opened
+        // while answering, and a heading that must not stand in for the next turn's.
+        let snap = b.display_snapshot();
+        put(&mut b, GlkStyle::Normal, "look\n"); // the parser's echo of the question
+        put(&mut b, GlkStyle::Subheader, "Cavern\n");
+        put(&mut b, GlkStyle::Normal, "A dripping cave.\n\n>");
+        b.grid_put(2, 0, 0, GlkStyle::Normal, "Cavern              Score: 9");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Cavern"), "the answer, read once");
+        b.window_open(3, WinType::TextBuffer);
+        b.window_tree(Some(win_leaf(3, WinType::TextBuffer, 80, 24)));
+        b.restore_display_snapshot(snap);
+
+        // The status line the question rewrote.
+        assert_eq!(grid_text(&b), before_grid, "the grid is back");
+        // The window it opened, and the tree the app lays out from.
+        assert_eq!(b.window_dump_lines(), before_dump, "so is the window tree");
+        // The buffer log, which is what a VM-only restore leaves growing: the drain
+        // pointer moves, the text does not, so the question's prose is owed to the
+        // player's transcript on the NEXT turn and prints the room description twice.
+        assert!(
+            b.take_transcript_elems().is_empty(),
+            "the question's prose is owed to nobody, and a moved drain pointer over an \
+             un-rewound log would owe the player the room description a second time"
+        );
+        // And the heading scan, so the next turn is read the way the real one left it.
+        assert_eq!(
+            b.take_room_heading(true),
+            None,
+            "the answer must not stand in for the next turn's room"
+        );
+    }
+
+    #[test]
+    fn two_stacked_banners_do_not_promote_the_upper_one() {
+        // The other half of the rule, and the reason the verdict cannot be reached when
+        // the displacing run OPENS: a banner page stacks own-line `Subheader` lines, and
+        // the upper one is no more a room than the lower (THE BAT's title page, SQ-0732).
+        // What separates the two shapes is whether the displacing line turns out to be
+        // prose opened by a bolded noun, or a line the newcomer owns outright.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "THE BAT\n");
+        put(&mut b, GlkStyle::Subheader, "An Interactive Nightmare\n");
+        put(&mut b, GlkStyle::Normal, "\nPress any key to begin.\n");
+        assert_eq!(b.take_room_heading(false), None);
+    }
+
+    #[test]
     fn a_styled_word_opening_a_sentence_is_not_a_room() {
         // Kerkerkruip renders the "Enable" of "Enable the screen reader mode?" as a
         // Subheader hyperlink — at line start, so the line-start rule alone accepted it.
@@ -2321,5 +3550,68 @@ mod heading_tests {
         put(&mut b, GlkStyle::Normal, " the screen reader mode? Please enter: Yes or No\n");
         put(&mut b, GlkStyle::Normal, "\nThis option can be changed later from the menu.\n");
         assert_eq!(b.take_room_heading(false), None);
+    }
+
+    /// The status-line grid (id 2) above the primary buffer, the shape every
+    /// Inform Glulx story splits off — see [`AppGlk::status_room_name`].
+    fn with_status_line(rows: &[&str]) -> AppGlk {
+        let mut b = primary_backend();
+        b.window_open(2, WinType::TextGrid);
+        let h = rows.len() as u32;
+        b.window_layout(&[
+            (2, WinType::TextGrid, GlkRect { left: 0, top: 0, width: 80, height: h }, Some(true)),
+            (1, WinType::TextBuffer, GlkRect { left: 0, top: h, width: 80, height: 24 - h }, Some(true)),
+        ]);
+        for (y, row) in rows.iter().enumerate() {
+            b.grid_put(2, 0, y as u32, GlkStyle::Normal, row);
+        }
+        b
+    }
+
+    #[test]
+    fn the_wizard_sniffer_names_its_room_only_on_the_status_line() {
+        // SQ-1302, and the exact styled sequence release 1 / serial 171007 / Inform 7
+        // build 6L38 prints on the turn that first hands the player a command prompt:
+        // a banner and a room DESCRIPTION in the buffer, with not one `Subheader` run
+        // anywhere, and the room's name in the two-row status grid beside "Exit:".
+        let mut b = with_status_line(&[" Atop a Mountain", " Exit: north"]);
+        put(&mut b, GlkStyle::Header, "The Wizard Sniffer");
+        put(&mut b, GlkStyle::Normal, "\nAn Interactive Fiction by Buster Hudson\n");
+        put(&mut b, GlkStyle::Normal, "Release 1 / Serial number 171007 / Inform 7 build 6L38\n\n");
+        put(&mut b, GlkStyle::Normal, "You stand before the raised drawbridge of an evil fortress.\n\n>");
+        assert_eq!(
+            b.take_room_heading(true),
+            None,
+            "the story prints no Subheader run at all; this is why the map stayed empty"
+        );
+        assert_eq!(b.status_room_name().as_deref(), Some("Atop a Mountain"));
+    }
+
+    #[test]
+    fn a_status_line_room_is_read_past_the_score_block_and_its_qualifier() {
+        // Counterfeit Monkey paints " Back Alley, noon    Goals: 1  Score: 0": the room
+        // is the first 2+-space segment, and the time of day is a qualifier after the
+        // comma exactly as a Z-machine status line's posture is.
+        let b = with_status_line(&[" Back Alley, noon                          Goals: 1  Score: 0"]);
+        assert_eq!(b.status_room_name().as_deref(), Some("Back Alley"));
+        // Zozzled puts the exits on the same row instead.
+        let b = with_status_line(&[" Hotel Lobby                                    Exits:  N S E"]);
+        assert_eq!(b.status_room_name().as_deref(), Some("Hotel Lobby"));
+        // Slouching Towards Bedlam CENTRES its title, so the first segment is blank.
+        let b = with_status_line(&["                                   Office"]);
+        assert_eq!(b.status_room_name().as_deref(), Some("Office"));
+    }
+
+    #[test]
+    fn a_status_line_that_is_not_a_room_mints_none() {
+        // City of Secrets paints an instruction there — a sentence, not a noun phrase.
+        let b = with_status_line(&[" For instructions and information type ABOUT and press return."]);
+        assert_eq!(b.status_room_name(), None);
+        // FooFoo's single row is a bare field label with nothing in it.
+        let b = with_status_line(&[" Exits:"]);
+        assert_eq!(b.status_room_name(), None);
+        // And a story with no status line at all has nothing to say.
+        let b = primary_backend();
+        assert_eq!(b.status_room_name(), None);
     }
 }

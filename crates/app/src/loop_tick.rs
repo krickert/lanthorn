@@ -17,6 +17,69 @@ use app::tidy::{apply_tidy_result, cleanup_overlaps_layer_silent, tidy_layer_sil
 use app::render::map::SOUND_PULSE_MS;
 use app::state::{AppState, TidyJob, TidyKind, TidyAnim, TranscriptKind};
 
+/// Poll the background recall worker during idle passes as well as keystrokes.
+/// A changed transcript is re-queried so ranked line positions never point at
+/// text from an earlier restore or a rewritten live screen.
+pub(crate) fn poll_recall(state: &mut AppState, panes: &crate::PaneRects) -> bool {
+    if !state.recall_mode {
+        return false;
+    }
+    if !state.recall_scope_current() {
+        let Some(query) = state.search_query.clone() else {
+            state.clear_search();
+            return true;
+        };
+        match state.begin_recall(&query) {
+            Ok(()) => state.set_status("recall: transcript changed; updating results in background"),
+            Err(err) => state.set_status(format!("recall: could not refresh: {err}")),
+        }
+        return true;
+    }
+    let Some(reply) = state.recall_worker.poll() else {
+        return false;
+    };
+    if state.recall_pending_id != Some(reply.request_id)
+        || state.search_query.as_deref() != Some(reply.query.as_str())
+    {
+        return false;
+    }
+    if !reply.matches_state(state) {
+        let query = reply.query;
+        match state.begin_recall(&query) {
+            Ok(()) => state.set_status("recall: transcript changed; updating results in background"),
+            Err(err) => state.set_status(format!("recall: could not refresh: {err}")),
+        }
+        return true;
+    }
+    let Some(matches) = reply.visible_matches(state) else {
+        state.clear_search();
+        state.set_status("recall: transcript changed; try the query again");
+        return true;
+    };
+    let result_count = matches.len();
+    let reason = match &reply.status {
+        app::recall::RecallStatus::KeywordOnly { reason } => Some(reason.chars().take(100).map(|c| if c.is_control() { ' ' } else { c }).collect::<String>()),
+        _ => None,
+    };
+    state.recall_keyword_only_reason = reason.clone();
+    state.recall_empty = matches!(reply.status, app::recall::RecallStatus::Empty);
+    state.recall_excerpts = reply.hits.into_iter().map(|hit| hit.excerpt).collect();
+    state.search_matches = matches;
+    state.search_idx = 0;
+    state.recall_preview_scroll = 0;
+    state.recall_pending_id = None;
+    if result_count > 0 {
+        state.transcript_scroll = crate::scroll_for_recall_match(state, panes, state.search_matches[0]);
+        state.set_status(state.recall_selected_status());
+    } else {
+        state.set_status("recall: no passages found in what you have seen");
+    }
+    if let Some(reason) = reason {
+        state.set_status(format!("recall: semantic search unavailable; word search used: {reason}"));
+    }
+    true
+}
+
 /// Style watch: drain events, debounce, then reload. Returns `true` if a reload
 /// happened (colours/status changed → repaint).
 pub(crate) fn poll_style_watch(
@@ -92,71 +155,158 @@ pub(crate) fn poll_glulx_resize(
                 *resize_dirty = None;
                 *vm_story_size = Some(cur);
                 redraw = true; // Glulx graphics repaint at the new size
-                if let Some(gs) = session.as_any_mut().downcast_mut::<GlulxSession>() {
-                    gs.resize(cur.0 as u32, cur.1 as u32);
-                }
+                // The resize itself is the library's (SQ-1539); the settle timer
+                // above is the TUI's, because only a drag needs one.
+                app::host::screen::resize_glulx(session, cur);
             }
         }
     }
     redraw
 }
 
-/// Report the story pane's REAL size to the Z-machine (ZMSD §8.4 — SQ-0532/A-F1).
+/// SQ-1504: reset [`poll_glulx_resize`]'s three trackers to the same starting
+/// point (`None`/`None`/`None`) a fresh launch begins from.
 ///
-/// §8.4: the interpreter "may change the exact dimensions whenever it likes but
-/// must write the current height (in lines) and width (in characters) into bytes
-/// $20 and $21 in the header." Uses last frame's story rect (one-frame lag is
-/// fine) and runs BEFORE the draw so the frame that follows already renders the
-/// upper window at the width the game was just told about.
+/// A restarted Glulx session (`reset::reset_game`) is rebuilt at the same
+/// fallback width a launch's own constructor uses — `state.config.
+/// virtual_screen_cols`/`rows` are unset by default in both paths. A launch
+/// still ends up at the real pane width because `poll_glulx_resize` sees
+/// `vm_story_size` at its initial `None`, treats the real pane as new, and
+/// resizes once its settle timer elapses. `reset_game` has no access to
+/// `main.rs`'s tracker locals and cannot touch them, so left alone they carry
+/// whatever the OLD session last settled on — and if the terminal itself
+/// hasn't moved since then, that already equals the (unchanged) pane, so the
+/// poll reads the freshly rebuilt (narrower) session as already matching it
+/// and never re-measures. The story panel then stays at the fallback width
+/// until an actual terminal resize forces the comparison to differ — the
+/// reported symptom. Called right after every `reset_game` (`main.rs`'s
+/// `OverlayAct::ResetConfirm` and `OverlayAct::GameOverPlayAgain` arms) so the
+/// very next `poll_glulx_resize` pass re-measures for real, exactly as a
+/// launch's first pass does. A no-op for a Z-machine/Scott session — these
+/// trackers are read only by the Glulx-gated code above — so it is safe to
+/// call unconditionally after every reset.
+pub(crate) fn reset_glulx_resize_trackers(
+    vm_story_size: &mut Option<(u16, u16)>,
+    story_size_seen: &mut Option<(u16, u16)>,
+    resize_dirty: &mut Option<std::time::Instant>,
+) {
+    *vm_story_size = None;
+    *story_size_seen = None;
+    *resize_dirty = None;
+}
+
+/// Settle-and-requery the in-game graphics `Picker`'s cell size after a resize
+/// (SQ-1511), replacing the ioctl-based `picker_ui::refresh_cell_size` this used
+/// to call for `state.game_picker` specifically. SQ-1520 moved
+/// `picker_ui::run_story_picker`'s own cover-art preview picker onto the same
+/// settle-and-requery core (see [`requery_picker_if_settled`]) and retired
+/// `refresh_cell_size` for good, once nothing called it any more.
 ///
-/// Unlike [`poll_glulx_resize`] there is no settle timer: this writes two header
-/// bytes rather than running the game's re-layout code, so it is free to track
-/// every intermediate size during a drag. It also carries no cached "last
-/// applied" size — it compares against what the header currently SAYS, so a fresh
-/// boot after `@restart` (whose new `Machine` re-seeds the fallback) is corrected
-/// on the next pass without the restart path having to know about any of this.
+/// **Why settle-and-requery instead of `TIOCGWINSZ`.** `refresh_cell_size`
+/// re-derived the cell every resize with no round trip, by dividing the
+/// window's reported pixel size by its cell count — cheap, but provably wrong
+/// at some window sizes (the division isn't always exact), which is why
+/// `ratatui-image`'s maintainer rejected a `set_font_size` call driven off it
+/// upstream. The fix that shipped upstream instead (SQ-1519) is a poll-based
+/// `Picker::from_query_stdio` — a real stdio round trip, safe to repeat
+/// mid-session now that it no longer risks racing a blocking read against the
+/// app's own input loop. A round trip is not free, so it is paid at most once
+/// per settled resize BURST rather than once per `Event::Resize` — the same
+/// shape as [`poll_glulx_resize`]'s settle timer, reused rather than
+/// reinvented.
 ///
-/// Skipped for v6, whose fixed 640×400 pixel screen is scaled into the pane
-/// rather than measured from it, and for v1–3, which have no such header fields.
-/// Returns `true` when the header changed (the upper window's width follows it).
+/// **Why every resize re-triggers it, not only a suspected font change.**
+/// `Event::Resize(cols, rows)` is IDENTICAL whether the user dragged a window
+/// corner or zoomed their font — crossterm hands back the same shape either
+/// way, and there is no signal at that layer to tell them apart. The only
+/// terminal-side signal that could — comparing against a derived pixel cell —
+/// is exactly the disputed `TIOCGWINSZ` arithmetic this function exists to
+/// stop trusting, so reaching for it here to decide WHETHER to requery would
+/// just move the same rejected assumption one step earlier. Every settled
+/// resize therefore requeries; see the commit message for the measured
+/// real-world cost of that choice.
 ///
-/// What is declared is [`declared_story_screen_dims`], not the raw pane
-/// measurement: the width is floored at the columns the story booted with
-/// (SQ-0679) — whatever `GameSession::boot_screen_cols` says THIS session
-/// actually booted at, 80 by default or a narrower/wider pre-boot-seeded pane
-/// (SQ-0680) — so narrowing the pane can never move a v4/v5 status routine's
-/// baked-in field columns outside the window.
+/// `dirty` is set by the caller (`main.rs`, on every `Event::Resize`) and
+/// cleared here; `query` performs the actual requery and is a parameter
+/// purely so a test can substitute a counting stub for the real stdio round
+/// trip. Returns `true` (redraw needed) only when the requery both ran and
+/// found a different cell.
 ///
-/// [`declared_story_screen_dims`]: app::render::screen::declared_story_screen_dims
+/// A thin wrapper over [`requery_picker_if_settled`], which holds the actual
+/// settle/requery/compare logic with no `AppState` dependency (SQ-1520
+/// extraction) — so `picker_ui::run_story_picker`'s own cover-art preview loop
+/// (its own local `Option<Picker>`, not `state.game_picker`) can drive the
+/// same settle timer instead of the ioctl-based `picker_ui::refresh_cell_size`
+/// it used to call.
+pub(crate) fn poll_picker_requery(
+    state: &mut AppState,
+    dirty: &mut Option<std::time::Instant>,
+    query: impl FnOnce() -> Option<ratatui_image::picker::Picker>,
+) -> bool {
+    let changed = requery_picker_if_settled(
+        &mut state.game_picker,
+        state.game_picker_query_answered,
+        dirty,
+        query,
+    );
+    if changed {
+        state.graphics_render.borrow_mut().invalidate_cell_geometry();
+    }
+    changed
+}
+
+/// The settle-and-requery core [`poll_picker_requery`] wraps for `AppState`
+/// (SQ-1520 extraction — see that fn's doc). Takes every fact it needs as a
+/// parameter rather than reading `AppState`, so a second caller with its own
+/// local `Option<Picker>` (`picker_ui::run_story_picker`'s cover-art preview)
+/// can drive it too. `query_answered` is the caller's own
+/// `game_picker_query_answered`-shaped bool (SQ-1511's guard: a launch-time
+/// query that got no answer at all never will, so don't pay its timeout again
+/// on every future resize). Returns `true` only when the requery both ran and
+/// found a different cell — callers that keep a separate cell-geometry cache
+/// invalidate it on `true`, same as [`poll_picker_requery`] does for
+/// `state.graphics_render`.
+pub(crate) fn requery_picker_if_settled(
+    picker: &mut Option<ratatui_image::picker::Picker>,
+    query_answered: bool,
+    dirty: &mut Option<std::time::Instant>,
+    query: impl FnOnce() -> Option<ratatui_image::picker::Picker>,
+) -> bool {
+    if !app::watch::due(*dirty, std::time::Instant::now(), Duration::from_millis(150)) {
+        return false;
+    }
+    *dirty = None;
+
+    if !query_answered {
+        return false;
+    }
+    // `FontSize` has no `PartialEq` (it's a foreign type), so compare the
+    // fields it exposes.
+    let Some(was) = picker.as_ref().map(|p| (p.font_size().width, p.font_size().height)) else {
+        return false;
+    };
+    let Some(new_picker) = query() else { return false };
+    let now = (new_picker.font_size().width, new_picker.font_size().height);
+    if now == was {
+        return false; // same measurement; don't churn the picker for nothing
+    }
+    *picker = Some(new_picker);
+    true
+}
+
+/// Report the story pane's REAL size to the Z-machine (ZMSD §8.4 — SQ-0532/A-F1),
+/// from last frame's story rect (one-frame lag is fine). Runs BEFORE the draw so
+/// the frame that follows already renders the upper window at the width the game
+/// was just told about. The rule — which versions, the SQ-0679 width floor, the
+/// compare against what the header says — is the library's
+/// [`app::host::screen::sync_zvm_screen_dims`] (SQ-1539); this only measures.
+/// Returns `true` when the header changed.
 pub(crate) fn poll_zvm_screen_dims(
     session: &mut dyn Engine,
     state: &AppState,
     last_panes: &crate::PaneRects,
 ) -> bool {
-    let Some(gs) = session.as_any().downcast_ref::<app::session::GameSession>() else {
-        return false;
-    };
-    let version = gs.machine.mem.version();
-    if version < 4 || version == 6 {
-        return false;
-    }
-    let Some((rows, cols)) = app::render::screen::declared_story_screen_dims(
-        last_panes.story,
-        state,
-        version,
-        gs.boot_screen_cols,
-    ) else {
-        return false;
-    };
-    let current = (
-        gs.machine.mem.read_byte(0x20) as u16,
-        gs.machine.mem.read_byte(0x21) as u16,
-    );
-    if current == (rows.min(255), cols.min(255)) {
-        return false;
-    }
-    session.set_screen_dims(rows, cols);
-    true
+    app::host::screen::sync_zvm_screen_dims(session, state, (last_panes.story.width, last_panes.story.height))
 }
 
 /// Keep header bytes $2C/$2D describing the colours the player actually sees
@@ -198,6 +348,7 @@ pub(crate) fn poll_zvm_default_colours(session: &mut dyn Engine, state: &AppStat
         return;
     };
     let Some((bg, fg)) = app::colors::host_default_colour_pair(
+        gs.machine.palette(),
         state.colors.theme.get("transcript").style,
         state.term_default_colors.fg.map(|c| (c.0[0], c.0[1], c.0[2])),
         state.term_default_colors.bg.map(|c| (c.0[0], c.0[1], c.0[2])),
@@ -226,13 +377,15 @@ pub(crate) fn poll_tidy_jobs(
     if state.tidy_job.as_ref().is_some_and(|j| j.handle.is_finished()) {
         redraw = true; // tidy result applied (or re-triggered) → map changes
         let job = state.tidy_job.take().unwrap();
-        let current_gen = state.graph_gen;
+        let current_gen = mapper.graph.struct_gen();
         let active_layer = job.layer;
         match job.handle.join() {
             Ok(tidied) => {
                 match apply_tidy_result(&mut mapper.graph, tidied, active_layer, job.gen, current_gen) {
                     ApplyTidyOutcome::Applied => {
-                        state.bump_graph_gen(); // tidied layout applied → invalidate map memo (SQ-0305)
+                        // `apply_tidy_result` writes through `set_pos`/`set_conn_distorted`,
+                        // both `struct_gen` mutators, so a real layout change already bumped
+                        // it (SQ-1544) — no separate invalidation needed.
                         // Re-center on the current room if it moved.
                         if let Some(rid) = mapper.graph.current() {
                             if let Some(room) = mapper.graph.room(rid) {
@@ -252,7 +405,7 @@ pub(crate) fn poll_tidy_jobs(
                         if !app::tidy::layer_is_frozen(&mapper.graph, active_layer2) {
                             let kind = job.kind;
                             let graph_clone = mapper.graph.clone();
-                            let gen2 = state.graph_gen;
+                            let gen2 = mapper.graph.struct_gen();
                             let handle2 = std::thread::spawn(move || {
                                 let mut g = graph_clone;
                                 match kind {
@@ -286,14 +439,14 @@ pub(crate) fn poll_tidy_jobs(
     if state.anim_build_job.as_ref().is_some_and(|j| j.handle.is_finished()) {
         redraw = true; // anim build installed / graph applied → repaint
         let job = state.anim_build_job.take().unwrap();
-        let current_gen = state.graph_gen;
+        let current_gen = mapper.graph.struct_gen();
         if let Ok((frames, tidied)) = job.handle.join() {
             match apply_tidy_result(&mut mapper.graph, tidied, job.layer, job.gen, current_gen) {
                 ApplyTidyOutcome::Applied => {
-                    // Instant re-tidy (animate=false) and the anim's final settle both
-                    // land the tidied graph here — invalidate the map memo so the live
-                    // path shows it (and does not SNAP BACK when the anim ends). (SQ-0305)
-                    state.bump_graph_gen();
+                    // Instant re-tidy (animate=false) and the anim's final settle both land the
+                    // tidied graph here — `apply_tidy_result`'s writes already bumped
+                    // `struct_gen` (SQ-1544), so the live path shows it (and does not SNAP BACK
+                    // when the anim ends) with no separate invalidation.
                     // `animate-tidy` plays the captured frames; the instant `tidy-map`
                     // re-tidy (animate=false) applies the tidied graph without an
                     // animation — it only used the off-thread build for the progress
@@ -318,152 +471,6 @@ pub(crate) fn poll_tidy_jobs(
             }
         }
     }
-
-    redraw
-}
-
-/// Play out a v6 turn's picture sequence, one frame per hold (SQ-0708).
-///
-/// A v6 turn can queue several `draw_picture`s — Arthur's intro paints the
-/// graveyard plate and then Merlin fourteen instructions later, in ONE turn — and
-/// compositing them all before anything renders hands the player the finished
-/// screen instantly. The real machines blitted each picture as its opcode ran, so
-/// you watched the graveyard paint and then Merlin paint onto it. The session
-/// snapshots the screens the turn passed through; this walks them.
-///
-/// The turn itself already ran to completion, so nothing here blocks the story
-/// interpreter, and nothing sleeps: the deadline joins the loop's other clocks in
-/// `next_deadline`, which is what keeps the poll waking in time and the keyboard
-/// live all the way through. Returns `true` when a frame actually advanced.
-pub(crate) fn poll_picture_pacing(state: &mut AppState, session: &mut dyn Engine) -> bool {
-    let Some(gs) = crate::engine_helpers::zvm_session_opt_mut(session) else {
-        // Not a Z-machine engine: no sequence can be in flight, so make sure a
-        // stale deadline from a previous session cannot linger.
-        state.picture_pace_next = None;
-        return false;
-    };
-    let Some(hold) = gs.paced_picture_hold() else {
-        state.picture_pace_next = None;
-        return false;
-    };
-    let now = std::time::Instant::now();
-    match state.picture_pace_next {
-        // First sight of this frame: start its clock. It is already on screen —
-        // the turn that produced it forced a redraw — so nothing changes yet.
-        None => {
-            state.picture_pace_next = Some(now + hold);
-            false
-        }
-        Some(due) if now >= due => {
-            gs.advance_paced_pictures();
-            // Arm the next frame's hold from THIS instant rather than from the
-            // deadline just missed, so a slow frame cannot compound into a
-            // sequence that races to catch up.
-            state.picture_pace_next = gs.paced_picture_hold().map(|h| now + h);
-            true
-        }
-        Some(_) => false,
-    }
-}
-
-/// Collapse any in-flight picture sequence to its settled composite (SQ-0708) —
-/// the player pressed a key, or the pane resized under it.
-///
-/// The player outranks paced output, the same rule the `[more]` pager runs on.
-/// Unlike the pager this never CONSUMES the key: the sequence is decoration over
-/// a turn that has already finished, so eating a keystroke to dismiss it would
-/// swallow a character the player meant for the story. The two cannot deadlock
-/// for the same reason — pacing blocks nothing and waits for nothing, so a key
-/// settles the pictures and goes on to whatever else wanted it, `[more]` included.
-///
-/// Returns `true` when frames were dropped (the screen jumps to the final state).
-pub(crate) fn settle_picture_pacing(state: &mut AppState, session: &mut dyn Engine) -> bool {
-    state.picture_pace_next = None;
-    crate::engine_helpers::zvm_session_opt_mut(session)
-        .is_some_and(|gs| gs.settle_paced_pictures())
-}
-
-/// Refresh the engine input-mode flags and re-arm the timed-input / Glk-timer
-/// deadlines. Returns `true` only for a prompt-visibility transition (the timer
-/// re-arm never forces a redraw).
-pub(crate) fn refresh_engine_input(
-    state: &mut AppState,
-    session: &mut dyn Engine,
-) -> bool {
-    let mut redraw = false;
-
-    // Each new Glulx line-input request says what the input line should now hold
-    // (Glk spec §4.2 `initlen`): text the game pre-loaded, editable, or nothing.
-    // advent.blb's toolbar needs both — clicking Examine must leave "Examine " at
-    // the prompt for the player to finish, while clicking a verb over an
-    // already-typed noun runs that command itself and asks again empty, which must
-    // not strand the noun at the prompt. Either way the game has just consumed or
-    // cancelled the previous line, so its answer is authoritative and replaces
-    // whatever the app was showing. (SQ-0562, SQ-0565)
-    if let Some(text) = crate::engine_helpers::glulx_session_opt_mut(session)
-        .and_then(|gs| gs.take_line_seed())
-    {
-        if state.input.value != text {
-            state.input.clear();
-            state.input.insert_str(&text);
-            redraw = true;
-        }
-    }
-    // ...and keep the game's buffer holding what the player has actually typed.
-    // Glk lends the interpreter that buffer for the whole request so a cancel can
-    // report the partial input; advent.blb's toolbar cancels on every button press
-    // and preserves what it finds there, so a stale buffer made every later button
-    // re-insert the FIRST verb — text the player may have already deleted. Written
-    // after the seed above so a fresh prefill lands in the buffer too. (SQ-0565)
-    if let Some(gs) = crate::engine_helpers::glulx_session_opt_mut(session) {
-        gs.sync_line_input(&state.input.value);
-    }
-
-    // Update char_mode flag so the renderer hides the prompt during read_char.
-    let prev_char_mode = state.char_mode;
-    let prev_event_wait = state.event_wait;
-    state.char_mode = matches!(session.pending_input(), app::session::InputKind::Char);
-    // A Glulx timer/mouse/hyperlink-only glk_select: hide the prompt too (no
-    // typed input is requested), but unlike char_mode do NOT forward keys to
-    // the game — the timer clock / click delivers the event instead.
-    state.event_wait = matches!(session.pending_input(), app::session::InputKind::Event);
-    // A prompt-visibility transition changes the frame even with no new input.
-    if state.char_mode != prev_char_mode || state.event_wait != prev_event_wait {
-        redraw = true;
-    }
-
-    // Re-arm the timed-input deadline each iteration. Only while the game is
-    // actually awaiting input (no dialog/overlay/prompt covering the pane) and
-    // honoring timers; `pending_timeout()` is `None` for an untimed read, so
-    // this is a no-op for the vast majority of games (regression guard). Timed
-    // input is a Z-machine-only concept (ZMSD): `zvm_session_opt` is `None` for
-    // a Glulx engine, so the timer never arms there.
-    let timer_interval = crate::engine_helpers::zvm_session_opt(session)
-        .and_then(|s| s.pending_timeout())
-        .map(|(t, _)| Duration::from_millis(t as u64 * 100));
-    let should_arm = state.config.honor_timed_input
-        && !state.any_overlay_open()
-        && timer_interval.is_some();
-    state.input_deadline = crate::turn::next_input_deadline(
-        state.input_deadline,
-        should_arm,
-        timer_interval.unwrap_or(Duration::ZERO),
-        std::time::Instant::now(),
-    );
-
-    // Re-arm the Glulx Glk timer-events clock (glk_request_timer_events) — the
-    // Glulx analogue of `input_deadline`, and independent of it. Armed only
-    // when a Glulx game has requested a timer interval and no overlay covers
-    // the pane; uses the same arm-once semantics (`next_input_deadline`) so the
-    // deadline holds steady until it fires (the fire path below re-arms fresh).
-    let glk_timer_interval = crate::engine_helpers::glulx_session_opt(session).and_then(|s| s.timer_interval());
-    let should_arm_glk_timer = !state.any_overlay_open() && glk_timer_interval.is_some();
-    state.glulx_timer_next_fire = crate::turn::next_input_deadline(
-        state.glulx_timer_next_fire,
-        should_arm_glk_timer,
-        glk_timer_interval.unwrap_or(Duration::ZERO),
-        std::time::Instant::now(),
-    );
 
     redraw
 }
@@ -520,78 +527,176 @@ pub(crate) fn expire_sound_and_settle_dock(state: &mut AppState) -> bool {
     redraw
 }
 
-/// Collect one answer from the shared shadow and give it to whoever asked for it,
-/// then let the return search hand out its next question (SQ-0785).
-///
-/// **One collector, because there is one channel.** [`app::probe::ShadowProbe`]
-/// serves two consumers — the vocabulary offer and the return search — and
-/// [`app::probe::ShadowProbe::poll`] takes whatever has arrived without knowing
-/// who wanted it. Two consumers each polling for themselves would mean the first
-/// one to look takes the other's answer off the channel and drops it, silently
-/// and only sometimes. So the answer is collected here, once, and routed by the
-/// token it carries.
-///
-/// The pump runs after the route, so a search whose attempt has just come back
-/// asks its next question on the same pass rather than idling a frame per
-/// direction.
-/// Pay off the layout debt a hidden map ran up, once its pane is back (SQ-1136).
-///
-/// The counterpart to `turn::schedule_map_maintenance`'s early return. One job
-/// settles any number of deferred turns, because a relayout derives every
-/// position from the graph and not from the turns that built it — which is what
-/// makes deferring sound in the first place.
-///
-/// Two conditions beyond the flag. The pane must be **visible**, or this would
-/// undo the whole optimisation on the very tick that set the flag. And no job may
-/// already be in flight: `schedule_map_maintenance` assigns over `state.tidy_job`,
-/// which drops the running handle and detaches its thread, so a catch-up that
-/// barged in would cost the very work it is trying to schedule. The debt keeps
-/// until the next tick instead — it is a flag, and waiting costs nothing.
-///
-/// Returns true when a job was scheduled, so the caller can redraw.
-pub(crate) fn catch_up_deferred_map_layout(
-    state: &mut AppState,
-    mapper: &Mapper,
-    bg_tidy_counter: &mut u32,
-) -> bool {
-    if !state.map_layout_deferred
-        || state.layout != app::state::Layout::Split
-        || state.tidy_job.is_some()
-    {
-        return false;
-    }
-    state.map_layout_deferred = false;
-    // `new_room = true` so this asks for a FULL relayout rather than a cleanup:
-    // the deferred stretch may have added many rooms, and dead reckoning is
-    // exactly what a full pass exists to straighten out.
-    crate::turn::schedule_map_maintenance(state, mapper, true, true, bg_tidy_counter);
-    true
-}
+#[cfg(all(test, feature = "t-misc"))]
+mod poll_picker_requery_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Instant;
 
-pub(crate) fn poll_shadow_answers(
-    state: &mut AppState,
-    mapper: &mut Mapper,
-    bg_tidy_counter: &mut u32,
-) -> bool {
-    let mut changed = false;
-    if let Some(answer) = state.probe.poll() {
-        if app::vocab::owns(state, answer.token) {
-            changed |= app::vocab::deliver_answer(state, answer);
-        } else if app::return_probe::owns(state, answer.token)
-            && app::return_probe::deliver(state, mapper, &answer).is_some()
-        {
-            // A new passage is a geometry change, so it gets everything a walked
-            // one gets: the render memo invalidated, the layout rescheduled, and
-            // a redraw. An edge nobody lays out or draws is a discovery the
-            // player never sees.
-            state.graph_gen = state.graph_gen.wrapping_add(1);
-            crate::turn::schedule_map_maintenance(state, mapper, false, true, bg_tidy_counter);
-            changed = true;
-        }
-        // An answer nobody owns is one whose asker has moved on — an aborted
-        // search, or a vocabulary offer the player typed past. Dropping it is the
-        // silence discipline both consumers already have.
+    use ratatui_image::picker::Picker;
+    use ratatui_image::FontSize;
+
+    /// A picker whose launch query got an answer, at `font`. Real `Picker`s
+    /// with non-empty `capabilities()` can only come from a real stdio round
+    /// trip (its fields are private outside `ratatui-image`), which is exactly
+    /// why `game_picker_query_answered` is a plain `AppState` bool rather than
+    /// something derived from the picker itself — see that field's doc.
+    // `Picker::set_font_size` was a fork-only addition (SQ-0992); upstream has
+    // no setter for an existing `Picker`, only the deprecated `from_fontsize`
+    // constructor — fine here, since these tests only need a `Picker` at a
+    // chosen font size, not a live capability-queried one (SQ-1510).
+    #[allow(deprecated)]
+    fn answered_state(font: (u16, u16)) -> AppState {
+        let mut state = AppState::default();
+        let p = Picker::from_fontsize(FontSize::new(font.0, font.1));
+        state.game_picker = Some(p);
+        state.game_picker_query_answered = true;
+        state
     }
-    app::return_probe::pump_return_search(state);
-    changed
+
+    fn font_of(state: &AppState) -> (u16, u16) {
+        let f = state.game_picker.as_ref().expect("picker still present").font_size();
+        (f.width, f.height)
+    }
+
+    /// (1) A resize that just arrived has not settled — the very next poll
+    /// pass must not query at all, not even to find "no change".
+    #[test]
+    fn an_unsettled_resize_never_queries() {
+        let mut state = answered_state((10, 20));
+        let calls = Cell::new(0u32);
+        let mut dirty = Some(Instant::now()); // a Resize "just" arrived
+        let redraw = poll_picker_requery(&mut state, &mut dirty, || {
+            calls.set(calls.get() + 1);
+            Some(Picker::halfblocks())
+        });
+        assert!(!redraw, "the settle window has not elapsed yet");
+        assert_eq!(calls.get(), 0, "no requery before a burst settles");
+        assert!(dirty.is_some(), "still pending — not consumed early");
+    }
+
+    /// (1) An ordinary resize with no font change: once settled, the requery
+    /// runs (there is no cheaper signal that distinguishes a font change from
+    /// a plain resize — see the fn's own docs) but finds the same measurement
+    /// and leaves the picker alone.
+    #[test]
+    fn a_settled_resize_with_no_font_change_does_not_swap() {
+        let mut state = answered_state((10, 20));
+        let calls = Cell::new(0u32);
+        let mut dirty = Some(Instant::now() - std::time::Duration::from_millis(200));
+        let redraw = poll_picker_requery(&mut state, &mut dirty, || {
+            calls.set(calls.get() + 1);
+            Some(Picker::halfblocks()) // same (10, 20) as `answered_state`
+        });
+        assert!(!redraw, "same measurement — nothing to redraw for");
+        assert_eq!(calls.get(), 1, "the settled requery still runs once");
+        assert_eq!((10, 20), font_of(&state), "unchanged measurement leaves the picker alone");
+        assert!(dirty.is_none(), "consumed once due() fires");
+    }
+
+    /// (2) A font change: once settled, the requery's result replaces
+    /// `game_picker` and asks for a redraw. FALSIFY by hard-coding this fn to
+    /// always `return false` after the swap and watch `font_of` stay stale.
+    #[test]
+    #[allow(deprecated)]
+    fn a_settled_font_change_swaps_the_picker_and_redraws() {
+        let mut state = answered_state((10, 20));
+        let mut dirty = Some(Instant::now() - std::time::Duration::from_millis(200));
+        let redraw = poll_picker_requery(&mut state, &mut dirty, || {
+            Some(Picker::from_fontsize(FontSize::new(7, 15)))
+        });
+        assert!(redraw, "a font-size change must ask for a redraw");
+        assert_eq!((7, 15), font_of(&state));
+        assert!(dirty.is_none());
+    }
+
+    /// (3) A resize BURST — several `Resize` events arriving faster than the
+    /// settle window — must cost at most one requery, not one per event.
+    /// Driven the way `main.rs` drives it: every event just re-marks `dirty`
+    /// to "now", so a burst keeps re-arming the timer and never lets it fire
+    /// until the events stop. FALSIFY by removing the `due()` gate (always
+    /// query) and watch `calls` climb past 1 during the burst loop below.
+    #[test]
+    #[allow(deprecated)]
+    fn a_resize_burst_queries_at_most_once() {
+        let mut state = answered_state((10, 20));
+        let calls = Cell::new(0u32);
+        let mut dirty: Option<Instant>;
+
+        // Four "Resize" events in a row, each re-arming the settle timer
+        // before it can fire — exactly a drag delivering a burst.
+        for _ in 0..4 {
+            dirty = Some(Instant::now());
+            let redraw = poll_picker_requery(&mut state, &mut dirty, || {
+                calls.set(calls.get() + 1);
+                Some(Picker::halfblocks())
+            });
+            assert!(!redraw, "still inside the burst — never settled");
+        }
+        assert_eq!(calls.get(), 0, "no requery fired during the burst itself");
+
+        // The burst stops; the settle window has now genuinely elapsed.
+        dirty = Some(Instant::now() - std::time::Duration::from_millis(200));
+        let redraw = poll_picker_requery(&mut state, &mut dirty, || {
+            calls.set(calls.get() + 1);
+            Some(Picker::from_fontsize(FontSize::new(7, 15)))
+        });
+        assert!(redraw);
+        assert_eq!(calls.get(), 1, "settling a burst costs exactly one requery");
+
+        // A further idle poll pass (no new Resize) must not re-fire.
+        let redraw2 = poll_picker_requery(&mut state, &mut dirty, || {
+            calls.set(calls.get() + 1);
+            Some(Picker::halfblocks())
+        });
+        assert!(!redraw2);
+        assert_eq!(calls.get(), 1, "consumed — an idle pass after settling must not re-query");
+    }
+
+    /// The guard: a picker whose launch query never got an answer at all must
+    /// never pay a requery's stdio round trip on a resize, however long the
+    /// settle window has elapsed — this is what keeps a terminal that never
+    /// answers DSR from paying that timeout on every resize.
+    #[test]
+    fn an_unanswered_launch_query_never_requeries() {
+        let mut state = AppState::default();
+        state.game_picker = Some(Picker::halfblocks());
+        state.game_picker_query_answered = false; // e.g. --image-protocol halfblocks, or a silent tty
+        let calls = Cell::new(0u32);
+        let mut dirty = Some(Instant::now() - std::time::Duration::from_millis(200));
+        let redraw = poll_picker_requery(&mut state, &mut dirty, || {
+            calls.set(calls.get() + 1);
+            Some(Picker::halfblocks())
+        });
+        assert!(!redraw);
+        assert_eq!(calls.get(), 0, "never pay the query's timeout for a terminal that answers nothing");
+        assert!(dirty.is_none(), "still consumed — no point re-arming for the same terminal");
+    }
+
+    /// SQ-1520: the core the AppState-shaped tests above exercise through
+    /// [`poll_picker_requery`] must also work driven directly, with no
+    /// `AppState` in sight — exactly how `picker_ui::run_story_picker`'s own
+    /// local cover-art preview picker drives it. FALSIFY by hard-coding
+    /// `requery_picker_if_settled` to always `return false` right after
+    /// building `new_picker` (skipping the `*picker = Some(new_picker)`
+    /// assignment) and watch `cover_picker`'s font stay at its stale (10, 20)
+    /// below.
+    #[test]
+    #[allow(deprecated)]
+    fn requery_picker_if_settled_drives_a_bare_option_with_no_appstate() {
+        let mut cover_picker = Some(Picker::from_fontsize(FontSize::new(10, 20)));
+        let calls = Cell::new(0u32);
+        let mut dirty = Some(Instant::now() - std::time::Duration::from_millis(200));
+
+        let changed = requery_picker_if_settled(&mut cover_picker, true, &mut dirty, || {
+            calls.set(calls.get() + 1);
+            Some(Picker::from_fontsize(FontSize::new(7, 15)))
+        });
+
+        assert!(changed, "a settled requery finding a different cell reports true");
+        assert_eq!(calls.get(), 1);
+        let f = cover_picker.as_ref().expect("picker still present").font_size();
+        assert_eq!((7, 15), (f.width, f.height));
+        assert!(dirty.is_none(), "consumed once due() fires");
+    }
 }

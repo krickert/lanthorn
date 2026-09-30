@@ -108,16 +108,18 @@ fn the_maze_flag_defaults_the_view_without_overriding_a_choice() {
 }
 
 /// Both commands change what the pane draws, so both must invalidate the render memo — a missed
-/// bump paints a stale map (SQ-0305).
+/// bump paints a stale map (SQ-0305). Since SQ-1544 the render memo reads
+/// `Mapper::struct_gen` straight off the live graph rather than a hand-bumped
+/// `AppState` field, so this checks the mapper's own counter.
 #[test]
 fn both_commands_invalidate_the_map_render_memo() {
     let (mut m, mut st) = on_maze();
-    let g0 = st.graph_gen;
+    let g0 = m.struct_gen();
     apply_action(Action::ViewMap(None), &mut st, &mut m);
-    assert_ne!(st.graph_gen, g0, "/view-map bumps the generation");
-    let g1 = st.graph_gen;
+    assert_ne!(m.struct_gen(), g0, "/view-map bumps the generation");
+    let g1 = m.struct_gen();
     apply_action(Action::MarkMazeLayer, &mut st, &mut m);
-    assert_ne!(st.graph_gen, g1, "/mark-maze-layer bumps it too");
+    assert_ne!(m.struct_gen(), g1, "/mark-maze-layer bumps it too");
 }
 
 // ── Matrix navigation ─────────────────────────────────────────────────────────
@@ -188,7 +190,7 @@ fn panning_scrolls_the_table_when_the_matrix_is_showing() {
 fn the_trail_remembers_the_last_eight_steps_and_ignores_standing_still() {
     let mut st = AppState::default();
     for id in 1..=12u16 {
-        st.push_trail(id);
+        st.push_trail(id.into());
     }
     assert_eq!(st.map_trail.len(), app::state::MAP_TRAIL_LEN);
     assert_eq!(st.map_trail.back(), Some(&12), "the newest step is last");

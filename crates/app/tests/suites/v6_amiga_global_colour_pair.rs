@@ -93,6 +93,11 @@ const ZORK_ZERO: Floppy = Floppy {
 };
 const ARTHUR: Floppy =
     Floppy { file: "Arthur - The Quest for Excalibur.adf", release: 54, serial: "890606", turns: 12 };
+/// The Macintosh Zork Zero release, pinned in `real_media_releases.rs` — a
+/// DIFFERENT build than [`ZORK_ZERO`]'s Amiga floppy (296/881019 vs.
+/// 366/890323), so its own boot sequence to reach the DEFINE menu is
+/// verified empirically rather than assumed to match (SQ-1617).
+const ZORK_ZERO_MAC: Floppy = Floppy { file: "Zork Zero Disk.image", release: 296, serial: "881019", turns: 12 };
 
 fn ctx(f: &Floppy, profile: InterpreterProfile, honor: bool) -> String {
     format!(
@@ -128,7 +133,6 @@ fn boot(f: &Floppy, profile: InterpreterProfile, honor: bool) -> Option<GameSess
         ctx(f, profile, honor)
     );
 
-    app::v6_set_palette(profile.palette());
     let mut picts = PictSource::resolve(&path, None);
     let picture_dims = picts.all_pict_dims();
     // `startup.rs`'s own chain, `native_std_window` included — this suite boots disk
@@ -148,6 +152,10 @@ fn boot(f: &Floppy, profile: InterpreterProfile, honor: bool) -> Option<GameSess
         None,
     )
     .unwrap_or_else(|e| panic!("{}: should boot without a ZError: {e:?}", ctx(f, profile, honor)));
+    // SQ-1393: the machine's own colour table. `new_with_trace` is the
+    // no-machine door and presents §8.3.1's own, so a harness that boots a
+    // press states the press's table here.
+    s.machine.set_palette(profile.palette());
     s.set_pict_source(Some(picts));
     s.flush_boot_pictures();
     for _ in 0..f.turns {
@@ -207,7 +215,6 @@ fn painted_foregrounds(s: &GameSession) -> std::collections::BTreeSet<String> {
 /// every window adopts window 3's ink and this fails immediately.
 #[test]
 fn a_colour_set_outside_window_0_never_lands_on_an_amiga() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&JOURNEY, InterpreterProfile::Amiga, true) else { return };
     let who = ctx(&JOURNEY, InterpreterProfile::Amiga, true);
 
@@ -258,7 +265,6 @@ fn a_colour_set_outside_window_0_never_lands_on_an_amiga() {
 /// and the sharing rule is gone, while window 0 alone still shows the colour.
 #[test]
 fn a_colour_set_from_window_0_moves_the_pen_for_every_window() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&ZORK_ZERO, InterpreterProfile::Amiga, true) else { return };
     let who = ctx(&ZORK_ZERO, InterpreterProfile::Amiga, true);
     let pairs = window_pairs(&s);
@@ -286,7 +292,6 @@ fn a_colour_set_from_window_0_moves_the_pen_for_every_window() {
 /// out, in `amiga/yzip3.c`.)
 #[test]
 fn a_label_drawn_over_artwork_stays_over_the_artwork() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&ZORK_ZERO, InterpreterProfile::Amiga, true) else { return };
     let who = ctx(&ZORK_ZERO, InterpreterProfile::Amiga, true);
     let v6 = s.machine.screen.v6.as_ref().unwrap();
@@ -313,7 +318,6 @@ fn a_label_drawn_over_artwork_stays_over_the_artwork() {
 /// it. Arthur release 54 makes none, on either profile.
 #[test]
 fn a_title_that_never_sets_a_colour_is_untouched() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&ARTHUR, InterpreterProfile::Amiga, true) else { return };
     let who = ctx(&ARTHUR, InterpreterProfile::Amiga, true);
     for (i, (fg, bg)) in window_pairs(&s).iter().enumerate() {
@@ -333,7 +337,6 @@ fn a_title_that_never_sets_a_colour_is_untouched() {
 /// having quietly adopted window 3's ink.
 #[test]
 fn the_ibm_pc_profile_keeps_one_pair_per_window() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&JOURNEY, InterpreterProfile::IbmPc, true) else { return };
     let who = ctx(&JOURNEY, InterpreterProfile::IbmPc, true);
     let pairs = window_pairs(&s);
@@ -363,7 +366,6 @@ fn the_ibm_pc_profile_keeps_one_pair_per_window() {
 /// profile: a shared pen is still a game colour.
 #[test]
 fn with_game_colours_off_the_theme_owns_the_screen_on_both_profiles() {
-    let _g = app::v6_palette_at_boot();
     for profile in [InterpreterProfile::IbmPc, InterpreterProfile::Amiga] {
         let Some(s) = boot(&JOURNEY, profile, false) else { return };
         let who = ctx(&JOURNEY, profile, false);
@@ -393,7 +395,7 @@ fn render_hybrid(s: &GameSession, honor: bool, cols: u16, rows: u16) -> (Rect, B
     use app::engine::Engine;
     let model = s.screen();
     let mut state = app::state::AppState::default();
-    state.colors = app::colors::ColorScheme::terminal_default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
     state.game_picker =
         Some(ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(8, 18)));
     state.config.v6_render = app::config::V6RenderMode::Hybrid;
@@ -441,9 +443,10 @@ fn tally(area: Rect, buf: &Buffer) -> CellTally {
 /// the Z-machine's own currency, so this is the faithful number rather than a
 /// rounding to paper over.
 fn amiga_pair_rgb() -> (String, String) {
-    let (r, g, b) = app::colors::standard_colour_rgb(app::interpreter::AMIGA_DEFAULT_FOREGROUND)
+    let amiga = zvm::screen::Palette::Amiga;
+    let (r, g, b) = app::colors::standard_colour_rgb(amiga, app::interpreter::AMIGA_DEFAULT_FOREGROUND)
         .expect("standard 9 is white");
-    let (gr, gg, gb) = zvm::screen::grey_rgb(app::interpreter::AMIGA_DEFAULT_BACKGROUND);
+    let (gr, gg, gb) = zvm::screen::grey_rgb(amiga, app::interpreter::AMIGA_DEFAULT_BACKGROUND);
     (format!("Rgb({r}, {g}, {b})"), format!("Rgb({gr}, {gg}, {gb})"))
 }
 
@@ -465,7 +468,6 @@ fn amiga_pair_rgb() -> (String, String) {
 /// the user's symptom, verbatim.
 #[test]
 fn journey_renders_white_on_the_machines_dark_grey_on_the_amiga_floppy() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&JOURNEY, InterpreterProfile::Amiga, true) else { return };
     let who = ctx(&JOURNEY, InterpreterProfile::Amiga, true);
     let (white, grey) = amiga_pair_rgb();
@@ -503,7 +505,6 @@ fn journey_renders_white_on_the_machines_dark_grey_on_the_amiga_floppy() {
 /// exactly as it was before this quest existed — and never in the Amiga's grey.
 #[test]
 fn the_ibm_pc_profile_renders_in_the_host_theme_exactly_as_before() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&JOURNEY, InterpreterProfile::IbmPc, true) else { return };
     let who = ctx(&JOURNEY, InterpreterProfile::IbmPc, true);
     let (_, grey) = amiga_pair_rgb();
@@ -530,7 +531,6 @@ fn the_ibm_pc_profile_renders_in_the_host_theme_exactly_as_before() {
 /// pair at all.
 #[test]
 fn with_game_colours_off_the_amiga_page_never_reaches_the_cells() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&JOURNEY, InterpreterProfile::Amiga, false) else { return };
     let who = ctx(&JOURNEY, InterpreterProfile::Amiga, false);
     let (_, grey) = amiga_pair_rgb();
@@ -619,7 +619,7 @@ fn render_with_transcript(s: &GameSession, lines: &[String], honor: bool) -> (Re
     use app::engine::Engine;
     let model = s.screen();
     let mut state = app::state::AppState::default();
-    state.colors = app::colors::ColorScheme::terminal_default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
     state.game_picker =
         Some(ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(8, 18)));
     state.config.v6_render = app::config::V6RenderMode::Hybrid;
@@ -674,7 +674,6 @@ fn row_styles(area: Rect, buf: &Buffer, needle: &str) -> Option<Vec<(String, Str
 /// `ColorScheme::resolve_story_style` and only the notice row fails, on its ink.
 #[test]
 fn arthurs_notices_are_the_machines_white_on_the_machines_dark_grey() {
-    let _g = app::v6_palette_at_boot();
     let Some((s, lines)) = arthur_at_the_church(true) else { return };
     let who = ctx(&ARTHUR, InterpreterProfile::Amiga, true);
     let (white, grey) = amiga_pair_rgb();
@@ -701,15 +700,17 @@ fn arthurs_notices_are_the_machines_white_on_the_machines_dark_grey() {
     // the REFERENCE pixels. `#444444` page, `#FFFFFF` ink, straight off the Amiga
     // capture, within the two units the 4→5→8-bit widening costs (see
     // `amiga_pair_rgb`). A page of standard 11 lands on 115 and misses by 47.
-    let (pr, pg, pb) = zvm::screen::grey_rgb(app::interpreter::AMIGA_DEFAULT_BACKGROUND);
+    let (pr, pg, pb) =
+        zvm::screen::grey_rgb(s.machine.palette(), app::interpreter::AMIGA_DEFAULT_BACKGROUND);
     for (got, want, ch) in [(pr, 0x44u8, 'r'), (pg, 0x44, 'g'), (pb, 0x44, 'b')] {
         assert!(
             got.abs_diff(want) <= 2,
             "{who}: the page's {ch} channel is {got}, and the real Amiga's is {want}",
         );
     }
-    let (ir, ig, ib) = app::colors::standard_colour_rgb(app::interpreter::AMIGA_DEFAULT_FOREGROUND)
-        .expect("standard 9 is white");
+    let (ir, ig, ib) =
+        app::colors::standard_colour_rgb(s.machine.palette(), app::interpreter::AMIGA_DEFAULT_FOREGROUND)
+            .expect("standard 9 is white");
     assert_eq!((ir, ig, ib), (0xFF, 0xFF, 0xFF), "{who}: the ink is the capture's white");
 }
 
@@ -719,7 +720,6 @@ fn arthurs_notices_are_the_machines_white_on_the_machines_dark_grey() {
 /// INTERPRETER paints with is still a game colour.
 #[test]
 fn with_game_colours_off_arthurs_notice_keeps_the_themes_own_system_style() {
-    let _g = app::v6_palette_at_boot();
     let Some((s, lines)) = arthur_at_the_church(false) else { return };
     let who = ctx(&ARTHUR, InterpreterProfile::Amiga, false);
     let (_, grey) = amiga_pair_rgb();
@@ -732,7 +732,7 @@ fn with_game_colours_off_arthurs_notice_keeps_the_themes_own_system_style() {
     );
     let sys = format!(
         "{:?}",
-        app::colors::ColorScheme::terminal_default()
+        app::colors::ColorScheme::terminal_default_in(s.machine.palette())
             .theme
             .get("transcript_system")
             .style
@@ -761,7 +761,7 @@ fn render_echo(s: &GameSession, lines: &[String], honor: bool, typed: &str, comm
     use app::engine::Engine;
     let model = s.screen();
     let mut state = app::state::AppState::default();
-    state.colors = app::colors::ColorScheme::terminal_default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
     state.game_picker =
         Some(ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(8, 18)));
     state.config.v6_render = app::config::V6RenderMode::Hybrid;
@@ -820,7 +820,6 @@ fn span_look(area: Rect, buf: &Buffer, needle: &str) -> Vec<(String, String, Str
 /// machine's grey while the committed span stays `Rgb(255, 255, 255)`.
 #[test]
 fn the_amigas_typed_echo_stands_on_the_same_pair_as_its_committed_one() {
-    let _g = app::v6_palette_at_boot();
     let Some((s, lines)) = arthur_at_the_church(true) else { return };
     let who = ctx(&ARTHUR, InterpreterProfile::Amiga, true);
     let (white, grey) = amiga_pair_rgb();
@@ -847,7 +846,7 @@ fn the_amigas_typed_echo_stands_on_the_same_pair_as_its_committed_one() {
     let themed = span_look(area, &off, ">look");
     let theme_ink = format!(
         "{:?}",
-        app::colors::ColorScheme::terminal_default()
+        app::colors::ColorScheme::terminal_default_in(s.machine.palette())
             .theme
             .get("input_text")
             .style
@@ -866,7 +865,6 @@ fn the_amigas_typed_echo_stands_on_the_same_pair_as_its_committed_one() {
 /// — the SQ-0532 wave-6 path, unmoved by SQ-0847.
 #[test]
 fn a_game_that_named_its_own_pair_still_types_in_that_pair() {
-    let _g = app::v6_palette_at_boot();
     let Some(s) = boot(&ZORK_ZERO, InterpreterProfile::Amiga, true) else { return };
     let who = ctx(&ZORK_ZERO, InterpreterProfile::Amiga, true);
     let pairs = window_pairs(&s);
@@ -875,11 +873,12 @@ fn a_game_that_named_its_own_pair_still_types_in_that_pair() {
         (ZColour::Standard(2), ZColour::Standard(10)),
         "{who}: premise — the story window named its own pair",
     );
-    // Standard 2 and standard 10, resolved the way the prose resolves them — the
-    // Amiga palette is process-global here, so the greys must come through
+    // Standard 2 and standard 10, resolved the way the prose resolves them —
+    // through the SESSION's own table (SQ-1393), so the greys come through
     // `zvm::screen::grey_rgb` rather than off a default palette table.
-    let (br, bg_, bb) = app::colors::standard_colour_rgb(2).expect("standard 2 is black");
-    let (gr, gg, gb) = zvm::screen::grey_rgb(10);
+    let (br, bg_, bb) =
+        app::colors::standard_colour_rgb(s.machine.palette(), 2).expect("standard 2 is black");
+    let (gr, gg, gb) = zvm::screen::grey_rgb(s.machine.palette(), 10);
     let (black, light_grey) = (format!("Rgb({br}, {bg_}, {bb})"), format!("Rgb({gr}, {gg}, {gb})"));
 
     let (area, live) = render_echo(&s, &["Nothing happens.".to_string()], true, "look", false);
@@ -922,7 +921,6 @@ fn a_game_that_named_its_own_pair_still_types_in_that_pair() {
 /// story background, so nothing about them may move.
 #[test]
 fn chrome_inherits_the_page_the_game_dressed() {
-    let _g = app::v6_palette_at_boot();
     let mut ran = 0;
     for (f, to_menu) in [(&ZORK_ZERO, true), (&ARTHUR, false), (&JOURNEY, false)] {
         let Some(mut s) = boot(f, InterpreterProfile::Amiga, true) else { continue };
@@ -945,11 +943,11 @@ fn chrome_inherits_the_page_the_game_dressed() {
         let app::engine::WinNode::Layered(items) = &model.root else { panic!("{label}: Layered") };
         let dressed = app::render::v6_layout::story_bg_rgba(
             app::render::v6_layout::classify_windows(items.as_slice(), zvm::screen::V6Cell::DEFAULT).story,
-            &app::colors::ColorScheme::terminal_default(),
+            &app::colors::ColorScheme::terminal_default_in(s.machine.palette()),
         );
 
         let mut state = app::state::AppState::default();
-        state.colors = app::colors::ColorScheme::terminal_default();
+        state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
         state.config.honor_game_colours = true;
         state.game_picker = Some(ratatui_image::picker::Picker::halfblocks());
         let area = Rect::new(0, 0, 98, 37);
@@ -962,7 +960,7 @@ fn chrome_inherits_the_page_the_game_dressed() {
             .filter(|&(x, y)| !buf[(x, y)].symbol().trim().is_empty())
             .map(|(x, y)| format!("{:?}", buf[(x, y)].bg))
             .collect();
-        let theme_ground = format!("{:?}", app::colors::ColorScheme::terminal_default().theme.get("upper_window").style.bg);
+        let theme_ground = format!("{:?}", app::colors::ColorScheme::terminal_default_in(s.machine.palette()).theme.get("upper_window").style.bg);
 
         match dressed {
             Some(p) => {
@@ -1002,3 +1000,292 @@ fn chrome_inherits_the_page_the_game_dressed() {
     }
 }
 
+// ── The cell-path's own published layout for a painted MENU takeover
+//    (SQ-1614) ─────────────────────────────────────────────────────────────
+
+/// Zork Zero's Amiga DEFINE menu again — same specimen, same boot sequence as
+/// [`chrome_inherits_the_page_the_game_dressed`] — but this time checking the
+/// HOST-facing API a non-terminal embedder reads instead of the terminal's own
+/// buffer: [`app::render::screen::hybrid_chrome_layout`] must now answer
+/// `None` for this exact frame (closing that function's own documented
+/// promise gap, SQ-1614), and
+/// [`app::render::screen::hybrid_painted_menu_layout`] must answer `Some`
+/// whose fills/stamps resolve to EXACTLY the colours the real cell-path
+/// render stamps — verified by replaying them in order onto a scratch grid
+/// and comparing every cell that grid claims against the real render's own
+/// buffer, the same "layout agrees with the real render" shape
+/// `v6_hybrid_chrome_layout.rs`'s `verify_agreement` established for the ring.
+///
+/// Every one of the menu's inked cells resolves to the same black-on-grey
+/// FG/BG pair here — `Style`'s reverse bit never swaps the colour channels
+/// themselves, only the `Modifier` a terminal later renders with — but the
+/// frame is NOT uniformly plain: the operation-description column ("take",
+/// "drop", "Save Defs", "Exit", and the rest of the right-hand text) carries
+/// [`ratatui::style::Modifier::REVERSED`] already, at rest, with no mouse or
+/// arrow-key interaction needed to reach it, while the left-hand key-name
+/// column ("F1", " UP", …) does not (SQ-1617; confirmed by rendering this
+/// exact frame through [`app::render::screen::render_story_pane`] and
+/// scanning its buffer for `Modifier::REVERSED` before trusting it below —
+/// 457 of this frame's cells carry it). So this case checks colour AND
+/// modifier on every cell, and separately asserts the reversed set is
+/// non-empty — a guard against a future change silently making this frame
+/// stop exercising reverse video.
+#[test]
+fn zork_zero_define_menu_has_a_resolved_painted_menu_layout() {
+    let Some(mut s) = boot(&ZORK_ZERO, InterpreterProfile::Amiga, true) else { return };
+    let label = ctx(&ZORK_ZERO, InterpreterProfile::Amiga, true);
+    for _ in 0..8 {
+        if matches!(s.pending_input(), InputKind::Line) {
+            break;
+        }
+        let _ = s.submit_char(13);
+    }
+    let said = s.submit("define").transcript;
+    assert!(
+        said.to_lowercase().contains("key to define"),
+        "{label}: premise — `define` did not open the key-definition menu: {said:?}",
+    );
+    let _ = s.submit_char(b' ');
+
+    let model = app::engine::Engine::screen(&s);
+    let app::engine::WinNode::Layered(items) = &model.root else { panic!("{label}: Layered") };
+
+    let mut state = app::state::AppState::default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
+    state.config.honor_game_colours = true;
+    state.game_picker = Some(ratatui_image::picker::Picker::halfblocks());
+    let area = Rect::new(0, 0, 98, 37);
+
+    let layout = app::render::v6_layout::classify_windows(items.as_slice(), state.v6_text.cell());
+    let native = app::render::v6_layout::native_extent(items.as_slice(), &state.v6_text);
+    let cell_px = state
+        .game_picker
+        .as_ref()
+        .map(|p| {
+            let f = p.font_size();
+            (f.width, f.height)
+        })
+        .unwrap_or((8, 16));
+
+    // The promise this quest closes: the ring's own host-facing layout must
+    // no longer claim a frame the terminal never draws a ring for.
+    assert!(
+        app::render::screen::hybrid_chrome_layout(&layout, native, area, cell_px, &state).is_none(),
+        "{label}: hybrid_chrome_layout should answer None for a painted menu takeover — this is \
+         exactly the promise gap SQ-1614 closes",
+    );
+
+    let pm = app::render::screen::hybrid_painted_menu_layout(&layout, native, area, &state)
+        .unwrap_or_else(|| panic!("{label}: hybrid_painted_menu_layout should answer Some for this frame"));
+    assert!(!pm.fills.is_empty(), "{label}: premise — the DEFINE menu's window carries an ErasedFill");
+    assert!(!pm.stamps.is_empty(), "{label}: premise — the menu prints text");
+
+    // Standard 2 (black) and standard 10 (light grey), resolved through the
+    // SESSION's own table (SQ-1393) — the same two colours
+    // `a_game_that_named_its_own_pair_still_types_in_that_pair` and
+    // `chrome_inherits_the_page_the_game_dressed` both pin for this release.
+    let (br, bg_, bb) = app::colors::standard_colour_rgb(s.machine.palette(), 2).expect("standard 2 is black");
+    let (gr, gg, gb) = zvm::screen::grey_rgb(s.machine.palette(), 10);
+    let black = ratatui::style::Color::Rgb(br, bg_, bb);
+    let light_grey = ratatui::style::Color::Rgb(gr, gg, gb);
+
+    // Every erase fill's GROUND resolves to the game's own page (its `fg` is
+    // whatever the theme's own default is — the fill's own cells are blank,
+    // so nothing ever reads it, exactly as `draw_erase_fills` never sets an
+    // explicit fg for a fill whose window named none). Every stamp resolves
+    // to black text on that same page — never the theme's.
+    for f in &pm.fills {
+        assert_eq!(f.bg, light_grey, "{label}: erase fill {f:?} did not resolve to the game's page");
+    }
+    for st in &pm.stamps {
+        if st.text.trim().is_empty() {
+            continue;
+        }
+        assert_eq!((st.fg, st.bg), (black, light_grey), "{label}: stamp {st:?} did not resolve to the game's page");
+    }
+
+    // Replay `pm`'s fills then stamps onto a scratch grid, in order — the
+    // documented rule on `V6PaintedMenuStamp` — and check every cell that
+    // grid claims (colour AND modifier, SQ-1617) against what the real
+    // render actually put in the SAME buffer cell.
+    let mut sim: std::collections::HashMap<(u16, u16), (ratatui::style::Color, ratatui::style::Color, ratatui::style::Modifier)> =
+        Default::default();
+    for f in &pm.fills {
+        for y in f.rect.y..f.rect.bottom() {
+            for x in f.rect.x..f.rect.right() {
+                sim.insert((x, y), (f.fg, f.bg, f.modifier));
+            }
+        }
+    }
+    for st in &pm.stamps {
+        for y in st.rect.y..st.rect.bottom() {
+            for x in st.rect.x..st.rect.right() {
+                sim.insert((x, y), (st.fg, st.bg, st.modifier));
+            }
+        }
+    }
+    assert!(sim.len() > 100, "{label}: premise — the menu covers a meaningful number of cells, got {}", sim.len());
+
+    let mut buf = Buffer::empty(area);
+    let _ = app::render::screen::render_story_pane(&model, false, None, &state, area, &mut buf);
+    let mut mismatches = Vec::new();
+    let mut reversed_compared = 0usize;
+    for (&(x, y), &(fg, bg, modifier)) in &sim {
+        let real = &buf[(x, y)];
+        if real.modifier.contains(ratatui::style::Modifier::REVERSED) {
+            reversed_compared += 1;
+        }
+        if (real.fg, real.bg, real.modifier) != (fg, bg, modifier) {
+            mismatches.push((x, y, (real.fg, real.bg, real.modifier), (fg, bg, modifier)));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{label}: {} of {} cells the published layout claims disagree with the real render \
+         (cell, real (fg,bg,modifier), published (fg,bg,modifier)): {:?}",
+        mismatches.len(),
+        sim.len(),
+        &mismatches[..mismatches.len().min(10)],
+    );
+    // Non-vacuity guard (CLAUDE.md testing conventions): this frame must
+    // actually exercise reverse video, or the comparison above proves
+    // nothing about the `modifier` field it was added to check (SQ-1617).
+    assert!(
+        reversed_compared > 0,
+        "{label}: premise — this frame must carry at least one REVERSED cell the published \
+         layout also covers, or the modifier comparison above is vacuous",
+    );
+}
+
+/// The Macintosh half of the same specimen (SQ-1617). Release 296/serial
+/// 881019 is a DIFFERENT build than the Amiga floppy's 366/890323, but an
+/// empirical probe found the identical boot sequence — Return×≤8 past any
+/// remaining "hit any key" screens, `define`, one space — lands on the same
+/// "key to define" menu and the same reversed operation-description column
+/// (confirmed by driving the real fixture and printing its runs and its
+/// rendered buffer's `(fg, bg, Modifier::REVERSED)` triples before writing
+/// this case). Unlike the Amiga case, no earlier test in this file pins this
+/// release's exact page RGB pair, so this case checks INTERNAL consistency
+/// (every fill and every non-blank stamp shares one page pair) rather than
+/// asserting a specific hardcoded colour — the replay-vs-real-render
+/// comparison below is what actually exercises the `modifier` field this
+/// quest adds.
+#[test]
+fn zork_zero_define_menu_has_a_resolved_painted_menu_layout_on_macintosh() {
+    let Some(mut s) = boot(&ZORK_ZERO_MAC, InterpreterProfile::Macintosh, true) else { return };
+    let label = ctx(&ZORK_ZERO_MAC, InterpreterProfile::Macintosh, true);
+    for _ in 0..8 {
+        if matches!(s.pending_input(), InputKind::Line) {
+            break;
+        }
+        let _ = s.submit_char(13);
+    }
+    let said = s.submit("define").transcript;
+    assert!(
+        said.to_lowercase().contains("key to define"),
+        "{label}: premise — `define` did not open the key-definition menu: {said:?}",
+    );
+    let _ = s.submit_char(b' ');
+
+    let model = app::engine::Engine::screen(&s);
+    let app::engine::WinNode::Layered(items) = &model.root else { panic!("{label}: Layered") };
+
+    let mut state = app::state::AppState::default();
+    state.colors = app::colors::ColorScheme::terminal_default_in(s.machine.palette());
+    state.config.honor_game_colours = true;
+    state.game_picker = Some(ratatui_image::picker::Picker::halfblocks());
+    let area = Rect::new(0, 0, 98, 37);
+
+    let layout = app::render::v6_layout::classify_windows(items.as_slice(), state.v6_text.cell());
+    let native = app::render::v6_layout::native_extent(items.as_slice(), &state.v6_text);
+    let cell_px = state
+        .game_picker
+        .as_ref()
+        .map(|p| {
+            let f = p.font_size();
+            (f.width, f.height)
+        })
+        .unwrap_or((8, 16));
+
+    assert!(
+        app::render::screen::hybrid_chrome_layout(&layout, native, area, cell_px, &state).is_none(),
+        "{label}: hybrid_chrome_layout should answer None for a painted menu takeover",
+    );
+
+    let pm = app::render::screen::hybrid_painted_menu_layout(&layout, native, area, &state)
+        .unwrap_or_else(|| panic!("{label}: hybrid_painted_menu_layout should answer Some for this frame"));
+    assert!(!pm.fills.is_empty(), "{label}: premise — the DEFINE menu's window carries an ErasedFill");
+    assert!(!pm.stamps.is_empty(), "{label}: premise — the menu prints text");
+
+    // Every fill's background is the same single page colour, and every
+    // non-blank stamp's colours match it — the internal-consistency check
+    // this release substitutes for the Amiga case's hardcoded standard-2/10
+    // pin (no prior test in this file establishes this release's own pair).
+    let page_bg = pm.fills[0].bg;
+    for f in &pm.fills {
+        assert_eq!(f.bg, page_bg, "{label}: erase fill {f:?} disagrees with the menu's own page colour");
+    }
+    let mut page_pair: Option<(ratatui::style::Color, ratatui::style::Color)> = None;
+    for st in &pm.stamps {
+        if st.text.trim().is_empty() {
+            continue;
+        }
+        let pair = (st.fg, st.bg);
+        match page_pair {
+            None => page_pair = Some(pair),
+            Some(p) => assert_eq!(pair, p, "{label}: stamp {st:?} disagrees with the menu's own text pair"),
+        }
+    }
+    assert!(page_pair.is_some(), "{label}: premise — the menu prints at least one non-blank stamp");
+
+    // Replay `pm`'s fills then stamps onto a scratch grid, in order, and
+    // check every cell the grid claims (colour AND modifier, SQ-1617)
+    // against what the real render actually put in the SAME buffer cell.
+    let mut sim: std::collections::HashMap<(u16, u16), (ratatui::style::Color, ratatui::style::Color, ratatui::style::Modifier)> =
+        Default::default();
+    for f in &pm.fills {
+        for y in f.rect.y..f.rect.bottom() {
+            for x in f.rect.x..f.rect.right() {
+                sim.insert((x, y), (f.fg, f.bg, f.modifier));
+            }
+        }
+    }
+    for st in &pm.stamps {
+        for y in st.rect.y..st.rect.bottom() {
+            for x in st.rect.x..st.rect.right() {
+                sim.insert((x, y), (st.fg, st.bg, st.modifier));
+            }
+        }
+    }
+    assert!(sim.len() > 100, "{label}: premise — the menu covers a meaningful number of cells, got {}", sim.len());
+
+    let mut buf = Buffer::empty(area);
+    let _ = app::render::screen::render_story_pane(&model, false, None, &state, area, &mut buf);
+    let mut mismatches = Vec::new();
+    let mut reversed_compared = 0usize;
+    for (&(x, y), &(fg, bg, modifier)) in &sim {
+        let real = &buf[(x, y)];
+        if real.modifier.contains(ratatui::style::Modifier::REVERSED) {
+            reversed_compared += 1;
+        }
+        if (real.fg, real.bg, real.modifier) != (fg, bg, modifier) {
+            mismatches.push((x, y, (real.fg, real.bg, real.modifier), (fg, bg, modifier)));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{label}: {} of {} cells the published layout claims disagree with the real render \
+         (cell, real (fg,bg,modifier), published (fg,bg,modifier)): {:?}",
+        mismatches.len(),
+        sim.len(),
+        &mismatches[..mismatches.len().min(10)],
+    );
+    // Non-vacuity guard: this Macintosh frame must also carry at least one
+    // REVERSED cell the published layout covers, or the modifier comparison
+    // above proves nothing (SQ-1617).
+    assert!(
+        reversed_compared > 0,
+        "{label}: premise — this frame must carry at least one REVERSED cell the published \
+         layout also covers, or the modifier comparison above is vacuous",
+    );
+}

@@ -60,7 +60,6 @@ impl LayerMeta {
 
 use crate::direction::{grid_offset, opposite, Direction};
 use crate::graph::{Connection, MapGraph, RoomId};
-use crate::router::{fine_cell, stub_label, RoutedEdge};
 
 /// A set of rooms to re-home onto a layer, together with the room it was computed FROM.
 ///
@@ -421,40 +420,6 @@ fn silence_boundary_seams(graph: &mut MapGraph, region: &Region) {
     }
 }
 
-/// One portal badge per connection that LEAVES `layer` — i.e. whose ORIGIN is in
-/// `layer` and dest is elsewhere. Anchored at the origin; carries the destination room
-/// name and destination layer name. Emitting only outgoing edges means a reciprocal
-/// up/down pair (`A↓B` + `B↑A`) shows a single down glyph on A and a single up glyph on
-/// B, instead of both glyphs on both rooms.
-pub fn interlayer_badges(graph: &MapGraph, layer: LayerId) -> Vec<RoutedEdge> {
-    let mut out = Vec::new();
-    for c in graph.connections() {
-        if !is_interlayer(graph, c) || graph.layer_of(c.origin) != layer {
-            continue;
-        }
-        let (here, there, dir) = (c.origin, c.dest, c.dir);
-        let Some(here_pos) = graph.room(here).and_then(|r| r.pos) else { continue };
-        let fine = fine_cell(here_pos);
-        let dest_layer = graph.layer_of(there);
-        let dest_lbl = graph
-            .room(there)
-            .map(|r| format!("{} · {}", r.label(), graph.layer_name(dest_layer)));
-        out.push(RoutedEdge {
-            origin: here,
-            dest: there,
-            dir,
-            points: vec![fine, (fine.0, fine.1 - 1)],
-            distorted: false,
-            is_stub: true,
-            label: Some(stub_label(dir).to_string()),
-            arrival_dir: None,
-            dest_label: dest_lbl,
-            is_interlayer: true, // interlayer_badges only ever emits cross-layer edges
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,52 +760,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reciprocal_crossing_shows_one_glyph_per_side() {
-        // A reciprocal 1↓3 / 3↑1 across a peeled boundary must NOT draw both glyphs on
-        // both rooms: the upper room shows only its down exit, the lower only its up exit.
-        let mut g = two_floors();
-        g.set_pos(1, (0, 0));
-        g.set_pos(3, (0, 0));
-        let l = peel(&mut g, 3).expect("peel cellar");
-
-        let up = interlayer_badges(&g, MAIN_LAYER);
-        assert_eq!(up.len(), 1, "Hall side shows exactly one crossing badge");
-        assert_eq!(up[0].origin, 1);
-        assert_eq!(up[0].dir, Direction::Down, "Hall shows its DOWN exit to the cellar");
-
-        let down = interlayer_badges(&g, l);
-        assert_eq!(down.len(), 1, "Cellar side shows exactly one crossing badge");
-        assert_eq!(down[0].origin, 3);
-        assert_eq!(down[0].dir, Direction::Up, "Cellar shows its UP exit to the hall");
-    }
-
-    #[test]
-    fn interlayer_badges_are_per_edge() {
-        // Two staircases between the same two layers must yield two distinct badges.
-        let mut g = MapGraph::new();
-        for (id, n) in [(1, "HallN"), (2, "HallS"), (3, "CellarN"), (4, "CellarS")] {
-            g.upsert_room(id, n.into());
-        }
-        g.set_pos(1, (0, 0));
-        g.set_pos(2, (0, 1));
-        g.add_edge(1, Direction::E, 2); // keep them in one planar region up top
-        g.add_edge(2, Direction::W, 1);
-        g.add_edge(1, Direction::Down, 3); // staircase A
-        g.add_edge(2, Direction::Down, 4); // staircase B
-        let l = peel(&mut g, 3).expect("peel cellar");
-        g.set_room_layer(4, l); // ensure both cellar rooms in the new layer
-        g.set_pos(3, (0, 0));
-        g.set_pos(4, (0, 1));
-        let up = interlayer_badges(&g, MAIN_LAYER);
-        assert_eq!(up.len(), 2, "two independent staircases → two badges");
-        assert!(up.iter().all(|e| e.is_stub));
-        // The peel named the layer after room 3's label ("CellarN"); badge text is
-        // "<dest room> · <dest layer>". Assert the shape, not a brittle literal.
-        assert!(up.iter().all(|e| e.dest_label.as_deref().is_some_and(|s| s.contains(" · "))));
-        assert!(up.iter().any(|e| e.dest_label.as_deref() == Some("CellarN · CellarN")));
-    }
-
     /// Fold a whole layer into `target` — the old `merge_layer_into`, now a whole-layer region
     /// moved onto an existing one.
     fn merge_into(g: &mut MapGraph, layer: LayerId, target: LayerId) -> Result<LayerId, MoveRefusal> {
@@ -1024,5 +943,18 @@ mod tests {
         // And it goes back: fold the peeled layer home and the map is whole again.
         merge_into(&mut g, l, MAIN_LAYER).expect("fold back");
         assert_eq!(g.rooms_in_layer(MAIN_LAYER), vec![1, 2, 3, 4]);
+    }
+
+    /// SQ-1540: peeling a region moves rooms to a new layer (`set_room_layer`), mints that layer
+    /// (`new_layer`) and may reposition a colliding room (`set_pos`) — every one of which is
+    /// already a `MapGraph::struct_gen` mutator, so `move_region` bumps it for free. This just
+    /// confirms the wiring holds at the call this file itself makes.
+    #[test]
+    fn move_region_bumps_struct_gen() {
+        let mut g = two_floors();
+        let region = region_at_edge(&g, 1, Direction::E).expect("the 1→2 passage is a seam");
+        let gen = g.struct_gen();
+        move_region(&mut g, &region, MoveTarget::New).expect("peel");
+        assert_ne!(g.struct_gen(), gen, "move_region must bump the structural generation counter");
     }
 }

@@ -83,9 +83,9 @@ pub fn draw_launch_options(
     buf: &mut Buffer,
 ) -> Option<LaunchOptionsRects> {
     // Rows: art choices (+ "inherit"), a blank, the interpreter line, its
-    // provenance line, a blank, the checkbox, the escape-hatch note and the key
-    // hints, plus a caveat line for each thing the current choice warrants one
-    // for. Plus dialog chrome + button row.
+    // provenance line, a blank, the checkbox and the escape-hatch note, plus a
+    // caveat line for each thing the current choice warrants one for. Plus
+    // dialog chrome + button row.
     //
     // Counting the caveats HERE is what keeps a short list from scrolling: the
     // list is filtered to this story's own archives now — four for Zork Zero,
@@ -93,7 +93,7 @@ pub fn draw_launch_options(
     // because a warning line took its last row would be paging for nothing.
     let caveat_lines = u16::from(st.clears_inherited_art())
         + u16::from(st.chosen_art().is_some_and(|c| c.caveat().is_some()));
-    let body_rows = st.row_count() as u16 + 5 + caveat_lines;
+    let body_rows = st.row_count() as u16 + 4 + caveat_lines;
     let w = MAX_W.min(area.width.saturating_sub(4));
     let h = (body_rows + 3).min(MAX_H).min(area.height.saturating_sub(2));
     if w < MIN_W || h < MIN_H {
@@ -158,12 +158,13 @@ pub fn draw_launch_options(
     // The list is short now that it is filtered to this story's own archives —
     // five at the very most in the real library — but a folder can hold anything,
     // so it still scrolls; nothing else does.
-    // blank, interpreter, provenance, checkbox, escape hatch, key hints
-    const TAIL: u16 = 6;
+    // blank, interpreter, provenance, [picture resolution], colour source,
+    // game colours, checkbox, escape hatch (SQ-1532 added the two colour rows)
+    let tail: u16 = 7 + u16::from(st.scott_native_pictures);
     // The "N more above/below" markers cost rows too, and only exist when the
     // list actually scrolls — so budget for them only then, in two passes.
-    let fixed = 1 + TAIL + caveat_lines; // + the "Artwork" heading
-    let art_total = st.candidates.len() + 1;
+    let fixed = 1 + tail + caveat_lines; // + the "Artwork" heading
+    let art_total = st.art_rows();
     let loose = content.height.saturating_sub(fixed);
     let marks = if art_total > usize::from(loose) { 2 } else { 0 };
     let art_rows = usize::from(content.height.saturating_sub(fixed + marks).max(1));
@@ -208,7 +209,7 @@ pub fn draw_launch_options(
                 };
                 option_row(buf, 0, &label, &mut rows, &mut y);
             }
-            Some(i) => {
+            Some(i) if i < st.candidates.len() => {
                 let c = &st.candidates[i];
                 let mark = if st.art == idx { "(•)" } else { "( )" };
                 // Where an archive with no path of its own lives: `CPic.data` is
@@ -224,6 +225,13 @@ pub fn draw_launch_options(
                     note(&crate::launch_options::medium_note(c)),
                 );
                 option_row(buf, idx, &label, &mut rows, &mut y);
+            }
+            // The one past every candidate: "None, text only" (SQ-1556) — this
+            // launch forces no picture source at all, whatever the story would
+            // otherwise draw.
+            Some(_) => {
+                let mark = if st.is_text_only() { "(•)" } else { "( )" };
+                option_row(buf, idx, &format!("  {mark} None, text only"), &mut rows, &mut y);
             }
         }
     }
@@ -250,7 +258,7 @@ pub fn draw_launch_options(
     }
 
     // Pin the tail to the bottom of the content so it never slides with the list.
-    y = content.bottom().saturating_sub(TAIL).max(y);
+    y = content.bottom().saturating_sub(tail).max(y);
     // The number, and where it came from. Showing the provenance is the point:
     // picking an Amiga archive MOVES an auto interpreter to the Amiga, and doing
     // that silently — changing the emulated machine because someone chose
@@ -260,7 +268,7 @@ pub fn draw_launch_options(
         None => "auto".to_string(),
     };
     y += 1;
-    option_row(buf, st.candidates.len() + 1, &format!("  Interpreter   {shown}"), &mut rows, &mut y);
+    option_row(buf, st.art_rows(), &format!("  Interpreter   {shown}"), &mut rows, &mut y);
     let derived = match st.derived() {
         Some((n, src)) => format!(
             "      header 0x1E = {n} ({}) — {}",
@@ -271,15 +279,42 @@ pub fn draw_launch_options(
     };
     line(buf, &derived, dim, &mut y);
 
+    // Picture resolution (SQ-1473): only for a Scott entry with native C64
+    // vector pictures — a Blorb's pictures are pre-rendered bitmaps with no
+    // second resolution to choose, so the row does not exist for one.
+    if st.scott_native_pictures {
+        let label = format!("  Picture resolution   {}", st.scott_resolution.label());
+        option_row(buf, st.art_rows() + 1, &label, &mut rows, &mut y);
+    }
+
+    // Colour source and game colours (SQ-1532): always present, unlike the
+    // picture-resolution row above — locking shows the row FIXED/READ-ONLY
+    // rather than hiding it, per the confirmed design, so a CLI-set value is
+    // still visible and its provenance is said on screen.
+    let colour_source_idx = st.art_rows() + 1 + usize::from(st.scott_native_pictures);
+    let cs_note = if st.colour_source_cli_locked { "   (fixed by --colour)" } else { "" };
+    let cs_label = format!(
+        "  Colour source   {}{}",
+        crate::launch_options::colour_source_label(st.colour_source),
+        cs_note,
+    );
+    option_row(buf, colour_source_idx, &cs_label, &mut rows, &mut y);
+
+    let game_colours_idx = colour_source_idx + 1;
+    let gc_note = if st.honor_game_colours_cli_locked { "   (fixed by --game-colours)" } else { "" };
+    let gc_label =
+        format!("  {} Game colours (honor the story's own){}", checkbox(st.honor_game_colours), gc_note);
+    option_row(buf, game_colours_idx, &gc_label, &mut rows, &mut y);
+
+    let persist_idx = game_colours_idx + 1;
     let persist = format!("  {} Save as this game's default", checkbox(st.persist));
-    option_row(buf, st.candidates.len() + 2, &persist, &mut rows, &mut y);
+    option_row(buf, persist_idx, &persist, &mut rows, &mut y);
     // The escape hatch, said on screen rather than left to the docs. The list
     // above is filtered by name, so an archive under an unrelated name — the
     // renamed `FMVPOKER.EG1` case — will not appear in it, and someone who has
     // one must not be left thinking it is unreachable. Naming a path outright
     // has always been the durable form and still wins over everything.
     line(buf, "  another name? pictures = \"…\" in the game's config, or --pictures", dim, &mut y);
-    line(buf, "  ↑/↓ choose   Space select/toggle   Tab buttons   Esc cancel", dim, &mut y);
 
     Some(LaunchOptionsRects {
         area: rects.area,
@@ -289,7 +324,7 @@ pub fn draw_launch_options(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-render"))]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
@@ -340,6 +375,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// SQ-1556: "None, text only" draws as a real row in the art list — always
+    /// last, one past every candidate — with its own hit-rect and a selection
+    /// mark that follows `st.art`, exactly like every other art choice.
+    #[test]
+    fn none_text_only_draws_as_the_last_art_choice() {
+        let dir = tmp("text-only-draw");
+        let story = dir.join("story.z6");
+        std::fs::write(&story, b"x").unwrap();
+        let mut st = LaunchOptionsState::new("Story", &story, None, None, Some(6), None);
+        assert!(st.candidates.is_empty(), "a dummy story has no real archives beside it");
+
+        let (text, rects) = render(&st, 90, 24);
+        let r = rects.expect("dialog renders at 90x24");
+        assert!(text.contains("None, text only"), "{text:?}");
+        assert!(text.contains("( ) None, text only"), "unselected mark: {text:?}");
+        assert_eq!(r.rows.len(), st.row_count(), "one hit-rect per selectable row, text-only included");
+        assert!(
+            r.rows.iter().any(|(idx, _)| *idx == st.text_only_index()),
+            "the text-only row is a hit-rect at its own flat index"
+        );
+
+        st.art = st.text_only_index();
+        let (text2, _) = render(&st, 90, 24);
+        assert!(text2.contains("(•) None, text only"), "selected mark: {text2:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_checkbox_shows_its_state() {
         let dir = tmp("check");
@@ -364,6 +426,73 @@ mod tests {
         let (text, _) = render(&st, 90, 24);
         assert!(text.contains("Interpreter   4 Amiga"), "{text:?}");
         assert!(text.contains("set here"), "provenance says explicit: {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1532: the colour-source and game-colours rows always draw, and an
+    /// unlocked row carries no lock note.
+    #[test]
+    fn the_colour_rows_draw_with_no_lock_note_when_unlocked() {
+        let dir = tmp("colours-unlocked");
+        let story = dir.join("story.z6");
+        std::fs::write(&story, b"x").unwrap();
+        let st = LaunchOptionsState::new("Story", &story, None, None, Some(6), None)
+            .with_colours(Some(crate::config::ColourSource::Theme), false, true, false);
+        let (text, rects) = render(&st, 90, 24);
+        assert!(text.contains("Colour source   Theme"), "{text:?}");
+        assert!(text.contains("Game colours"), "{text:?}");
+        assert!(!text.contains("fixed by --colour"), "unlocked row carries no provenance note: {text:?}");
+        assert!(!text.contains("fixed by --game-colours"), "{text:?}");
+        let r = rects.expect("dialog renders at 90x24");
+        assert_eq!(r.rows.len(), st.row_count(), "one hit-rect per selectable row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1532: a CLI-locked row is shown FIXED, not hidden — it still draws
+    /// (and is still a hit-rect, so the cursor can land on it, even though it
+    /// cannot be changed), and a visible provenance note says where the value
+    /// came from, per the confirmed design.
+    #[test]
+    fn a_cli_locked_row_still_draws_with_a_provenance_note() {
+        let dir = tmp("colours-locked");
+        let story = dir.join("story.z6");
+        std::fs::write(&story, b"x").unwrap();
+        let st = LaunchOptionsState::new("Story", &story, None, None, Some(6), None)
+            .with_colours(Some(crate::config::ColourSource::Machine), true, false, true);
+        let (text, rects) = render(&st, 90, 24);
+        assert!(text.contains("Colour source   Machine"), "the value still shows: {text:?}");
+        assert!(text.contains("fixed by --colour"), "provenance note: {text:?}");
+        assert!(text.contains("fixed by --game-colours"), "provenance note: {text:?}");
+        assert!(text.contains("[ ] Game colours"), "the checkbox still reflects its CLI-set value: {text:?}");
+        let r = rects.expect("dialog renders at 90x24");
+        assert_eq!(r.rows.len(), st.row_count(), "a locked row is still a row, not hidden");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SQ-1473: the "Picture resolution" row is drawn only for a Scott entry
+    /// with native C64 vector pictures, and it is one of the hit-rects
+    /// (`r.rows`) exactly when it is drawn — never a row the eye sees but the
+    /// mouse/keyboard cannot reach, or the reverse.
+    #[test]
+    fn the_resolution_row_draws_only_for_a_native_c64_entry() {
+        let dir = tmp("resolution-draw");
+        let story = dir.join("story.prg");
+        std::fs::write(&story, b"x").unwrap();
+
+        let plain = LaunchOptionsState::new("Story", &story, None, None, None, None);
+        let (plain_text, plain_rects) = render(&plain, 90, 24);
+        assert!(!plain_text.contains("Picture resolution"), "no row for a plain story: {plain_text:?}");
+        let plain_rects = plain_rects.expect("dialog renders at 90x24");
+        assert_eq!(plain_rects.rows.len(), plain.row_count());
+
+        let native = LaunchOptionsState::new("Story", &story, None, None, None, None)
+            .with_scott_resolution(true, crate::graphics::ScottPictureResolution::default());
+        let (native_text, native_rects) = render(&native, 90, 24);
+        assert!(native_text.contains("Picture resolution"), "row must draw: {native_text:?}");
+        assert!(native_text.contains("hi-res (default)"), "default label: {native_text:?}");
+        let native_rects = native_rects.expect("dialog renders at 90x24");
+        assert_eq!(native_rects.rows.len(), native.row_count(), "one hit-rect per selectable row, resolution included");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -39,7 +39,7 @@
 //!
 //! # Where a candidate may come from
 //!
-//! Four sources, and [`StoryVocabulary::candidates`] simply concatenates them:
+//! Five sources, and [`StoryVocabulary::candidates`] simply concatenates them:
 //!
 //! 1. **A near miss.** `lanturn` is one keystroke from `lantern`, and a
 //!    near-miss against a word this story really holds is strong evidence.
@@ -56,10 +56,49 @@
 //! 4. **The story's own synonyms.** Once a VERB is identified, whichever source
 //!    found it, [`grammar_model::Verb::words`] is every spelling the dictionary
 //!    gives it — free, and on all three engines.
+//! 5. **A bare grammatical coincidence, as a LAST RESORT.** When the first
+//!    four found nothing at all, [`StoryVocabulary::by_grammar_shape`] asks
+//!    whether some verb this story implements accepts the exact sentence
+//!    shape already typed — the same count of noun phrases and the same
+//!    literal prepositions — with no claim of any relation to the word
+//!    typed. `use lockpick on plate` has no meaning in common with `touch
+//!    lockpick on plate` at all; `touch`'s grammar simply happens to accept
+//!    the shape (SQ-1642).
+//! 6. **The same coincidence, UNPREPOSITIONED — and only ever shown once
+//!    vetted.** `pickup toolcase` reaches none of the first five: it is not a
+//!    near miss or stem of `get`, and the synonym table's key is the
+//!    two-word `pick up`, a different string from the one-word `pickup`
+//!    typed. [`StoryVocabulary::by_bare_grammar_shape`] asks the fifth
+//!    source's question again, but for a bare `VERB noun` shape with no
+//!    literal preposition at all — deliberately excluded from source 5,
+//!    because it is the single commonest shape in the medium and an
+//!    UNVETTED claim built on it alone is worthless noise (SQ-1644). So a
+//!    candidate from this source is marked vetting-mandatory
+//!    ([`Pick::requires_vetting`]) and [`offer_vocabulary`] never shows one
+//!    through the unvetted "this story knows" fallback — only through a
+//!    vetted "try instead", or not at all.
+//! 7. **A running-together of two of the story's own words — and only ever
+//!    shown once vetted, same as source 6.** Every source above answers
+//!    `pickup toolcase` with nothing at all, source 6 included: source 6
+//!    still needs SOME verb to accept the exact shape typed, and no verb of
+//!    this story is spelled `pickup`, one word. But this story's own `pick`
+//!    genuinely takes a literal `up` somewhere in its grammar
+//!    ([`grammar_model::Verb::prepositions`]) — `pickup` is `pick` and `up`
+//!    run together with no space. [`StoryVocabulary::by_word_split`] tries
+//!    every way of cutting the typed word into a leading and a trailing
+//!    piece and asks, of each cut, whether the LEADING piece names a verb
+//!    this story holds and the TRAILING piece is a literal word that very
+//!    verb's own grammar spells — a WORD-SEGMENTATION coincidence, never a
+//!    sentence-shape one, and the one gap sources 5 and 6 cannot reach
+//!    because neither of them ever looks at the typed word's characters at
+//!    all (SQ-1645).
 //!
 //! The first two and the fourth are answerable from the story file alone; the
-//! third is the only one that is not, and it needed no seam of its own to arrive
-//! — which is why the sources are a concatenation and not a chain.
+//! third is the only one that needs an outside corpus, and it needed no seam
+//! of its own to arrive — which is why the sources are a concatenation and
+//! not a chain. The fifth, sixth and seventh need nothing but the story file
+//! either, and are held back until the sources above them have nothing to
+//! say, because unlike those they are not evidence about the word at all.
 //!
 //! Whatever proposes a candidate, [`StoryVocabulary::offer`] intersects it with
 //! this story's dictionary before anything is shown. **The player must never be
@@ -192,6 +231,12 @@ pub struct StoryVocabulary {
     /// database. `flashlight` is stored as `flashl` in a Version 3 game, and
     /// comparing untruncated forms would report every long word unknown.
     key_len: usize,
+    /// Every word the story's own static text holds ([`Engine::story_text_words`]),
+    /// empty where the engine has no reader for it.
+    text_words: BTreeSet<String>,
+    /// Dictionary key → the whole word it was cut from, for the keys that can be
+    /// spelled out with confidence (SQ-1553). See [`Self::spell`].
+    spellings: BTreeMap<String, String>,
 }
 
 impl StoryVocabulary {
@@ -221,7 +266,45 @@ impl StoryVocabulary {
         for w in words.keys() {
             by_trunc.entry(cut(w)).or_insert_with(|| w.clone());
         }
-        StoryVocabulary { verbs, by_word, words, by_trunc, prepositions, key_len }
+        StoryVocabulary {
+            verbs,
+            by_word,
+            words,
+            by_trunc,
+            prepositions,
+            key_len,
+            text_words: BTreeSet::new(),
+            spellings: BTreeMap::new(),
+        }
+    }
+
+    /// Attach the story's own text and build the spelling table from it and the
+    /// shipped lexicon (SQ-1553). `None` — an engine with no text reader — still
+    /// gets the lexicon.
+    pub fn with_story_text(mut self, text: Option<BTreeSet<String>>) -> StoryVocabulary {
+        self.text_words = text.unwrap_or_default();
+        self.spellings = full_spellings(self.words.keys(), self.key_len, &self.text_words);
+        self
+    }
+
+    /// Every word the story's own static text holds — empty where the engine
+    /// could not read it.
+    pub fn text_words(&self) -> &BTreeSet<String> {
+        &self.text_words
+    }
+
+    /// A dictionary entry as the player should SEE it: the whole word where the
+    /// entry was cut short and exactly one whole word is known to have been
+    /// cut to it, and the entry as stored otherwise (SQ-1553).
+    ///
+    /// **Display only, and safe to type back.** `lanter` shows as `lantern`;
+    /// typing `lantern` reaches the same entry, because the parser truncates the
+    /// player's word exactly as the dictionary truncated its own. Where the
+    /// evidence is ambiguous — Zork I's text says both `machine` and `machinery`
+    /// — the key is shown as stored, because a truncated word is still one that
+    /// works and a guessed one might be a lie.
+    pub fn spell<'a>(&'a self, entry: &'a str) -> &'a str {
+        self.spellings.get(entry).map_or(entry, String::as_str)
     }
 
     /// Drop every dictionary word this story's own tokeniser would never hand
@@ -282,6 +365,8 @@ impl StoryVocabulary {
         if self.words.keys().all(|w| typeable(w)) {
             return self;
         }
+        // Applied before [`Self::with_story_text`] (see `VocabState::get`), so
+        // there is no text or spelling table here yet to carry across.
         let StoryVocabulary { mut verbs, words, prepositions, key_len, .. } = self;
         for v in &mut verbs {
             v.words.retain(|w| typeable(w));
@@ -321,9 +406,50 @@ impl StoryVocabulary {
 
     /// The dictionary entry a spelling reaches, truncation included: `examine`
     /// finds the `examin` a Version 3 dictionary actually stores.
+    ///
+    /// `word` may be a whole phrase — a synonym table member such as `look
+    /// sharp` or `put on` — and that is exactly the case a naive truncation
+    /// gets wrong (SQ-1238), and dictionary membership alone still gets wrong
+    /// (SQ-1240).
+    ///
+    /// **SQ-1238: every word, not the phrase truncated as one string.**
+    /// [`Self::truncated`] cuts to `key_len` CHARACTERS, so truncating the
+    /// phrase as one string lands on a real dictionary key by accident: a
+    /// Scott Adams database keeping four characters stores `look` for `look`,
+    /// and `"look sharp".chars().take(4)` is ALSO `look` — so the phrase reads
+    /// as known whether or not the story has ever heard of `sharp`. The
+    /// truncation map is keyed per WORD, so every later word has to resolve
+    /// as a dictionary entry on its own — truncated by ITS OWN characters,
+    /// not the phrase's.
+    ///
+    /// **SQ-1240: every word resolving is still not enough.** `light` and
+    /// `up` can each be a genuine dictionary word of a story that has no
+    /// `light up` action at all — Zork I's dictionary holds both, and its
+    /// grammar never pairs them. What settles a MULTI-word member is the
+    /// story's own GRAMMAR, not its dictionary: the first word must resolve
+    /// to a verb this story implements, and every later word must be one of
+    /// the literal words that verb's own syntax lines actually pair it with
+    /// — its real prepositions, [`Verb::prepositions`]. A Scott Adams game
+    /// has no prepositions at all (verb + noun only, never verb + literal),
+    /// so no multi-word member can ever match one; that alone is what closes
+    /// `adv03.dat`'s `look` / `sha` collision, which SQ-1238's per-word
+    /// dictionary check could not (`sharp` truncates to `sha`, a real but
+    /// unrelated verb there, so every word of `look sharp` "resolves").
+    ///
+    /// A single-word query never reaches either check: `rest` is empty and
+    /// the phrase reduces to the ordinary lookup SQ-1238 left in place.
     fn stored(&self, word: &str) -> Option<(&String, WordRoles)> {
         let w = word.to_lowercase();
-        let key = self.by_trunc.get(&self.truncated(&w))?;
+        let mut parts = w.split_whitespace();
+        let first = parts.next()?;
+        let rest: Vec<&str> = parts.collect();
+        if !rest.is_empty() {
+            let preps = self.verb_named(first)?.prepositions();
+            if !rest.iter().all(|r| preps.iter().any(|p| p.eq_ignore_ascii_case(r))) {
+                return None;
+            }
+        }
+        let key = self.by_trunc.get(&self.truncated(first))?;
         self.words.get_key_value(key).map(|(k, r)| (k, *r))
     }
 
@@ -438,7 +564,11 @@ pub fn typeable_name(
         }
         return Some(tokens[start..=noun].join(" "));
     }
-    obj.words.first().cloned().or_else(|| obj.display_name())
+    // A parse name is a dictionary key, so it may be cut short (SQ-1553).
+    obj.words
+        .first()
+        .map(|w| vocab.map_or(w.as_str(), |v| v.spell(w)).to_string())
+        .or_else(|| obj.display_name())
 }
 
 /// Every word the parser accepts for `obj`, spelled the way the story SPELLS
@@ -489,7 +619,8 @@ pub fn typeable_words(
     }
     for w in obj.words.iter().chain(obj.adjectives.words()) {
         if !out.iter().any(|t| cut(t) == cut(w)) {
-            out.push(w.clone());
+            // A stored key, so spelled out where it can be (SQ-1553).
+            out.push(vocab.map_or(w.as_str(), |v| v.spell(w)).to_string());
         }
     }
     out
@@ -513,14 +644,27 @@ struct Candidate {
     /// The dictionary spelling, exactly as the story stores it.
     word: String,
     /// 0 for a word the player nearly typed, 1 for one the typed word MEANS,
-    /// 2 for another spelling the story gives whatever either of those found.
+    /// 2 for another spelling the story gives whatever either of those found,
+    /// 3 for a verb reached only because it happens to accept the same
+    /// sentence shape the player typed
+    /// ([`by_grammar_shape`](StoryVocabulary::by_grammar_shape)), 4 for the
+    /// same coincidence with no literal preposition at all
+    /// ([`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)),
+    /// 5 for two of the story's own words found run together with no space
+    /// between them ([`by_word_split`](StoryVocabulary::by_word_split)) — no
+    /// claim about the word at all, the weakest ranks and why they sort
+    /// last; tiers 4 and 5 additionally may never be shown unvetted (see
+    /// [`Pick::requires_vetting`]).
     ///
-    /// Three ranks and not two, because `order` is an index into whichever table
+    /// Six ranks and not two, because `order` is an index into whichever table
     /// a source read and says nothing across sources: `doff` reaches `remove`
     /// first in the synonym table and `carry` first in Zork's own verb entry,
     /// both at 0, and the tie was settled alphabetically in favour of the aside.
     /// The evidence is what separates them — the form itself, then the meaning,
-    /// then what the story calls the answer as well.
+    /// then what the story calls the answer as well, then bare grammatical
+    /// coincidence when nothing else answered at all, then that same
+    /// coincidence stripped of even its one literal anchor, then a coincidence
+    /// of SEGMENTATION rather than of shape at all.
     tier: usize,
     /// How far from what was typed — the edit distance, or 0 for a stem.
     distance: usize,
@@ -538,6 +682,19 @@ struct Candidate {
     /// answered with `carry · catch · get`, because the one word that was right
     /// looked like a fragment and was dropped in favour of its own asides.
     whole: bool,
+    /// True when this is a [`by_meaning`](StoryVocabulary::by_meaning) candidate
+    /// reached from the TYPED word itself, rather than from one of its stems
+    /// (SQ-1232).
+    ///
+    /// `hasten` is not a typo — it is an English verb the shipped table already
+    /// groups with `rush` and `hie` — and a story that implements one of those
+    /// has answered the question `by_near_miss` can only guess at. So this one
+    /// candidate outranks a spelling neighbour on the strength of that group
+    /// membership: `fasten` at distance one used to win over `rush` every time,
+    /// because tier alone put every near miss ahead of every meaning guess. A
+    /// meaning reached by STEMMING first (`hastening` → `hasten`) is still a
+    /// guess about what the player meant to type and is not marked here.
+    exact_meaning: bool,
 }
 
 /// One word an offer line will name, and how it was arrived at.
@@ -563,6 +720,21 @@ pub struct Pick {
     /// own, and the two cannot be told apart downstream once the line is a list
     /// of strings (SQ-1145).
     pub proposed: bool,
+    /// True for a candidate reached only by
+    /// [`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)
+    /// (tier 4) or [`by_word_split`](StoryVocabulary::by_word_split) (tier
+    /// 5) — a bare-noun grammatical coincidence with no literal preposition
+    /// anchoring it at all, or a word-segmentation coincidence with no
+    /// claim about meaning at all; the single commonest shape in the medium
+    /// (tier 4) and a claim naming a phrase the player never typed at all
+    /// (tier 5), and worthless as unvetted evidence either way (SQ-1644,
+    /// SQ-1645; see each source's own doc for why tier 3's
+    /// preposition-anchored cousin is exempt from this).
+    ///
+    /// A pick with this set must never reach the player through the unvetted
+    /// "this story knows" fallback — only through a vetted "try instead", or
+    /// not at all. [`offer_vocabulary`] is where that rule is enforced.
+    pub requires_vetting: bool,
 }
 
 /// The most an offer may name. Three, and it is a limit rather than a target:
@@ -591,34 +763,105 @@ pub const MAX_OFFERED: usize = 3;
 /// the story disposes — at three letters exactly as at eight.
 const MIN_LEN: usize = 4;
 
+/// The most raw candidates [`by_grammar_shape`](StoryVocabulary::by_grammar_shape)
+/// may put into the pool, deliberately smaller than [`MAX_OFFERED`] allows
+/// downstream.
+///
+/// Every other source here is evidence about the WORD — a near miss, a stem, a
+/// meaning, a story's own synonym. `by_grammar_shape` is evidence about
+/// nothing but the SENTENCE: it never looks at what the player typed at all,
+/// only at whether some other verb this story implements happens to accept the
+/// same count of noun phrases and the same literal prepositions. That
+/// coincidence is real and it is also the weakest thing any source here can
+/// offer, which is why it only runs once every other source has found
+/// nothing (see [`candidates`](StoryVocabulary::candidates)) — and why, even
+/// then, it must not be allowed to flood the ranking pool with every verb in
+/// a large grammar that happens to share one common shape (`verb noun prep
+/// noun` is not a rare shape). `MAX_OFFERED` still applies after ranking, as
+/// it does to every source; this cap keeps the pool itself small before that
+/// ranking ever runs.
+///
+/// Shared with [`by_bare_grammar_shape`](StoryVocabulary::by_bare_grammar_shape)
+/// (tier 4, SQ-1644) rather than given a cap of its own: the two ask the same
+/// question of the same pool for the same reason, and never contribute in the
+/// same call (`by_bare_grammar_shape` only runs when tier 3 added nothing).
+const MAX_SHAPE_CANDIDATES: usize = 8;
+
+/// The shortest a piece on either side of a
+/// [`by_word_split`](StoryVocabulary::by_word_split) cut may be.
+///
+/// A one-character piece is not a verb or a particle in any story this
+/// interpreter runs, and admitting it would mean every typed word starting or
+/// ending in a letter that also happens to be a one-letter verb abbreviation
+/// (`x`, `z`, `g`, `i`, `l`, `q` are common Infocom and Scott Adams shortcuts)
+/// produces a "split" on almost nothing. Two is the floor real English still
+/// clears — `log` + `in`, `pick` + `up`, `sit` + `on` all have a two-character
+/// side — and is deliberately not longer: a literal is very often a short
+/// preposition (`on`, `up`, `in`, `at`), and requiring three would silently
+/// drop the shortest and commonest ones.
+const MIN_SPLIT_LEN: usize = 2;
+
+/// The most raw candidates [`by_word_split`](StoryVocabulary::by_word_split)
+/// may put into the pool, mirroring [`MAX_SHAPE_CANDIDATES`]'s own reasoning
+/// but not its cap: that one bounds a walk over every verb in the story's
+/// WHOLE GRAMMAR, which can run to hundreds; this one bounds a walk over the
+/// cut points of one TYPED WORD, which is at most its length minus
+/// `2 * MIN_SPLIT_LEN` — for any word actually worth offering back to a
+/// player, already a handful. The cap exists anyway, and separately, because
+/// nothing here stops a player pasting something absurdly long into the
+/// input line, and a pool that size should still be bounded before
+/// [`offer_picks`](Self::offer_picks) ever ranks or trims it down to
+/// [`MAX_OFFERED`].
+const MAX_SPLIT_CANDIDATES: usize = 8;
+
 /// Words the parser ignores and a shape count must ignore with it.
 const ARTICLES: &[&str] = &["the", "a", "an", "some", "my", "his", "her", "its", "their"];
 
 impl StoryVocabulary {
-    /// Every word this story holds that the player may have meant by `typed`.
+    /// Every word this story holds that the player may have meant by `typed`,
+    /// which sat at `position` in a command whose other words already read as
+    /// `nouns` noun phrases and the literal words `preps`.
     ///
     /// The sources are CONCATENATED, not chained: each proposes independently
     /// and the ranking in [`offer`](Self::offer) settles them. SQ-1119's
     /// meaning-driven source joined the list here as one more line, knowing
     /// nothing about the ones beside it — which is what the shape was for.
-    fn candidates(&self, typed: &str, position: Position) -> Vec<Candidate> {
+    /// `nouns`/`preps` exist only for
+    /// [`by_grammar_shape`](Self::by_grammar_shape), the last of the five —
+    /// every source above it answers from the WORD alone.
+    fn candidates(
+        &self,
+        typed: &str,
+        position: Position,
+        nouns: usize,
+        preps: &[&str],
+    ) -> Vec<Candidate> {
         let mut out = Vec::new();
         self.by_near_miss(typed, position, &mut out);
         self.by_ending(typed, position, &mut out);
         self.by_meaning(typed, position, &mut out);
-        // Meaning speaks only where FORM reached nothing. A near miss or a
-        // changed ending is evidence about the word the player really typed; a
-        // synonym is a guess at what they meant, and with the first in hand the
-        // second is wallpaper — `opening mailbox` wants `open`, and two games in
-        // the corpus put `look` and `read` on that same verb, so the offer read
-        // `open · read · look` until this line. It sits here rather than in the
-        // ranking below because the aside source builds on whatever it finds: a
-        // proposal that is not going to be shown must not leave its asides
-        // behind, spelled by a verb nothing else reached.
+        // Meaning speaks only where FORM reached nothing — UNLESS the typed
+        // word is itself a known word with a meaning of its own (SQ-1232). A
+        // near miss or a changed ending is evidence about the word the player
+        // really typed; a synonym reached by STEMMING is a guess at what they
+        // meant, and with the first in hand the second is wallpaper —
+        // `opening mailbox` wants `open`, and two games in the corpus put
+        // `look` and `read` on that same verb, so the offer read `open · read
+        // · look` until this line. But `hasten` is not a guess: the shipped
+        // table already groups it with `rush`, so a story that implements
+        // `rush` has answered the question, and `fasten` sitting one keystroke
+        // away must not crowd that answer out — `exact_meaning` is what keeps
+        // it. It sits here rather than in the ranking below because the aside
+        // source builds on whatever it finds: a proposal that is not going to
+        // be shown must not leave its asides behind, spelled by a verb nothing
+        // else reached.
         if out.iter().any(|c| c.tier == 0) {
-            out.retain(|c| c.tier != 1);
+            out.retain(|c| c.tier != 1 || c.exact_meaning);
         }
         self.by_story_synonym(position, &mut out);
+        self.by_grammar_shape(position, nouns, preps, &mut out);
+        self.by_bare_grammar_shape(position, nouns, preps, &mut out);
+        self.by_word_split(typed, position, &mut out);
         out
     }
 
@@ -650,7 +893,14 @@ impl StoryVocabulary {
                 continue;
             }
             if osa(&key, &self.truncated(word)) == 1 {
-                out.push(Candidate { word: word.clone(), tier: 0, distance: 1, order, whole: false });
+                out.push(Candidate {
+                    word: word.clone(),
+                    tier: 0,
+                    distance: 1,
+                    order,
+                    whole: false,
+                    exact_meaning: false,
+                });
             }
         }
     }
@@ -668,7 +918,14 @@ impl StoryVocabulary {
             let word = word.clone();
             let order = self.words.keys().position(|k| *k == word).unwrap_or(0);
             if !out.iter().any(|c| c.word == word) {
-                out.push(Candidate { word, tier: 0, distance: 0, order, whole: false });
+                out.push(Candidate {
+                    word,
+                    tier: 0,
+                    distance: 0,
+                    order,
+                    whole: false,
+                    exact_meaning: false,
+                });
             }
         }
     }
@@ -704,6 +961,10 @@ impl StoryVocabulary {
             return;
         }
         for lemma in std::iter::once(typed.to_string()).chain(stems(typed)) {
+            // The typed word itself, unstemmed, is the strong case (SQ-1232):
+            // `hasten` is a group member in its own right, not a guess reached
+            // by stripping a suffix off something else.
+            let exact_meaning = lemma == typed;
             let known = |w: &str| self.stored(w).is_some_and(|(s, r)| self.fills(s, r, position));
             for (order, word) in
                 verb_synonyms::suggest(&lemma, known, MAX_OFFERED).into_iter().enumerate()
@@ -715,6 +976,7 @@ impl StoryVocabulary {
                         distance: 0,
                         order,
                         whole: true,
+                        exact_meaning,
                     });
                 }
             }
@@ -725,12 +987,25 @@ impl StoryVocabulary {
     /// dictionary spelling of one verb, so a story that groups `take` with `get`
     /// and `hold` teaches the player its own vocabulary at no cost — and after
     /// every other source, whichever one found the verb, because it is an aside.
+    ///
+    /// **A PHRASE is never expanded this way** (SQ-1251). Since SQ-1238 a
+    /// multi-word synonym member can be a candidate in its own right, and
+    /// [`Self::verb_named`] resolves one through its FIRST word alone — so
+    /// `put on` reaches Zork I's `put` entry, whose other spellings are
+    /// `hide`, `insert`, `place` and `stuff`. Those are aliases of `put`, not
+    /// of `put on`, and they mean a different action: typing `don sword` was
+    /// answered `wear · put on · hide`, and hiding a sword is not wearing it.
+    /// The preposition is what carries the meaning, and the verb entry knows
+    /// nothing about it.
     fn by_story_synonym(&self, position: Position, out: &mut Vec<Candidate>) {
         if position != Position::Opening {
             return;
         }
         let found: Vec<String> = out.iter().map(|c| c.word.clone()).collect();
         for w in &found {
+            if w.split_whitespace().count() > 1 {
+                continue;
+            }
             let Some(verb) = self.verb_named(w) else { continue };
             for (order, other) in verb.words.iter().enumerate() {
                 // A one-letter abbreviation (`q`, `x`, `g`) is real vocabulary
@@ -746,9 +1021,242 @@ impl StoryVocabulary {
                         distance: 0,
                         order,
                         whole: false,
+                        exact_meaning: false,
                     });
                 }
             }
+        }
+    }
+
+    /// LAST RESORT: does some verb this story implements accept the exact
+    /// sentence shape the player already typed — the same count of noun
+    /// phrases and the same literal prepositions — with no claim of any
+    /// relation, spelled or meant, to the word the player actually typed?
+    ///
+    /// Every source above this one is evidence about the WORD: a keystroke
+    /// away, a different ending, what it MEANS, another spelling the story
+    /// gives the verb form already found. This one is evidence about none of
+    /// that — it never reads `typed` at all. `touch lockpick on plate`
+    /// solving *Spider and Web*'s `use lockpick on plate` is not a synonym
+    /// relationship; `use` and `touch` share no meaning whatsoever, and no
+    /// table anywhere groups them. The only thing connecting them is that
+    /// `touch`'s own grammar line happens to accept the exact shape the
+    /// player already typed — a coincidence of this story's OWN verb table,
+    /// not of English, and not evidence about what the player meant.
+    ///
+    /// That is exactly why this is gated far more strictly than the sources
+    /// above it: verbs only, so the opening word only, like
+    /// [`by_meaning`](Self::by_meaning); and — unlike `by_meaning`'s own
+    /// partial gate — it may add anything at all only when every earlier
+    /// source found NOTHING WHATSOEVER (`out.is_empty()` on entry). A bare
+    /// grammatical coincidence must never be allowed to crowd out even a weak
+    /// proposal that is genuinely evidence about the word, so this does not
+    /// merely defer to tier 0/1 the way `by_meaning` does — it defers to
+    /// silence itself.
+    ///
+    /// **And it requires at least one literal preposition of its own —
+    /// `preps` must not be empty.** A bare `VERB noun` line is not a
+    /// coincidence worth naming: it is the single commonest shape in the
+    /// medium, so nearly every verb in nearly every game accepts it, and
+    /// gating on it alone answered any one-noun typo with the story's own
+    /// verb list wholesale — confirmed against real fixtures, where it broke
+    /// `vocabulary_offer.rs`'s own `a_scott_story_does_not_credit_a_phrasal_synonym_through_truncation`
+    /// and `adv03_credits_no_phrasal_member_because_scott_adams_has_no_prepositions`
+    /// (a Scott Adams database's grammar is always `VERB` or `VERB noun`,
+    /// never `VERB word noun` — see `scott_session::story_vocabulary` —
+    /// so `Verb::prepositions()` is empty for every verb that format can
+    /// produce, and this refinement is what keeps this source silent there,
+    /// exactly as it always has been). A literal word is comparatively rare
+    /// per verb and much closer to the genuine coincidence the motivating
+    /// case actually is: `touch NOUN on NOUN` sharing `use lockpick on
+    /// plate`'s shape is notable because `on` is a specific word one verb's
+    /// table happens to spell the same way another's would have, not because
+    /// two verbs both merely take an object.
+    ///
+    /// [`MAX_SHAPE_CANDIDATES`] caps how many raw verbs this may push before
+    /// [`offer_picks`](Self::offer_picks) ever ranks or trims to
+    /// [`MAX_OFFERED`] — see that constant's own doc for why a second, tighter
+    /// cap sits in front of the shared one.
+    fn by_grammar_shape(&self, position: Position, nouns: usize, preps: &[&str], out: &mut Vec<Candidate>) {
+        if position != Position::Opening || !out.is_empty() || preps.is_empty() {
+            return;
+        }
+        for (order, verb) in self.verbs().iter().enumerate() {
+            if out.len() >= MAX_SHAPE_CANDIDATES {
+                break;
+            }
+            let Some(word) = verb.word() else { continue };
+            if !verb.accepts(nouns, preps) {
+                continue;
+            }
+            let word = word.to_string();
+            if out.iter().any(|c| c.word == word) {
+                continue;
+            }
+            out.push(Candidate { word, tier: 3, distance: 0, order, whole: true, exact_meaning: false });
+        }
+    }
+
+    /// [`by_grammar_shape`](Self::by_grammar_shape)'s own question, asked again
+    /// for the shape that source deliberately declines: a bare `VERB noun`
+    /// line, with no literal preposition anywhere in the command typed.
+    ///
+    /// `pickup toolcase` is the motivating case (SQ-1644): the player typed one
+    /// word, not two, so the synonym table's `pick up` key — a different
+    /// string — never matches, and `pickup` is no near miss or stem of `get`
+    /// either. Every source above this one, tier 3 included, answers nothing.
+    /// Yet `get toolcase` (or whichever verb this story spells that action) is
+    /// real, and its grammar's bare-noun line accepts exactly the shape typed.
+    ///
+    /// This is gated exactly like tier 3, with two differences:
+    ///
+    /// * **`preps` must be EMPTY, not non-empty.** This is tier 3's shape with
+    ///   the anchor removed — asked only when tier 3's own gate declined the
+    ///   command for lacking a literal preposition, never as a stronger
+    ///   alternative to it.
+    /// * **`self.prepositions` must not be empty.** Not the command typed —
+    ///   the STORY's whole grammar, which must spell a literal word
+    ///   *somewhere*, even though this command doesn't. A Scott Adams
+    ///   database's grammar is always `VERB` or `VERB noun` and never spells a
+    ///   literal word at all (`Verb::prepositions()` is empty for every verb
+    ///   that format can produce — see `by_grammar_shape`'s own doc), so
+    ///   `self.prepositions` is always empty there and this source never runs
+    ///   on that format at all. That is deliberate, not incidental: a bare
+    ///   `VERB noun` shape is EVERY line in that grammar, so the "commonest
+    ///   shape" problem tier 3's own gate protects against is at its worst
+    ///   there, and probing every candidate would cost the most for the least.
+    ///
+    /// Everything reached here is marked [`Candidate::tier`] 4, which
+    /// [`offer_picks`](Self::offer_picks) carries into
+    /// [`Pick::requires_vetting`]: unlike tier 3, a tier 4 candidate may never
+    /// be shown through the unvetted "this story knows" fallback — see that
+    /// field's own doc, and [`offer_vocabulary`] for where the rule is kept.
+    /// The bare shape this source trades on is the single commonest one in the
+    /// medium (nearly every verb accepts *some* object with no preposition at
+    /// all), which is exactly why [`by_grammar_shape`] excludes it from its
+    /// own UNVETTED claim; requiring vetting here is what makes surfacing it
+    /// safe rather than the noise the original gate was written to prevent.
+    fn by_bare_grammar_shape(
+        &self,
+        position: Position,
+        nouns: usize,
+        preps: &[&str],
+        out: &mut Vec<Candidate>,
+    ) {
+        if position != Position::Opening
+            || !out.is_empty()
+            || !preps.is_empty()
+            || self.prepositions.is_empty()
+        {
+            return;
+        }
+        for (order, verb) in self.verbs().iter().enumerate() {
+            if out.len() >= MAX_SHAPE_CANDIDATES {
+                break;
+            }
+            let Some(word) = verb.word() else { continue };
+            if !verb.accepts(nouns, preps) {
+                continue;
+            }
+            let word = word.to_string();
+            if out.iter().any(|c| c.word == word) {
+                continue;
+            }
+            out.push(Candidate { word, tier: 4, distance: 0, order, whole: true, exact_meaning: false });
+        }
+    }
+
+    /// LAST RESORT, beyond even tier 4: is the typed word simply TWO of the
+    /// story's own words, run together with no space? (SQ-1645, the reported
+    /// case: `pickup toolcase` in a story that implements `get toolcase` and
+    /// spells the action `pick up` as a verb plus a literal, not as a single
+    /// verb `pickup`.)
+    ///
+    /// This is not evidence about the word's FORM — `pickup` is not a near
+    /// miss or a stem of `get` at all, six keystrokes and no shared suffix.
+    /// It is not evidence about its MEANING either — the synonym table's key
+    /// is the two-word `pick up`, a different string from the one-word
+    /// `pickup` actually typed, so `by_meaning`'s exact lookup never reaches
+    /// it. And it is not the sentence-SHAPE coincidence tiers 3 and 4 look
+    /// for either — those never read the characters of `typed` at all, only
+    /// the number of noun phrases and literal words around it. This is a
+    /// fourth, genuinely different kind of gap: a coincidence of
+    /// SEGMENTATION, where the player's one typed token is this story's own
+    /// two tokens with the space missing.
+    ///
+    /// For every way of cutting `typed` into a leading piece and a trailing
+    /// piece, each at least [`MIN_SPLIT_LEN`] characters: does the leading
+    /// piece name a verb this story's dictionary holds
+    /// ([`Self::verb_named`]), and does that VERB's own grammar spell the
+    /// trailing piece literally somewhere
+    /// ([`grammar_model::Verb::prepositions`])? If both hold, this is not a
+    /// guess at a coincidence — it is a GRAMMAR FACT about this story's own
+    /// tables: `pick` is a real verb here, and its own syntax line genuinely
+    /// uses the literal `up`, so `pick up` is proposed, spelled the way the
+    /// verb and its literal are actually stored rather than the way the
+    /// player happened to type them (a truncated dictionary or a differently
+    /// cased literal would otherwise leak through).
+    ///
+    /// Gated exactly like tiers 3 and 4: the opening word only — a verb
+    /// belongs nowhere else — and only once every source above, tiers 0
+    /// through 4, has found NOTHING WHATSOEVER (`out.is_empty()` on entry).
+    /// A segmentation coincidence must not crowd out even a weak proposal
+    /// that is genuine evidence about the word, any more than a shape
+    /// coincidence may.
+    ///
+    /// **No separate Scott Adams exemption is needed, and none is added.**
+    /// Tier 4 needs its own `!self.prepositions.is_empty()` half-gate
+    /// because `Verb::accepts` does not care whether a verb's OWN table
+    /// carries a literal at all — a Scott Adams verb with no literals
+    /// anywhere still "accepts" a bare noun. This source asks a different
+    /// question: whether the leading piece's *own* [`Verb::prepositions`]
+    /// contains the trailing piece. A Scott Adams verb's `prepositions()` is
+    /// always empty (SQ-1240/SQ-1644 — that dialect's grammar is `VERB` or
+    /// `VERB noun`, never `VERB word noun`), so that check can never
+    /// succeed for one, and this source is silent on that format by
+    /// construction rather than by an added condition —
+    /// `a_grammar_with_no_prepositions_anywhere_never_offers_a_word_split_match`
+    /// below confirms it empirically rather than trusting the argument alone.
+    ///
+    /// **Marked vetting-mandatory** ([`Pick::requires_vetting`]), the same
+    /// treatment as tier 4 and for a related reason. A tier-5 match is a
+    /// stronger, more specific coincidence than tier 4's — it needs an EXACT
+    /// substring match on a real verb spelling and an EXACT literal the
+    /// verb's own grammar spells, not merely "some verb accepts this generic
+    /// shape" — but [`MIN_SPLIT_LEN`] admits pieces as short as two
+    /// characters on either side, and this medium is thick with two- and
+    /// three-letter verb abbreviations (`go`, `in`, `on` all plausibly name
+    /// a verb somewhere) that could coincide with an unrelated typo's
+    /// leading or trailing pair of characters. This source has not been
+    /// proven against a corpus the way tier 4's bare-shape gate was refined
+    /// against real fixtures before shipping (SQ-1644's own doc); requiring
+    /// vetting is the conservative default until it has been.
+    fn by_word_split(&self, typed: &str, position: Position, out: &mut Vec<Candidate>) {
+        if position != Position::Opening || !out.is_empty() {
+            return;
+        }
+        let chars: Vec<char> = typed.chars().collect();
+        if chars.len() < MIN_SPLIT_LEN * 2 {
+            return;
+        }
+        for i in MIN_SPLIT_LEN..=(chars.len() - MIN_SPLIT_LEN) {
+            if out.len() >= MAX_SPLIT_CANDIDATES {
+                break;
+            }
+            let w1: String = chars[..i].iter().collect();
+            let w2: String = chars[i..].iter().collect();
+            let Some(verb) = self.verb_named(&w1) else { continue };
+            let Some(canonical) = verb.word() else { continue };
+            let Some(literal) =
+                verb.prepositions().into_iter().find(|p| p.eq_ignore_ascii_case(&w2))
+            else {
+                continue;
+            };
+            let word = format!("{canonical} {literal}");
+            if out.iter().any(|c| c.word == word) {
+                continue;
+            }
+            out.push(Candidate { word, tier: 5, distance: 0, order: i, whole: true, exact_meaning: false });
         }
     }
 
@@ -805,7 +1313,17 @@ impl StoryVocabulary {
         if self.is_empty() {
             return Vec::new();
         }
-        let mut found = self.candidates(&typed, position);
+        // The sentence the player typed. `SyntaxLine::accepts` matches on the
+        // NUMBER of noun phrases and the literal prepositions, never on which
+        // object — whether a verb applies to *that* lantern is decided by the
+        // game at runtime and is not in the tables. Computed once and read
+        // twice: [`by_grammar_shape`](Self::by_grammar_shape) reads it as its
+        // only evidence, and below it is once more the last TIE-BREAK among
+        // candidates every other source already proposed on other grounds —
+        // the two readings are not the same claim, only the same shape.
+        let (nouns, preps) = self.shape(rest);
+        let preps: Vec<&str> = preps.iter().map(String::as_str).collect();
+        let mut found = self.candidates(&typed, position, nouns, &preps);
 
         // The invariant, applied once and to everything: only words THIS story
         // holds are ever shown. Every source above already draws from the
@@ -813,20 +1331,18 @@ impl StoryVocabulary {
         // added later cannot put a word on screen that the parser would refuse.
         found.retain(|c| self.knows(&c.word) && c.word != typed);
 
-        // The sentence the player typed, as the last tie-break and no more than
-        // that. `SyntaxLine::accepts` matches on the NUMBER of noun phrases and
-        // the literal prepositions, never on which object — whether a verb
-        // applies to *that* lantern is decided by the game at runtime and is not
-        // in the tables — so it separates candidates that are otherwise equal and
-        // is not evidence on its own.
-        let (nouns, preps) = self.shape(rest);
-        let preps: Vec<&str> = preps.iter().map(String::as_str).collect();
         let misfits = |c: &Candidate| match self.verb_named(&c.word) {
             Some(v) => !v.accepts(nouns, &preps),
             None => true,
         };
 
-        found.sort_by_key(|c| (c.tier, c.distance, misfits(c), c.order, c.word.clone()));
+        // `!exact_meaning` sorts first (SQ-1232): a candidate reached because
+        // the TYPED word is itself a known word with a group of its own
+        // outranks every tier before it settles ties by tier as always — the
+        // one case a spelling neighbour must not win against.
+        found.sort_by_key(|c| {
+            (!c.exact_meaning, c.tier, c.distance, misfits(c), c.order, c.word.clone())
+        });
         let mut seen = BTreeSet::new();
         let mut picks = Vec::new();
         for c in found {
@@ -847,7 +1363,11 @@ impl StoryVocabulary {
                 }
             };
             if seen.insert(word.clone()) {
-                picks.push(Pick { word, proposed: c.tier == 1 });
+                picks.push(Pick {
+                    word,
+                    proposed: c.tier == 1,
+                    requires_vetting: matches!(c.tier, 4 | 5),
+                });
             }
             if picks.len() == MAX_OFFERED {
                 break;
@@ -900,7 +1420,9 @@ impl StoryVocabulary {
                 }
             }
         }
-        best
+        // What the player has just read wins; failing that, the spelling the
+        // story's whole text (or the lexicon) settles on (SQ-1553).
+        best.or_else(|| self.spellings.get(stored).cloned())
     }
 
     /// How many noun phrases the player supplied and which prepositions they
@@ -925,6 +1447,140 @@ impl StoryVocabulary {
         }
         (nouns, preps)
     }
+}
+
+// ── Spelling a truncated key out (SQ-1553) ─────────────────────────────────
+
+/// The shortest key worth spelling out. A Z-machine key is six or nine
+/// characters (ZMSD 1.1 §13.3/§13.4) and a Glulx one `DICT_WORD_SIZE`, nine by
+/// default; a Scott Adams database keeps three to five, and at that length a
+/// prefix names no word in particular — `lam` is `lamp`, `lamb` and `lament` —
+/// so those words are the game's own abbreviations and are shown as they are.
+const MIN_SPELLED_KEY: usize = 6;
+
+/// Dictionary key → the whole word it was cut from, for every key that can be
+/// spelled out with confidence.
+///
+/// A key is a candidate only when it sits exactly at `key_len` and is plain
+/// `a`–`z`: each of those letters costs one Z-character (alphabet A0, §3.5.3),
+/// so its character count IS its Z-character count, and a whole word of plain
+/// letters truncates to it by characters exactly as the story's encoder would.
+/// A key holding anything else is left alone rather than reasoned about.
+///
+/// The whole words come from two places:
+///
+/// 1. **The story's own text** — `text`, what it can print. `lanter` is
+///    `lantern` because the story says so. This is where the nouns come from.
+/// 2. **The shipped lexicon** ([`verb_synonyms::words`]) — mostly verbs, which
+///    a game accepts but never prints: Zork I says `activate` nowhere and
+///    stores `activa`.
+///
+/// **Pooled, not tried in order.** Mini-Zork never prints `describe` but does
+/// print `descriptions`, and its `descri` is the describe-verb: text first
+/// would have labelled a verb `descriptions`. With both sources pooled, a key
+/// the two reach differently is simply ambiguous.
+///
+/// Inflections are folded first — `attacks` and `attacking` are both `attack`,
+/// and a key that one of them folds back onto is already whole — and then the
+/// answer has to be UNIQUE. `machine` and `machinery` both reach `machin`, so
+/// `machin` stays `machin`: it is still a word that works, which a guess might
+/// not be the right name for.
+fn full_spellings<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    key_len: usize,
+    text: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if key_len < MIN_SPELLED_KEY {
+        return out;
+    }
+    let plain = |w: &str| w.bytes().all(|b| b.is_ascii_lowercase());
+    let at_limit: BTreeSet<&str> =
+        keys.map(String::as_str).filter(|k| k.len() == key_len && plain(k)).collect();
+    if at_limit.is_empty() {
+        return out;
+    }
+    // Every whole word of `source` that reaches a key at the limit, by key.
+    let reach = |source: &mut dyn Iterator<Item = &str>| -> BTreeMap<&str, BTreeSet<String>> {
+        let mut by_key: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for w in source {
+            if w.len() < key_len || !plain(w) {
+                continue;
+            }
+            if let Some(&k) = at_limit.get(&w[..key_len]) {
+                by_key.entry(k).or_default().insert(w.to_string());
+            }
+        }
+        by_key
+    };
+    let lexicon: std::collections::HashSet<&str> = verb_synonyms::words().collect();
+    let from_text = reach(&mut text.iter().map(String::as_str));
+    let from_lexicon = reach(&mut lexicon.iter().copied());
+
+    for key in &at_limit {
+        let found: BTreeSet<String> = from_text
+            .get(key)
+            .into_iter()
+            .chain(from_lexicon.get(key))
+            .flatten()
+            .cloned()
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        // Each candidate folded onto its base form, where the base still
+        // reaches this key and is itself a word the text or the lexicon
+        // vouches for. The key itself counts only on that same evidence:
+        // `matches` does not fold onto `matche`, which is no word.
+        let lemmas: BTreeSet<String> = found
+            .iter()
+            .map(|w| {
+                inflection_bases(w)
+                    .into_iter()
+                    .find(|b| {
+                        b.starts_with(key) && (found.contains(b) || lexicon.contains(b.as_str()))
+                    })
+                    .unwrap_or_else(|| w.clone())
+            })
+            .collect();
+        let mut it = lemmas.into_iter();
+        if let (Some(only), None) = (it.next(), it.next()) {
+            if only != *key {
+                out.insert(key.to_string(), only);
+            }
+        }
+    }
+    out
+}
+
+/// The base forms a regular inflection of `w` might be — `attacks` → `attack`,
+/// `brandishing` → `brandish`/`brandishe`, `stopped` → `stop`, `carried` →
+/// `carry`. Deliberately narrower than [`stems`]: only the endings that inflect
+/// a word without making a different one (`-er`, `-ly` make `adventurer` and
+/// `strangely`, which are other words), and no irregulars, because a spelling
+/// is being recovered here, not a meaning.
+fn inflection_bases(w: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for suffix in ["ing", "ed", "es", "s"] {
+        let Some(base) = w.strip_suffix(suffix) else { continue };
+        let ch: Vec<char> = base.chars().collect();
+        if ch.len() < 2 {
+            continue;
+        }
+        out.push(base.to_string());
+        if suffix != "s" {
+            out.push(format!("{base}e"));
+        }
+        if ch[ch.len() - 1] == ch[ch.len() - 2] && !"aeiou".contains(ch[ch.len() - 1]) {
+            out.push(ch[..ch.len() - 1].iter().collect());
+        }
+        if suffix != "ing" && ch[ch.len() - 1] == 'i' {
+            let mut y: String = ch[..ch.len() - 1].iter().collect();
+            y.push('y');
+            out.push(y);
+        }
+    }
+    out
 }
 
 /// The words `w` might be an inflected form of.
@@ -1046,7 +1702,10 @@ impl VocabState {
             self.story = engine
                 .story_vocabulary()
                 .map(|v| v.without_untypeable_words(engine))
-                .filter(|v| !v.is_empty());
+                .filter(|v| !v.is_empty())
+                // The one-time read of the story's own text (SQ-1553), taken
+                // here so it is paid once a session with the grammar read.
+                .map(|v| v.with_story_text(engine.story_text_words()));
         }
         self.story.as_ref()
     }
@@ -1079,13 +1738,50 @@ impl VocabState {
 
 /// Split a typed command the way a parser would: words, lowercased, with the
 /// punctuation a player sprinkles on stripped off.
-fn words_of(cmd: &str) -> Vec<String> {
+///
+/// `pub` (SQ-1552) so a headless host building a structured offer's fill
+/// commands by hand — rather than reading [`crate::assist::Offer`] off the
+/// assist lanthorn already pushed — does not have to reimplement this
+/// tokenisation to find the word an offer is about.
+pub fn words_of(cmd: &str) -> Vec<String> {
     cmd.split(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == ';')
         .map(|w| {
             w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'').to_lowercase()
         })
         .filter(|w| !w.is_empty())
         .collect()
+}
+
+/// The command a click on `pick` should put in the input box (SQ-1552):
+/// `words` with the word at `at` — the one this story's dictionary rejected —
+/// replaced by `pick`, rejoined with spaces. The same construction
+/// [`vetting_plan`] uses to build the candidate it sends the shadow probe, so
+/// an offer's fill and what was actually vetted can never say different
+/// things about what "picking this word" means.
+fn substitute_word(words: &[String], at: usize, pick: &str) -> String {
+    let mut w = words.to_vec();
+    w[at] = pick.to_string();
+    w.join(" ")
+}
+
+/// Build the structured half of a vocabulary offer (SQ-1552): the unknown
+/// word, and each candidate paired with the command a click on it should
+/// fill the input with (via [`substitute_word`]).
+fn build_offer(
+    kind: crate::assist::OfferKind,
+    word: &str,
+    words: &[String],
+    at: usize,
+    picks: &[String],
+) -> crate::assist::Offer {
+    crate::assist::Offer {
+        kind,
+        word: Some(word.to_string()),
+        picks: picks
+            .iter()
+            .map(|p| crate::assist::OfferPick { word: p.clone(), command: substitute_word(words, at, p) })
+            .collect(),
+    }
 }
 
 // ── The vetting, and the claim it earns ─────────────────────────────────────
@@ -1269,9 +1965,11 @@ const PROSE_LOOKBACK: usize = 40;
 /// printed in that long is offered as stored, which the parser accepts anyway.
 const SPELLING_LOOKBACK: usize = 200;
 
-/// Which command in a `run` answered a candidate, and which pair of controls (if
-/// any) judges it. Indices into the run's steps, in the order they were typed.
-type Slot = (usize, Option<(usize, usize)>);
+/// Which command in a `run` answered a candidate, which pair of NOUN controls
+/// (if any) judges it, and which pair of DIRECTION controls (if any, SQ-1232 —
+/// see [`vetting_plan`]) judges it too. Indices into the run's steps, in the
+/// order they were typed.
+type Slot = (usize, Option<(usize, usize)>, Option<(usize, usize)>);
 
 /// A vocabulary offer that has been asked of the shadow and is waiting for its
 /// answer (SQ-1124).
@@ -1299,6 +1997,13 @@ pub struct PendingOffer {
     /// How many commands were sent. A run that came back shorter left the tail
     /// unjudged, and a partly-vetted offer cannot make the vetted claim.
     commands: usize,
+    /// The typed command's words, tokenised the way [`words_of`] left them.
+    /// Kept so the answer, once it arrives, can say what a click on each
+    /// surviving pick should fill the input with ([`build_offer`], SQ-1552) —
+    /// the same words [`vetting_plan`] built the candidates from.
+    words: Vec<String>,
+    /// Which of `words` was the unknown one.
+    at: usize,
 }
 
 /// Lay out the commands that would vet `picks`, and the plan for reading the
@@ -1311,6 +2016,14 @@ pub struct PendingOffer {
 /// Every control is laid out in the SAME run as the question it judges, from the
 /// same snapshot and therefore the same room. See [`crate::probe`]'s module docs
 /// for why a signature learned once a session is a signature of the wrong room.
+///
+/// When the object being tested is a DIRECTION, a second pair of controls
+/// stands in beside the noun pair — two other directions, rather than two
+/// absent nouns (SQ-1232). A direction is a real word the parser always
+/// recognises, so the noun pair's "you can't see any such thing" never
+/// matches what a direction object actually gets back; the direction pair
+/// teaches that shape instead of replacing the noun pair, which still covers
+/// every other kind of object exactly as before.
 fn vetting_plan(
     engine: &dyn Engine,
     v: &StoryVocabulary,
@@ -1329,6 +2042,26 @@ fn vetting_plan(
     // VERB, so the control keeps the sentence's shape and only loses its object.
     let noun_slot = if at > 0 { Some(at) } else { words.len().checked_sub(1).filter(|&i| i > 0) };
 
+    // A DIRECTION object defeats the noun-based control (SQ-1232): `fasten
+    // north` reads to many games as a different sentence from `fasten
+    // <absent noun>` — "You would achieve nothing by that" against "You can't
+    // see any such thing" — because a direction is a real, in-scope word and a
+    // conjured-absent noun is not. So when the word actually sitting in that
+    // slot is a direction, two OTHER directions stand in for the absent-noun
+    // pair and teach the refusal shape a direction object actually gets.
+    // `mapper::direction::parse_direction` is the one place the app knows a
+    // direction word from any other; nothing here keeps a second list of them.
+    let dir_words: Option<(String, String)> = noun_slot
+        .and_then(|slot| mapper::direction::parse_direction(&words[slot]))
+        .and_then(|typed_dir| {
+            let mut alts = mapper::direction::PROBE_DIRS
+                .into_iter()
+                .filter(|&d| d != typed_dir)
+                .map(mapper::direction::long_label)
+                .filter(|w| knows(w));
+            Some((alts.next()?.to_string(), alts.next()?.to_string()))
+        });
+
     let mut cmds: Vec<String> = vec![nonsense];
     let mut plan: Vec<Slot> = Vec::new();
     let mut controls: BTreeMap<String, usize> = BTreeMap::new();
@@ -1336,11 +2069,11 @@ fn vetting_plan(
         let mut w = words.to_vec();
         w[at] = pick.clone();
         let candidate = w.join(" ");
-        let pair = noun_slot.map(|slot| {
+        let mut swap_pair = |base: &[String], a: &str, b: &str, slot: usize| {
             let mut idx = [0usize; 2];
-            for (k, noun) in [absent_a, absent_b].into_iter().enumerate() {
-                let mut c = w.clone();
-                c[slot] = noun.clone();
+            for (k, sub) in [a, b].into_iter().enumerate() {
+                let mut c = base.to_vec();
+                c[slot] = sub.to_string();
                 let text = c.join(" ");
                 idx[k] = *controls.entry(text.clone()).or_insert_with(|| {
                     cmds.push(text);
@@ -1348,9 +2081,11 @@ fn vetting_plan(
                 });
             }
             (idx[0], idx[1])
-        });
+        };
+        let pair = noun_slot.map(|slot| swap_pair(&w, absent_a, absent_b, slot));
+        let dir_pair = noun_slot.zip(dir_words.as_ref()).map(|(slot, (d1, d2))| swap_pair(&w, d1, d2, slot));
         cmds.push(candidate);
-        plan.push((cmds.len() - 1, pair));
+        plan.push((cmds.len() - 1, pair, dir_pair));
     }
     (cmds.len() <= crate::probe::MAX_PROBES).then_some((cmds, plan))
 }
@@ -1380,9 +2115,12 @@ fn judge(run: &crate::probe::ProbeRun, offer: &PendingOffer) -> Option<Vec<Strin
             .picks
             .iter()
             .zip(&offer.plan)
-            .filter(|(_, (cand, pair))| {
+            .filter(|(_, (cand, pair, dir_pair))| {
                 let mut refusals = base.clone();
                 if let Some((a, b)) = *pair {
+                    refusals.merge(run.refusal_from_pair(a, b));
+                }
+                if let Some((a, b)) = *dir_pair {
                     refusals.merge(run.refusal_from_pair(a, b));
                 }
                 run.did_something(*cand, &refusals)
@@ -1397,8 +2135,10 @@ fn judge(run: &crate::probe::ProbeRun, offer: &PendingOffer) -> Option<Vec<Strin
 /// What one call to [`offer_vocabulary`] decided.
 enum Outcome {
     /// Say this now: nothing was asked of the shadow, so the claim is the modest
-    /// one the dictionary alone supports.
-    Now(String),
+    /// one the dictionary alone supports. Carries the structured offer
+    /// alongside the text (SQ-1552) — built once, here, from the same
+    /// `words`/`at`/`picks` the text was.
+    Now(String, crate::assist::Offer),
     /// The shadow was asked. Nothing is said until [`poll_vocabulary_offer`]
     /// collects the answer — or drops it, if the player has moved on.
     Asked(PendingOffer),
@@ -1475,7 +2215,17 @@ pub fn offer_vocabulary(state: &mut AppState, engine: &dyn Engine, cmd: &str, pr
         }
         let position = if at == 0 { Position::Opening } else { Position::Inside };
         let rest: Vec<&str> = words[at + 1..].iter().map(String::as_str).collect();
-        let picks = config.spoken_offer(v.offer_picks(word, position, &rest, prose));
+        let raw_picks = v.offer_picks(word, position, &rest, prose);
+        // Computed on the RAW picks, before `spoken_offer` collapses them to
+        // `Vec<String>` and the provenance is gone (SQ-1644). Every raw pick
+        // here shares one tier — `by_bare_grammar_shape` (tier 4) only ever
+        // runs when nothing else contributed anything at all, so a call never
+        // mixes a tier-4 candidate with one from an earlier tier — but `all`
+        // is what the claim actually is ("nothing here may be shown unvetted"),
+        // so that is what is checked rather than relying on the mix never
+        // happening.
+        let must_vet = !raw_picks.is_empty() && raw_picks.iter().all(|p| p.requires_vetting);
+        let picks = config.spoken_offer(raw_picks);
         // Empty because nothing was confident enough, or because everything that
         // was got filtered — one answer either way, and it is silence. The word
         // is NOT recorded as answered: nothing was said, so nothing was spent.
@@ -1500,22 +2250,35 @@ pub fn offer_vocabulary(state: &mut AppState, engine: &dyn Engine, cmd: &str, pr
                     picks: picks.clone(),
                     plan,
                     commands: cmds.len(),
+                    words: words.clone(),
+                    at,
                 })
             });
-        Some(match asked {
-            Some(pending) => Outcome::Asked(pending),
+        match asked {
+            Some(pending) => Some(Outcome::Asked(pending)),
+            // Every surviving pick came from a source that must never be shown
+            // unvetted (SQ-1644) and no probe answered — probing off, the seam
+            // unarmed, or `vetting_plan` couldn't build one. That is exactly
+            // "nothing survived" and gets the same answer: silence, with the
+            // word not recorded as answered, rather than the unvetted "this
+            // story knows" fallback below.
+            None if must_vet => None,
             None => {
                 vocab.mark_offered(word);
-                Outcome::Now(format!("{LEAD_DICTIONARY}{}", picks.join(" · ")))
+                let offer =
+                    build_offer(crate::assist::OfferKind::VocabularyOffer, word, &words, at, &picks);
+                Some(Outcome::Now(format!("{LEAD_DICTIONARY}{}", picks.join(" · ")), offer))
             }
-        })
+        }
     })();
     state.vocab = vocab;
     state.probe = probe;
     state.transcript = prose;
 
     match outcome {
-        Some(Outcome::Now(line)) => state.push_assist(&crate::assist::Assist::help(line)),
+        Some(Outcome::Now(line, offer)) => {
+            state.push_assist(&crate::assist::Assist::help(line).with_offer(offer))
+        }
         Some(Outcome::Asked(pending)) => state.vocab_pending = Some(pending),
         None => {}
     }
@@ -1549,11 +2312,11 @@ pub fn poll_vocabulary_offer(state: &mut AppState) -> bool {
 /// True when `token` answers a question THIS consumer asked.
 ///
 /// The shadow is shared — [`crate::return_probe`] asks it too (SQ-0785) — and it
-/// hands back one answer at a time with no idea who wanted it. So the event
-/// loop's single collector routes by token
-/// (`loop_tick::poll_shadow_answers`) rather than letting each consumer
-/// poll in turn: a consumer that polls and finds an answer it does not own has
-/// already taken it off the channel, and the one that did want it never sees it.
+/// hands back one answer at a time with no idea who wanted it. So a single
+/// collector routes by token ([`crate::host::probe::poll`], SQ-1548) rather than
+/// letting each consumer poll in turn: a consumer that polls and finds an
+/// answer it does not own has already taken it off the channel, and the one
+/// that did want it never sees it.
 pub fn owns(state: &AppState, token: u64) -> bool {
     state.vocab_pending.as_ref().is_some_and(|p| p.token == token)
 }
@@ -1565,24 +2328,32 @@ pub fn deliver_answer(state: &mut AppState, answer: crate::probe::Answer) -> boo
 
 // The wrap cache, and why the late insert does not defer to a keystroke gap.
 //
-// An insert above the prompt moves a line the cache has already wrapped, so it
-// is a `TranscriptEdit::Rewrote` and the next frame rebuilds the whole wrap.
-// Measured at 40 columns in a debug build
-// (`render::transcript::tests::a_late_insert_above_the_prompt_rebuilds_the_wrap_within_a_keystroke`):
-// 1.3 ms at 200 transcript lines, 4.0 ms at 1,000, 18.4 ms at 5,000 and 71.8 ms
-// at 20,000, against a flat 0.43 ms for a cached frame. Linear in scrollback,
-// and not free.
+// An insert above the prompt moves the one line the cache has already
+// wrapped — the trailing prompt itself — so before SQ-1179 it was a
+// `TranscriptEdit::Rewrote` and the next frame rebuilt the whole wrap. Measured
+// at 40 columns in a debug build
+// (`render::transcript::tests::a_late_insert_above_the_prompt_repairs_the_wrap_exactly_once`,
+// before the fix): 1.3 ms at 200 transcript lines, 4.0 ms at 1,000, 18.4 ms at
+// 5,000 and 71.8 ms at 20,000, against a flat 0.43 ms for a cached frame —
+// linear in scrollback, and not free.
 //
-// It is nevertheless paid where it always was. Every `push_transcript_internal`
-// in inline-prompt mode is the same edit — every `/help`, every save banner,
-// every other assist — so this is the register's standing cost rather than a new
-// one, and the SYNCHRONOUS offer paid it too. What changes is only that the
-// frame it lands on may be one the player is typing into; and the event loop
-// already coalesces an input burst (`skip_draw` defers the draw and leaves
-// `needs_redraw` set), so the rebuild is paid ONCE, on the frame that shows the
-// typed characters, rather than per keystroke. A deferral of our own would be new
-// machinery with its own staleness question, for a saving the burst coalescing
-// has already made.
+// SQ-1179 gave the edit its own `TranscriptEdit::Inserted { at, count }`, which
+// the wrap cache can REPAIR through instead: every line before `at` provably
+// did not move, so only the (typically one-line) tail is re-wrapped. What was
+// a rebuild is now flat again, like the cached-frame number above rather than
+// the scrollback-linear ones beside it.
+//
+// The cost this comment used to describe is nevertheless still paid where it
+// always was for anything that ISN'T an insert-above-the-prompt — a resize, a
+// filter, a theme, or any other `Rewrote`. Every `push_transcript_internal` in
+// inline-prompt mode used to be the same edit — every `/help`, every save
+// banner, every other assist — so before the fix this was the register's
+// standing cost rather than a new one, and the SYNCHRONOUS offer paid it too.
+// What changed with SQ-1124 alone (the deferred offer, prior to this fix) was
+// only that the frame it landed on might be one the player is typing into; and
+// the event loop already coalesces an input burst (`skip_draw` defers the draw
+// and leaves `needs_redraw` set), so even the pre-SQ-1179 rebuild was paid ONCE
+// per burst rather than per keystroke.
 
 /// [`poll_vocabulary_offer`], but waits for the answer instead of collecting one
 /// that has already arrived.
@@ -1609,9 +2380,9 @@ fn deliver(state: &mut AppState, answer: crate::probe::Answer) -> bool {
         return false; // stale — the player typed again
     }
     let vetted = answer.run.as_ref().and_then(|run| judge(run, &pending));
-    let (picks, lead) = match vetted {
-        Some(kept) => (kept, LEAD_VETTED),
-        None => (pending.picks, LEAD_DICTIONARY),
+    let (picks, lead, kind) = match vetted {
+        Some(kept) => (kept, LEAD_VETTED, crate::assist::OfferKind::VettedOffer),
+        None => (pending.picks, LEAD_DICTIONARY, crate::assist::OfferKind::VocabularyOffer),
     };
     // Vetting can empty the list, and then there is nothing to recommend.
     if picks.is_empty() {
@@ -1619,12 +2390,15 @@ fn deliver(state: &mut AppState, answer: crate::probe::Answer) -> bool {
     }
     state.vocab.mark_offered(&pending.word);
     let before = state.transcript.len();
-    state.push_assist(&crate::assist::Assist::help(format!("{lead}{}", picks.join(" · "))));
+    let offer = build_offer(kind, &pending.word, &pending.words, pending.at, &picks);
+    state.push_assist(
+        &crate::assist::Assist::help(format!("{lead}{}", picks.join(" · "))).with_offer(offer),
+    );
     state.transcript.len() != before
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-guidance"))]
 mod tests {
     use super::*;
     use grammar_model::{NounKind, Slot, SyntaxLine, Token};
@@ -1765,10 +2539,27 @@ mod tests {
     }
 
     /// Nothing confident, nothing said — the common answer, and the important one.
+    ///
+    /// **`xyzzy lamp` (one noun) stopped being silent under SQ-1644.** Every
+    /// verb `pocket_zork` holds accepts a bare, noun-only line, so once the
+    /// bare-noun grammar-shape source (tier 4) exists, `xyzzy lamp` is
+    /// exactly its motivating shape and a coincidental candidate is correctly
+    /// proposed — see `a_bare_shape_only_match_answers_when_nothing_else_can`
+    /// for that source's own test. What did NOT change is that such a
+    /// candidate is marked [`Pick::requires_vetting`] and so can never reach
+    /// the player through the unvetted fallback (`offer_vocabulary`), which
+    /// is the sense in which "nothing confident, nothing SAID" still holds.
+    /// This test's own assertion moves to zero nouns, a shape none of this
+    /// story's verbs answer at all, so it stays a case where even
+    /// `candidates()` proposes nothing whatsoever.
     #[test]
     fn silence_is_the_common_answer() {
         let v = pocket_zork();
-        assert!(v.offer("xyzzy", Position::Opening, &["lamp"], &[]).is_empty());
+        assert!(
+            v.offer("xyzzy", Position::Opening, &[], &[]).is_empty(),
+            "no verb here has a bare, noun-LESS line either, so even the weakest \
+             grammar-coincidence source has nothing to propose"
+        );
         assert!(
             v.offer("cas", Position::Inside, &[], &[]).is_empty(),
             "three letters is no evidence of a DISTANCE — `cas` is one keystroke from `case`, \
@@ -1875,6 +2666,222 @@ mod tests {
         let v = a_plainly_spelled_story();
         assert_eq!(v.offer("illuminating", Position::Opening, &["lamp"], &[]), vec!["light"]);
         assert_eq!(v.offer("purchased", Position::Opening, &["lamp"], &[]), vec!["buy"]);
+    }
+
+    /// A pocket story that implements `rush` and `fasten` as two separate
+    /// opening verbs, one spelling each — for SQ-1232's ranking rule.
+    fn a_hasten_or_fasten_story() -> StoryVocabulary {
+        let mut verbs = Vec::new();
+        let mut words = BTreeMap::new();
+        for (i, w) in ["rush", "fasten"].iter().enumerate() {
+            verbs.push(Verb::new(
+                300 + i as u32,
+                0,
+                vec![(*w).to_string()],
+                vec![SyntaxLine::new(i as u16, false, vec![noun()])],
+            ));
+            words.insert((*w).to_string(), roles(true, false));
+        }
+        StoryVocabulary::new(verbs, words, BTreeSet::new(), 0)
+    }
+
+    /// **SQ-1232.** `hasten` is one keystroke from `fasten` and NOT a typo of
+    /// it — the shipped table already groups `hasten` with `rush`, and a
+    /// story that implements `rush` has answered the question a spelling
+    /// neighbour can only guess at. A player typing `hasten north` wants to
+    /// know about `rush`, not `fasten`, so the group member has to outrank
+    /// the near miss rather than being suppressed by it.
+    ///
+    /// Falsify by dropping `exact_meaning` from the sort key (or from the
+    /// `candidates` retain that keeps it past the tier-1 filter): `fasten`
+    /// answers first, which was the reported symptom.
+    #[test]
+    fn a_known_words_own_meaning_outranks_a_spelling_neighbour() {
+        let v = a_hasten_or_fasten_story();
+        assert_eq!(
+            v.offer("hasten", Position::Opening, &[], &[]),
+            vec!["rush", "fasten"],
+            "the group member `hasten` itself means leads; the near miss trails as an aside"
+        );
+        // And the ordinary case is untouched: `fastn` has no group of its own
+        // — it is not an English word at all — so the near miss is still the
+        // only thing there is to offer.
+        assert_eq!(
+            v.offer("fastn", Position::Opening, &[], &[]),
+            vec!["fasten"],
+            "a genuine typo still finds its spelling neighbour"
+        );
+    }
+
+    /// A story with only `look` in its four-character dictionary — no `sharp`,
+    /// no `at`, no `rush`, no `hurry`. The pocket case for SQ-1238: what
+    /// `stored` (and everything routed through it — `knows`, `verb_named`,
+    /// `roles`, and the `known` closure `by_meaning` hands to
+    /// `verb_synonyms::suggest`) does with a MULTI-WORD query.
+    fn a_look_only_story() -> StoryVocabulary {
+        let verbs = vec![Verb::new(
+            100,
+            0,
+            vec!["look".into()],
+            vec![SyntaxLine::new(0, false, vec![noun()])],
+        )];
+        let mut words = BTreeMap::new();
+        words.insert("look".to_string(), roles(true, false));
+        StoryVocabulary::new(verbs, words, BTreeSet::new(), 4)
+    }
+
+    /// **SQ-1238, tightened by SQ-1240.** `look sharp` is a phrasal member of
+    /// the same synonym group as `hasten`, `rush` and `hurry`. Truncating the
+    /// whole PHRASE to this story's four-character key length lands on `look`
+    /// by accident — `"look sharp".chars().take(4)` is `look`, exactly like
+    /// `"look".chars().take(4)` — so a naive `stored` credits this story with
+    /// a phrase it has never implemented. `look` alone must still count, and
+    /// a phrasal member whose later word the story's own GRAMMAR pairs with
+    /// the verb as a preposition must still count too (SQ-1240: dictionary
+    /// membership of the later word is no longer enough on its own — see
+    /// [`a_grammar_pairing_is_what_a_multiword_member_actually_needs`]).
+    ///
+    /// Falsify by reverting the `stored` fix (truncate the whole phrase as one
+    /// string instead of checking each word on its own): the first assertion
+    /// fails, because `look sharp` truncates onto the same key as `look`.
+    #[test]
+    fn a_multiword_synonym_member_needs_every_word_in_the_dictionary() {
+        let v = a_look_only_story();
+        assert!(v.knows("look"), "the single word alone still counts");
+        assert!(
+            !v.knows("look sharp"),
+            "this story never heard of `sharp`; truncating the whole phrase must \
+             not land on `look` by accident"
+        );
+
+        // Give `look` a real grammar line pairing it with the preposition
+        // `at` (SQ-1240: a later word must be one the GRAMMAR pairs the verb
+        // with, not merely a dictionary word of its own) and the same phrase
+        // counts.
+        let mut verbs = v.verbs.clone();
+        verbs[0] = Verb::new(
+            100,
+            0,
+            vec!["look".into()],
+            vec![SyntaxLine::new(0, false, vec![noun()]), SyntaxLine::new(1, false, vec![word("at"), noun()])],
+        );
+        let mut words = v.words.clone();
+        words.insert("at".to_string(), WordRoles::default());
+        let with_at = StoryVocabulary::new(verbs, words, BTreeSet::new(), 4);
+        assert!(
+            with_at.knows("look at"),
+            "a multi-word member counts once every one of its words is a \
+             dictionary word the story's own grammar pairs with the verb"
+        );
+    }
+
+    /// The end-to-end shape of SQ-1238: a story that implements `look` but
+    /// none of `rush`, `hurry` or `sharp` must not answer `hasten` at all —
+    /// not with `look sharp`, and not with `look` riding along as `look
+    /// sharp`'s own alias through `by_story_synonym`.
+    ///
+    /// Falsify the same way: revert the `stored` fix and this starts offering
+    /// `look sharp` (tier 1, `exact_meaning`) and often `look` beside it.
+    #[test]
+    fn a_phrasal_synonym_member_does_not_match_through_truncation_of_its_first_word() {
+        let v = a_look_only_story();
+        assert!(
+            v.offer("hasten", Position::Opening, &[], &[]).is_empty(),
+            "this story implements `look`, not `rush`, `hurry`, or `look sharp`"
+        );
+    }
+
+    /// **SQ-1240.** Every word of a phrase resolving in the dictionary is not
+    /// enough (SQ-1238 already established that alone was too weak, but not
+    /// weak enough): `up` and `under` are both genuine dictionary words here,
+    /// yet neither is a preposition this story's GRAMMAR ever pairs with the
+    /// verb that reaches it. `put` pairs with `on` and `in` — real Zork-shaped
+    /// lines, `put OBJ on OBJ` and `put OBJ in OBJ` — but never `under`, and
+    /// `light` takes no preposition at all.
+    ///
+    /// Falsify by dropping the preposition-pairing check from `stored` back to
+    /// SQ-1238's bare per-word dictionary lookup: `put under` and `light up`
+    /// both start reading as known, because `under` and `up` are each a real
+    /// dictionary word of this story on their own.
+    #[test]
+    fn a_grammar_pairing_is_what_a_multiword_member_actually_needs() {
+        let verbs = vec![
+            Verb::new(
+                100,
+                0,
+                vec!["put".into()],
+                vec![
+                    SyntaxLine::new(0, false, vec![noun(), word("on"), noun()]),
+                    SyntaxLine::new(1, false, vec![noun(), word("in"), noun()]),
+                ],
+            ),
+            Verb::new(101, 0, vec!["light".into()], vec![SyntaxLine::new(2, false, vec![noun()])]),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["put", "light"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        for w in ["on", "in", "under", "up"] {
+            words.insert(w.to_string(), WordRoles::default());
+        }
+        let preps: BTreeSet<String> = ["on", "in"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        assert!(v.knows("put on"), "`put` takes `on` in this story's own grammar");
+        assert!(v.knows("put in"), "and `in` besides");
+        assert!(
+            !v.knows("put under"),
+            "`under` is a real word of this story, but `put` never takes it"
+        );
+        assert!(
+            !v.knows("light up"),
+            "`up` is a real word of this story, but `light` takes no preposition at all"
+        );
+    }
+
+    /// **SQ-1251, the bill for SQ-1238.** Once a PHRASE could be a candidate,
+    /// `by_story_synonym` started expanding one — and it resolves a candidate
+    /// to a verb through [`StoryVocabulary::verb_named`], which reads the FIRST
+    /// WORD alone. So `put on` reached the `put` entry and the offer picked up
+    /// that entry's other spellings, which are aliases of `put` and mean a
+    /// different action than `put on`.
+    ///
+    /// This is the pocket form of what Zork I r88 did on `don sword`: the
+    /// answer was `wear · put on · hide`, and hiding a sword is not wearing it.
+    ///
+    /// Falsify by dropping the phrase skip from `by_story_synonym`: `hide`
+    /// comes back in third place, exactly as it did on the real story.
+    #[test]
+    fn a_phrasal_candidate_never_drags_in_its_first_words_other_spellings() {
+        let verbs = vec![
+            Verb::new(100, 0, vec!["wear".into()], vec![SyntaxLine::new(0, false, vec![noun()])]),
+            Verb::new(
+                101,
+                0,
+                // Dictionary order, as a real story's entry arrives — which is
+                // why `hide` is the spelling that leaked out of Zork I's `put`.
+                vec!["hide".into(), "put".into(), "stow".into()],
+                vec![SyntaxLine::new(1, false, vec![noun(), word("on"), noun()])],
+            ),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["wear", "put", "hide", "stow"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        words.insert("on".to_string(), WordRoles::default());
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        // The setup: `don` is a word this story never heard, and the phrase the
+        // meaning table reaches for it IS one the grammar pairs (SQ-1240).
+        assert!(!v.knows("don"), "the word typed is not this story's");
+        assert!(v.knows("put on"), "`put` takes `on` here, so the phrase counts");
+
+        assert_eq!(
+            v.offer("don", Position::Opening, &["cloak"], &[]),
+            vec!["wear", "put on"],
+            "what the story calls `put` is not what it calls `put on`"
+        );
     }
 
     /// Meaning proposes VERBS, and the opening word is the only place a verb
@@ -1992,5 +2999,579 @@ mod tests {
             ["light", "the", "lanturn", "please"]
         );
         assert!(words_of("   ").is_empty());
+    }
+
+    /// **SQ-1248, at the judge.** The run that reached `judge` on `curses.z5`
+    /// and `suvehnux.z5`, transcribed: ten commands, every reply exactly what
+    /// those stories printed — and every step carrying a world print the shadow
+    /// took without a status line, against a baseline the LIVE engine took with
+    /// one.
+    ///
+    /// The judge answered `None` (the offer fell back to `this story knows`)
+    /// because `refusal_from(0)` was empty: the print called the nonsense
+    /// control a move, so its words could not be read as a refusal. Falsify by
+    /// folding `WorldPrint`'s three facts back into one hash — the vetting then
+    /// returns `None` here again, which is the reported symptom.
+    #[test]
+    fn a_shadow_with_no_status_line_can_still_be_judged() {
+        let step = |command: &str, reply: &str| crate::probe::ProbeStep {
+            command: command.to_string(),
+            reply: reply.to_string(),
+            location: None,
+            world: crate::probe::WorldPrint::from_parts(Some(7), None, None),
+            quit: false,
+            escaped: false,
+            died: false,
+        };
+        let run = crate::probe::ProbeRun {
+            baseline: crate::probe::WorldPrint::from_parts(Some(7), Some(35), Some(99)),
+            steps: vec![
+                step("zqxwvj", "That's not a verb I recognise."),
+                step("examine ace", "You can't see any such thing."),
+                step("examine adamant", "You can't see any such thing."),
+                step("examine hinged", "You see nothing special about the hinged trapdoor."),
+                step("describe ace", "You can't see any such thing."),
+                step("describe adamant", "You can't see any such thing."),
+                step("describe hinged", "You see nothing special about the hinged trapdoor."),
+                step("watch ace", "You can't see any such thing."),
+                step("watch adamant", "You can't see any such thing."),
+                step("watch hinged", "You can't see any such thing."),
+            ],
+        };
+        let offer = PendingOffer {
+            token: 1,
+            epoch: 0,
+            word: "inspect".to_string(),
+            picks: vec!["examine".into(), "describe".into(), "watch".into()],
+            plan: vec![(3, Some((1, 2)), None), (6, Some((4, 5)), None), (9, Some((7, 8)), None)],
+            commands: 10,
+            words: vec!["inspect".to_string(), "hinged".to_string()],
+            at: 0,
+        };
+        assert_eq!(
+            judge(&run, &offer),
+            Some(vec!["examine".to_string(), "describe".to_string()]),
+            "the two that described the trapdoor are kept; `watch`, which the story \
+             refused in the same words as the controls, is dropped"
+        );
+    }
+
+    // ── Spelling a truncated key out (SQ-1553) ──────────────────────────────
+
+    fn text(words: &[&str]) -> Option<BTreeSet<String>> {
+        Some(words.iter().map(|w| w.to_string()).collect())
+    }
+
+    /// The story's own text spells a noun out, and the lexicon a verb the
+    /// story never prints; a key already whole is left exactly as it is.
+    #[test]
+    fn a_truncated_key_is_spelled_from_the_story_text_and_the_lexicon() {
+        let v = pocket_zork().with_story_text(text(&["the", "brass", "lantern", "sword"]));
+        assert_eq!(v.spell("lanter"), "lantern", "the story's own text");
+        assert_eq!(v.spell("examin"), "examine", "the lexicon, for a verb never printed");
+        assert_eq!(v.spell("lamp"), "lamp", "short of the limit: already whole");
+        assert_eq!(v.spell("take"), "take");
+    }
+
+    /// Two whole words reaching one key is no answer: the key stays as stored,
+    /// which is still a word the parser takes.
+    #[test]
+    fn an_ambiguous_key_stays_as_stored() {
+        let v = pocket_zork().with_story_text(text(&["lantern", "lanterns", "lanternfish"]));
+        assert_eq!(
+            v.spell("lanter"),
+            "lanter",
+            "`lanterns` folds onto `lantern`, but `lanternfish` is another word"
+        );
+    }
+
+    /// Inflections fold onto their base: `attacks` and `attacking` say nothing
+    /// new about `attack`, and a key that one folds back onto is whole.
+    #[test]
+    fn inflections_fold_onto_the_word_they_inflect() {
+        let words: BTreeMap<String, WordRoles> = ["attack", "brandi", "matche"]
+            .iter()
+            .map(|w| (w.to_string(), roles(true, false)))
+            .collect();
+        let v = StoryVocabulary::new(Vec::new(), words, BTreeSet::new(), 6)
+            .with_story_text(text(&["attacks", "attacking", "brandishing", "matches"]));
+        assert_eq!(v.spell("attack"), "attack", "the key IS the base form");
+        assert_eq!(v.spell("brandi"), "brandish", "the base the lexicon vouches for");
+        assert_eq!(v.spell("matche"), "matches", "`matche` is no word to fold onto");
+    }
+
+    /// A key the text and the lexicon reach DIFFERENTLY is ambiguous: text
+    /// first would have called Mini-Zork's describe-verb `descriptions`.
+    #[test]
+    fn text_and_lexicon_are_pooled_not_ranked() {
+        let words: BTreeMap<String, WordRoles> =
+            [("descri".to_string(), roles(true, false))].into_iter().collect();
+        let v = StoryVocabulary::new(Vec::new(), words, BTreeSet::new(), 6)
+            .with_story_text(text(&["descriptions"]));
+        assert_eq!(v.spell("descri"), "descri");
+    }
+
+    /// A Scott Adams key of three to five letters is the game's own
+    /// abbreviation, not a fragment of one word — nothing is spelled out.
+    #[test]
+    fn a_short_key_is_never_spelled_out() {
+        let words: BTreeMap<String, WordRoles> =
+            [("lam".to_string(), roles(false, true))].into_iter().collect();
+        let v = StoryVocabulary::new(Vec::new(), words, BTreeSet::new(), 3)
+            .with_story_text(text(&["lamp"]));
+        assert_eq!(v.spell("lam"), "lam");
+    }
+
+    /// The offer spells a key the prose never carried out of the story's text,
+    /// where it used to show the fragment.
+    #[test]
+    fn an_offer_spells_a_key_the_prose_never_carried() {
+        let v = pocket_zork().with_story_text(text(&["lantern"]));
+        assert_eq!(v.offer("lanturn", Position::Inside, &[], &[]), vec!["lantern"]);
+    }
+
+    // ── The last resort: grammar shape alone (SQ-1642) ──────────────────────
+
+    /// A story that implements `touch NOUN on NOUN` and has never heard of
+    /// `use` at all. `use lockpick on plate` solving as `touch lockpick on
+    /// plate` in *Spider and Web* is exactly this shape: `use` and `touch`
+    /// share no meaning whatsoever, so no near-miss, stem or meaning table can
+    /// reach the second from the first — the only thing connecting them is
+    /// that `touch`'s own grammar happens to accept the shape already typed.
+    fn a_story_with_a_shape_only_match() -> StoryVocabulary {
+        let verbs = vec![Verb::new(
+            200,
+            0,
+            vec!["touch".into()],
+            vec![SyntaxLine::new(1, false, vec![noun(), word("on"), noun()])],
+        )];
+        let mut words = BTreeMap::new();
+        words.insert("touch".to_string(), roles(true, false));
+        for w in ["lockpick", "plate"] {
+            words.insert(w.to_string(), roles(false, true));
+        }
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        StoryVocabulary::new(verbs, words, preps, 0)
+    }
+
+    /// **The headline case.** Falsify by removing `by_grammar_shape` from
+    /// `candidates`: the offer vanishes, exactly as it did before this source
+    /// existed.
+    #[test]
+    fn a_shape_only_match_answers_when_nothing_else_can() {
+        let v = a_story_with_a_shape_only_match();
+        assert!(!v.knows("use"), "this story never heard of `use` at all");
+        assert_eq!(
+            v.offer("use", Position::Opening, &["lockpick", "on", "plate"], &[]),
+            vec!["touch"]
+        );
+    }
+
+    /// A story with a near-miss target (`look`) AND a verb (`touch`) that
+    /// would independently match the shape `lookx`'s command has.
+    fn a_story_with_a_near_miss_and_a_shape_match() -> StoryVocabulary {
+        let verbs = vec![
+            Verb::new(201, 0, vec!["look".into()], vec![SyntaxLine::new(2, false, vec![])]),
+            Verb::new(
+                200,
+                0,
+                vec!["touch".into()],
+                vec![SyntaxLine::new(1, false, vec![noun(), word("on"), noun()])],
+            ),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["look", "touch"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        for w in ["lockpick", "plate"] {
+            words.insert(w.to_string(), roles(false, true));
+        }
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        StoryVocabulary::new(verbs, words, preps, 0)
+    }
+
+    /// **The empty gate.** A real candidate reached by FORM must not be
+    /// crowded out by a bare grammatical coincidence, even when some other
+    /// verb in the same story would also match the shape. `lookx` is one
+    /// insertion from `look` — a near miss — and `touch` still accepts the
+    /// shape the rest of the command has; the shape source must contribute
+    /// nothing once `look` is already in hand.
+    ///
+    /// Falsify by loosening the gate from `out.is_empty()` to "no tier 0/1"
+    /// (the way `by_meaning`'s own gate reads): `raw.len()` becomes 2 and
+    /// `touch` rides alongside `look` in the offer, which is exactly the
+    /// noise this gate exists to prevent.
+    #[test]
+    fn a_shape_match_never_crowds_out_a_real_candidate() {
+        let v = a_story_with_a_near_miss_and_a_shape_match();
+
+        // White-box: the raw pool the sources build, before ranking.
+        let raw = v.candidates("lookx", Position::Opening, 2, &["on"]);
+        assert_eq!(
+            raw.len(),
+            1,
+            "the shape source must add nothing once form already found something"
+        );
+        assert_eq!(raw[0].word, "look");
+
+        // Black-box: the same story, through the public offer.
+        assert_eq!(
+            v.offer("lookx", Position::Opening, &["lockpick", "on", "plate"], &[]),
+            vec!["look"]
+        );
+    }
+
+    /// A verb belongs only at the opening word, and grammar shape is no
+    /// exception — mirrors `meaning_never_answers_a_word_inside_a_noun_phrase`
+    /// for the source added here.
+    #[test]
+    fn a_shape_match_never_fires_inside_a_noun_phrase() {
+        let v = a_story_with_a_shape_only_match();
+        assert!(v.candidates("whatever", Position::Inside, 2, &["on"]).is_empty());
+        assert!(
+            v.offer("use", Position::Inside, &["lockpick", "on", "plate"], &[]).is_empty()
+        );
+    }
+
+    /// A grammar with more shape-sharing verbs than [`MAX_SHAPE_CANDIDATES`]
+    /// stops there — ten verbs here all accept the same bare `VERB NOUN`
+    /// shape, and the raw pool this source alone contributes must never grow
+    /// past the cap, before `offer_picks` gets anywhere near ranking it down
+    /// to [`MAX_OFFERED`].
+    #[test]
+    fn a_grammar_with_more_shape_matches_than_the_cap_is_still_capped() {
+        let names =
+            ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"];
+        assert!(names.len() > MAX_SHAPE_CANDIDATES, "the fixture must outnumber the cap");
+        let mut verbs = Vec::new();
+        let mut words = BTreeMap::new();
+        for (i, name) in names.iter().enumerate() {
+            // A literal preposition on every line — a bare `VERB noun` line
+            // does not reach `by_grammar_shape` at all (see its own doc), so
+            // a fixture proving the CAP has to share a shape that can.
+            verbs.push(Verb::new(
+                300 + i as u32,
+                0,
+                vec![(*name).to_string()],
+                vec![SyntaxLine::new(i as u16, false, vec![noun(), word("at"), noun()])],
+            ));
+            words.insert((*name).to_string(), roles(true, false));
+        }
+        words.insert("thing".to_string(), roles(false, true));
+        let preps: BTreeSet<String> = ["at"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        let raw = v.candidates("glorphex", Position::Opening, 2, &["at"]);
+        assert_eq!(
+            raw.len(),
+            MAX_SHAPE_CANDIDATES,
+            "ten verbs share this shape; the raw pool must stop at the cap"
+        );
+        assert!(raw.iter().all(|c| c.tier == 3));
+    }
+
+    // ── SQ-1644: the bare-noun grammar-shape source, tier 4 ─────────────────
+
+    /// `touch` accepts a bare noun with no preposition at all; `put ON` is
+    /// here only to give the STORY's whole grammar a preposition somewhere —
+    /// required by `by_bare_grammar_shape`'s own gate, and unrelated to the
+    /// command under test, which has no preposition of its own.
+    fn a_story_with_a_bare_shape_only_match() -> StoryVocabulary {
+        let verbs = vec![
+            Verb::new(200, 0, vec!["touch".into()], vec![SyntaxLine::new(1, false, vec![noun()])]),
+            Verb::new(
+                199,
+                0,
+                vec!["put".into()],
+                vec![SyntaxLine::new(2, false, vec![noun(), word("on"), noun()])],
+            ),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["touch", "put"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        for w in ["lamp", "shelf"] {
+            words.insert(w.to_string(), roles(false, true));
+        }
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        StoryVocabulary::new(verbs, words, preps, 0)
+    }
+
+    /// **The headline case, unprepositioned.** `use lamp` has no literal word
+    /// at all — the shape [`by_grammar_shape`] (tier 3) declines — yet
+    /// `touch`'s bare-noun line accepts exactly it, and this story's grammar
+    /// has a preposition SOMEWHERE (`put ON`), so `by_bare_grammar_shape`'s
+    /// gate opens. Every candidate it contributes is tier 4 and marked
+    /// [`Pick::requires_vetting`] — unlike tier 3, this source is not
+    /// evidence enough to show unvetted (see `offer_vocabulary`, SQ-1644).
+    ///
+    /// Falsify by removing `by_bare_grammar_shape` from `candidates`: the
+    /// offer vanishes exactly as `by_grammar_shape`'s own headline case does
+    /// without it.
+    #[test]
+    fn a_bare_shape_only_match_answers_when_nothing_else_can() {
+        let v = a_story_with_a_bare_shape_only_match();
+        assert!(!v.knows("use"), "this story never heard of `use` at all");
+        let raw = v.candidates("use", Position::Opening, 1, &[]);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].word, "touch");
+        assert_eq!(raw[0].tier, 4);
+        assert_eq!(v.offer("use", Position::Opening, &["lamp"], &[]), vec!["touch"]);
+
+        let picks = v.offer_picks("use", Position::Opening, &["lamp"], &[]);
+        assert_eq!(picks.len(), 1);
+        assert!(
+            picks[0].requires_vetting,
+            "a tier-4 pick must be marked vetting-mandatory, unlike tier 3's own \
+             `a_prepositioned_shape_match_does_not_require_vetting` below"
+        );
+    }
+
+    /// The tier-3 counterpart to the assertion above: a preposition-anchored
+    /// shape match is NOT vetting-mandatory, exactly as it was before this
+    /// quest — it may still be shown through the unvetted "this story knows"
+    /// fallback, which is the behaviour SQ-1642 shipped and this quest must
+    /// not disturb.
+    #[test]
+    fn a_prepositioned_shape_match_does_not_require_vetting() {
+        let v = a_story_with_a_shape_only_match();
+        let picks = v.offer_picks("use", Position::Opening, &["lockpick", "on", "plate"], &[]);
+        assert_eq!(picks.len(), 1);
+        assert!(!picks[0].requires_vetting);
+    }
+
+    /// **The empty gate, unprepositioned.** A real candidate reached by FORM
+    /// must not be crowded out by a bare grammatical coincidence here either —
+    /// mirrors `a_shape_match_never_crowds_out_a_real_candidate` for the
+    /// source added in this quest.
+    #[test]
+    fn a_bare_shape_match_never_crowds_out_a_real_candidate() {
+        let verbs = vec![
+            Verb::new(201, 0, vec!["look".into()], vec![SyntaxLine::new(2, false, vec![])]),
+            Verb::new(200, 0, vec!["touch".into()], vec![SyntaxLine::new(1, false, vec![noun()])]),
+            Verb::new(
+                199,
+                0,
+                vec!["put".into()],
+                vec![SyntaxLine::new(3, false, vec![noun(), word("on"), noun()])],
+            ),
+        ];
+        let mut words = BTreeMap::new();
+        for w in ["look", "touch", "put"] {
+            words.insert(w.to_string(), roles(true, false));
+        }
+        for w in ["lamp", "shelf"] {
+            words.insert(w.to_string(), roles(false, true));
+        }
+        let preps: BTreeSet<String> = ["on"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        let raw = v.candidates("lookx", Position::Opening, 1, &[]);
+        assert_eq!(
+            raw.len(),
+            1,
+            "the bare-shape source must add nothing once form already found something"
+        );
+        assert_eq!(raw[0].word, "look");
+        assert_eq!(v.offer("lookx", Position::Opening, &["lamp"], &[]), vec!["look"]);
+    }
+
+    /// A verb belongs only at the opening word — mirrors
+    /// `a_shape_match_never_fires_inside_a_noun_phrase` for the source added
+    /// here.
+    #[test]
+    fn a_bare_shape_match_never_fires_inside_a_noun_phrase() {
+        let v = a_story_with_a_bare_shape_only_match();
+        assert!(v.candidates("whatever", Position::Inside, 1, &[]).is_empty());
+        assert!(v.offer("use", Position::Inside, &["lamp"], &[]).is_empty());
+    }
+
+    /// **The Scott Adams exemption, in isolation.** A grammar whose every
+    /// `SyntaxLine` spells no literal word at all — exactly a Scott Adams
+    /// database's shape, `VERB` or `VERB noun` and never `VERB word noun`
+    /// (see `by_grammar_shape`'s own doc) — has `prepositions` empty even
+    /// though `touch` genuinely accepts the bare shape `use lamp` has: the
+    /// ONLY thing standing between this fixture and an offer is
+    /// `by_bare_grammar_shape`'s own `!self.prepositions.is_empty()` half of
+    /// its gate.
+    ///
+    /// The real-fixture regression guards for this
+    /// (`a_scott_story_does_not_credit_a_phrasal_synonym_through_truncation`,
+    /// `adv03_credits_no_phrasal_member_because_scott_adams_has_no_prepositions`
+    /// in `vocabulary_offer.rs`) exercise the same gate on real Scott Adams
+    /// dictionaries, where other conditions (near misses, meaning groups) are
+    /// also in play; this fixture isolates the ONE condition this quest adds.
+    ///
+    /// Falsify by dropping `!self.prepositions.is_empty()` from
+    /// `by_bare_grammar_shape`'s gate: `raw` fills with `touch` and this test
+    /// fails.
+    #[test]
+    fn a_grammar_with_no_prepositions_anywhere_never_offers_a_bare_shape_match() {
+        let verbs = vec![
+            Verb::new(200, 0, vec!["touch".into()], vec![SyntaxLine::new(1, false, vec![noun()])]),
+        ];
+        let mut words = BTreeMap::new();
+        words.insert("touch".to_string(), roles(true, false));
+        words.insert("lamp".to_string(), roles(false, true));
+        let v = StoryVocabulary::new(verbs, words, BTreeSet::new(), 0);
+
+        assert!(
+            v.candidates("use", Position::Opening, 1, &[]).is_empty(),
+            "a Scott-Adams-shaped grammar has no preposition anywhere, which must \
+             exclude the bare-shape source entirely, even though `touch` itself \
+             accepts the exact shape typed"
+        );
+        assert!(v.offer("use", Position::Opening, &["lamp"], &[]).is_empty());
+    }
+
+    // ── SQ-1645: the word-split source, tier 5 ───────────────────────────────
+
+    /// `pick` accepts a literal `up` after its noun; `toolcase`/`shelf` are the
+    /// nouns the fixture's story understands. The story never spells `pickup`
+    /// as one word at all, which is the whole gap this source closes.
+    fn a_story_with_a_squished_verb_and_literal() -> StoryVocabulary {
+        let verbs = vec![Verb::new(
+            200,
+            0,
+            vec!["pick".into()],
+            vec![SyntaxLine::new(1, false, vec![word("up"), noun()])],
+        )];
+        let mut words = BTreeMap::new();
+        words.insert("pick".to_string(), roles(true, false));
+        words.insert("toolcase".to_string(), roles(false, true));
+        let preps: BTreeSet<String> = ["up"].iter().map(|s| s.to_string()).collect();
+        StoryVocabulary::new(verbs, words, preps, 0)
+    }
+
+    /// **The headline case** (SQ-1645's own motivating report): `pickup
+    /// toolcase` reaches none of the first six sources — `pickup` is not a
+    /// near miss or stem of anything this pocket story holds, and it spells
+    /// no verb `pickup` at all. But this story's own `pick` genuinely takes
+    /// the literal `up`, so `pick` + `up` run together with no space is
+    /// exactly `pickup`, and the split finds it.
+    ///
+    /// Falsify by removing `by_word_split` from `candidates`: the offer
+    /// vanishes exactly as every other last-resort source's own headline case
+    /// does without it.
+    #[test]
+    fn a_word_split_proposes_a_verb_and_its_own_literal_run_together() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        assert!(v.knows("pick"), "the fixture's own setup");
+        assert!(!v.knows("pickup"), "this story never heard of `pickup` as one word");
+        let raw = v.candidates("pickup", Position::Opening, 1, &[]);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].word, "pick up");
+        assert_eq!(raw[0].tier, 5);
+        assert_eq!(v.offer("pickup", Position::Opening, &["toolcase"], &[]), vec!["pick up"]);
+    }
+
+    /// **The empty gate.** A real candidate reached by an earlier tier must
+    /// not be crowded out by a segmentation coincidence — mirrors
+    /// `a_bare_shape_match_never_crowds_out_a_real_candidate` for the source
+    /// added in this quest. `pickup` is one edit from the fixture's OTHER
+    /// verb `pickups` (an inserted `s`), so tier 0 finds that first, and the
+    /// split — which would otherwise also fire on this exact typed word, per
+    /// the test above — must add nothing once it has.
+    #[test]
+    fn a_word_split_never_crowds_out_a_real_candidate() {
+        let verbs = vec![
+            Verb::new(
+                200,
+                0,
+                vec!["pick".into()],
+                vec![SyntaxLine::new(1, false, vec![word("up"), noun()])],
+            ),
+            Verb::new(199, 0, vec!["pickups".into()], vec![SyntaxLine::new(2, false, vec![noun()])]),
+        ];
+        let mut words = BTreeMap::new();
+        words.insert("pick".to_string(), roles(true, false));
+        words.insert("pickups".to_string(), roles(true, false));
+        words.insert("toolcase".to_string(), roles(false, true));
+        let preps: BTreeSet<String> = ["up"].iter().map(|s| s.to_string()).collect();
+        let v = StoryVocabulary::new(verbs, words, preps, 0);
+
+        let raw = v.candidates("pickup", Position::Opening, 1, &[]);
+        assert_eq!(
+            raw.len(),
+            1,
+            "the word-split source must add nothing once an earlier tier already found something"
+        );
+        assert_eq!(raw[0].word, "pickups");
+        assert_eq!(v.offer("pickup", Position::Opening, &["toolcase"], &[]), vec!["pickups"]);
+    }
+
+    /// A verb belongs only at the opening word — mirrors
+    /// `a_bare_shape_match_never_fires_inside_a_noun_phrase` for the source
+    /// added here.
+    #[test]
+    fn a_word_split_never_fires_inside_a_noun_phrase() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        assert!(v.candidates("pickup", Position::Inside, 1, &[]).is_empty());
+        assert!(v.offer("pickup", Position::Inside, &[], &[]).is_empty());
+    }
+
+    /// **A near miss on the MECHANISM, not just the headline case.** `pickme`
+    /// splits into a real verb (`pick`) plus a trailing piece (`me`) — but
+    /// `me` is not among `pick`'s own literal words, only `up` is, so nothing
+    /// may be proposed. Finding a real verb is not enough on its own; the
+    /// trailing piece has to be that exact verb's own literal.
+    #[test]
+    fn a_word_split_requires_the_trailing_piece_to_be_that_verbs_own_literal() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        assert!(!v.knows("pickme"), "the fixture's own setup");
+        let raw = v.candidates("pickme", Position::Opening, 1, &[]);
+        assert!(raw.is_empty(), "`me` is not among `pick`'s own literal words");
+        assert!(v.offer("pickme", Position::Opening, &["toolcase"], &[]).is_empty());
+    }
+
+    /// **Vetting is mandatory here, same treatment as tier 4.** A word-split
+    /// match is a coincidence of SEGMENTATION, not of meaning, and
+    /// [`MIN_SPLIT_LEN`] admits pieces as short as two characters — short
+    /// enough that this medium's own two- and three-letter verb
+    /// abbreviations could coincide with an unrelated typo. See
+    /// `by_word_split`'s own doc for the full reasoning, including why this
+    /// is the CONSERVATIVE default rather than the only defensible one.
+    #[test]
+    fn a_word_split_match_requires_vetting() {
+        let v = a_story_with_a_squished_verb_and_literal();
+        let picks = v.offer_picks("pickup", Position::Opening, &["toolcase"], &[]);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].word, "pick up");
+        assert!(
+            picks[0].requires_vetting,
+            "a tier-5 pick must be marked vetting-mandatory, same treatment as tier 4's own \
+             `a_bare_shape_only_match_answers_when_nothing_else_can` companion assertion"
+        );
+    }
+
+    /// **The Scott Adams exemption, confirmed rather than assumed.** A
+    /// Scott-Adams-shaped grammar (`VERB` or `VERB noun`, never a literal
+    /// word anywhere — see `by_grammar_shape`'s own doc) means `pick`'s own
+    /// [`grammar_model::Verb::prepositions`] is empty even though `pick`
+    /// genuinely resolves as a verb and `up` is the exact trailing piece the
+    /// split under test produces. `by_word_split` needs no added condition to
+    /// stay silent here, unlike tier 4's own `!self.prepositions.is_empty()`
+    /// half-gate — the check this source already makes (does THIS verb's own
+    /// literal list contain the trailing piece) can never succeed against an
+    /// empty list, by construction.
+    ///
+    /// Falsify by imagining `by_word_split` used [`Self::prepositions`]
+    /// (the story-wide set) instead of `verb.prepositions()`: this fixture
+    /// would then need its own added gate to stay silent, the way tier 4
+    /// does, and does not.
+    #[test]
+    fn a_grammar_with_no_prepositions_anywhere_never_offers_a_word_split_match() {
+        let verbs =
+            vec![Verb::new(200, 0, vec!["pick".into()], vec![SyntaxLine::new(1, false, vec![noun()])])];
+        let mut words = BTreeMap::new();
+        words.insert("pick".to_string(), roles(true, false));
+        words.insert("toolcase".to_string(), roles(false, true));
+        let v = StoryVocabulary::new(verbs, words, BTreeSet::new(), 0);
+
+        assert!(
+            v.candidates("pickup", Position::Opening, 1, &[]).is_empty(),
+            "`pick`'s own grammar spells no literal word at all, so no split may name one"
+        );
+        assert!(v.offer("pickup", Position::Opening, &["toolcase"], &[]).is_empty());
     }
 }

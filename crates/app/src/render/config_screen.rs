@@ -53,7 +53,7 @@ pub(crate) const CONFIG_ROWS: &[(&str, ConfigRowKind, &str)] = &[
     ("show_status_bar",      ConfigRowKind::Bool, "Show the top status bar (location, score, moves, time)."),
     ("watch_style",          ConfigRowKind::Bool, "Live-reload style.toml automatically whenever the file changes on disk."),
     ("record_turn_history",  ConfigRowKind::Bool, "Record a per-turn rewind/replay history — enables Rewind, but grows the archive and holds per-turn blobs in memory."),
-    ("undo_levels",          ConfigRowKind::Num,  "How many in-memory undo snapshots to keep (0 disables undo). Use ← / → to adjust. Takes effect on next launch (or after @restart): the running story keeps the cap it booted with."),
+    ("undo_levels",          ConfigRowKind::Num,  "How many in-memory snapshots the game's own in-game UNDO command keeps (0 disables undo). Use ← / → to adjust. Takes effect on next launch (or after @restart): the running story keeps the cap it booted with."),
     ("interpreter_number",   ConfigRowKind::Num,  "Z-machine interpreter number (header byte 1Eh); changes colour behaviour on some Infocom games (e.g. Beyond Zork). ← / → to adjust. Takes effect on next launch (or after @restart): the header byte is written when the story boots."),
     ("hint_skip_screen_warning", ConfigRowKind::Bool, "Auto-skip the InvisiClues 'your screen is only N characters wide' banner when opening izm hints, landing straight on the topic menu."),
     ("text_margin_x",        ConfigRowKind::Num,  "Blank columns reserved on each side inside the story text pane. Imported from garglk tmarginx. Use ← / → to adjust."),
@@ -63,7 +63,7 @@ pub(crate) const CONFIG_ROWS: &[(&str, ConfigRowKind, &str)] = &[
     ("v6_pixel_lock",        ConfigRowKind::Bool, "Scale v6 artwork by whole device pixels per art pixel (0.5x/1x/1.5x on a 320-wide rendition, 1x/2x/3x on the Mac mono and EGA ones) instead of stretching it to fill the pane: crisper art and seamless borders, at the cost of a wider margin. No effect under half-blocks, which draws cells rather than device pixels and has no rung to snap to."),
     ("guidance",             ConfigRowKind::Bool, "Lanthorn's Guiding Light: help offered while you play — the words the parser knows, a completed noun, a caution before a move that cannot be undone. Marked in the margin with its own glyph (style.toml's gutter.assist), never in the story's voice."),
     ("guidance_probe",       ConfigRowKind::Bool, "Vet the Guiding Light's word suggestions before showing them: each candidate is tried in a silent throwaway copy of the game and only what actually did something is offered. Nothing it does reaches the screen, your saves, or the game you are playing. Off, the light still offers — it just names what the dictionary holds instead of recommending."),
-    ("hide_adult_words",     ConfigRowKind::Bool, "Keep the strong language out of panels that list a story's whole vocabulary — the command band's VERB column and its like. Display only: the story still knows every word, typing one works exactly as before, and the Guiding Light still offers it. The words are the `adult_words` line in config.toml, there to be read, shortened or extended."),
+    ("hide_adult_words",     ConfigRowKind::Bool, "Keep the strong language out of panels that list a story's whole vocabulary — the command panel's VERB column and its like. Display only: the story still knows every word, typing one works exactly as before, and the Guiding Light still offers it. The words are the `adult_words` line in config.toml, there to be read, shortened or extended."),
     // Appended rather than filed beside `guidance_probe`, where it reads more
     // naturally: three tables in `input.rs` key off a row's INDEX, so inserting
     // in the middle renumbers every row after it in four places at once. The
@@ -286,7 +286,7 @@ fn bool_str(b: bool) -> String {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-render"))]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;

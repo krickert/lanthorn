@@ -196,7 +196,7 @@ fn the_options_panel_offers_only_this_storys_own_archives() {
     // each) and ten DOS ones (Arthur and Journey at four renditions, Zork Zero
     // at two) — less the two `.EG2` continuations, which are the back halves of
     // their `.EG1` rows rather than rows of their own.
-    let unfiltered = app::launch_options::discover_art_candidates(&disc, None);
+    let unfiltered = app::launch_options::discover_art_candidates(&disc, None, None);
     assert_eq!(unfiltered.len(), 14, "every archive on the disc, EGA sets counted once");
 
     for (entry, want) in [
@@ -207,7 +207,7 @@ fn the_options_panel_offers_only_this_storys_own_archives() {
         // A text game shipped beside no artwork is offered none.
         ("MAC/ZORK I", vec![]),
     ] {
-        let mut got: Vec<String> = app::launch_options::discover_art_candidates(&disc, Some(entry))
+        let mut got: Vec<String> = app::launch_options::discover_art_candidates(&disc, Some(entry), None)
             .into_iter()
             .map(|c| c.filename.rsplit('/').next().unwrap_or_default().to_string())
             .collect();

@@ -84,7 +84,6 @@ fn boot() -> Option<(GameSession, app::machine_boot::MachineBoot)> {
     assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), RELEASE, "{FIXTURE}: release");
     assert_eq!(String::from_utf8_lossy(&bytes[0x12..0x18]), SERIAL, "{FIXTURE}: serial");
     let (profile, source) = InterpreterProfile::resolve_with_source(&path, None, None, None);
-    app::v6_set_palette(profile.palette());
     let mut picts = PictSource::resolve(&path, None);
     let picture_dims = picts.all_pict_dims();
     // The whole cascade, exactly as `startup.rs` asks it — but with `disks: None`,
@@ -106,6 +105,8 @@ fn boot() -> Option<(GameSession, app::machine_boot::MachineBoot)> {
         profile.default_colours(),
         true,
         faces,
+        profile.palette(),
+        None,
     );
     let mut s =
         GameSession::new_for_machine(bytes, true, false, false, picture_dims, None, None, &machine)
@@ -211,7 +212,6 @@ fn ink_span(canvas: &image::RgbaImage, rows: std::ops::Range<u32>, xs: std::ops:
 /// and the game lays out 25 rows where the machine shows 20.
 #[test]
 fn the_amiga_floppy_declares_the_faces_own_twenty_row_line() {
-    let _g = app::v6_palette_at_boot();
     let Some((session, machine)) = boot() else { return };
     let face = machine.faces.body().expect("Arthur's floppy carries char.data");
     assert_eq!((face.width, face.height), (10, 10), "char.data is 10x10 nominal");
@@ -279,7 +279,6 @@ fn only_a_proportional_face_moves_a_machines_cell() {
 /// whatever line the intro happens to leave on screen.
 #[test]
 fn the_raster_prose_draws_the_runs_the_capture_measures() {
-    let _g = app::v6_palette_at_boot();
     let Some((_session, machine)) = boot() else { return };
     let tf = machine.text_face();
     assert!(tf.proportional(), "non-vacuity: the pen under test is the face's");
@@ -336,7 +335,6 @@ fn the_raster_prose_draws_the_runs_the_capture_measures() {
 /// machine showing 20 text rows where lanthorn gave the story 25.
 #[test]
 fn raster_prose_wraps_by_pixel_and_fills_the_line() {
-    let _g = app::v6_palette_at_boot();
     let Some((_session, machine)) = boot() else { return };
     let tf = machine.text_face();
     let mut state = raster_state(&machine);
@@ -407,7 +405,6 @@ fn raster_prose_wraps_by_pixel_and_fills_the_line() {
 /// origins step exactly the face's advances.
 #[test]
 fn the_score_bar_advances_by_the_faces_own_table() {
-    let _g = app::v6_palette_at_boot();
     let Some((session, state)) = in_the_churchyard() else { return };
     let tf = state.v6_text.clone();
     assert!(tf.proportional(), "non-vacuity: the pen under test is the face's");
@@ -475,7 +472,6 @@ fn the_score_bar_advances_by_the_faces_own_table() {
 /// there is no gap to spare, so bold words run together.
 #[test]
 fn a_bold_run_advances_by_the_faces_own_smear() {
-    let _g = app::v6_palette_at_boot();
     let Some((_session, machine)) = boot() else { return };
     let face = machine.faces.body().expect("char.data");
     assert_eq!(face.bold_smear, 1, "Arthur's char.data states tf_BoldSmear = 1");
@@ -527,7 +523,6 @@ fn a_bold_run_advances_by_the_faces_own_smear() {
 /// not one of the areas that pins both `honor_game_colours` modes.
 #[test]
 fn a_bold_prose_line_wraps_at_the_width_it_will_be_drawn_at() {
-    let _g = app::v6_palette_at_boot();
     let Some((_session, machine)) = boot() else { return };
     let tf = machine.text_face();
     const BOLD: u8 = 2;
@@ -715,7 +710,6 @@ fn wrap_px(font: &blorb::bitmap_font::BitmapFont, text: &str, px: u32) -> Vec<St
 /// number that is not there.
 #[test]
 fn no_declared_width_reproduces_the_machines_wrap_but_a_measured_one_does() {
-    let _g = app::v6_palette_at_boot();
     let Some((_session, machine)) = boot() else { return };
     let font = machine.faces.body().expect("char.data");
 
@@ -768,7 +762,6 @@ fn no_declared_width_reproduces_the_machines_wrap_but_a_measured_one_does() {
 /// single window width the right thing to have measured against.
 #[test]
 fn both_of_arthurs_prose_windows_wrap_to_the_same_width() {
-    let _g = app::v6_palette_at_boot();
     let Some((session, state)) = in_the_churchyard() else { return };
     // Measured off the captures: the inventory frame's lower window carries F5's
     // upper window from its second line on, plus the line that follows it.
@@ -829,7 +822,6 @@ fn both_of_arthurs_prose_windows_wrap_to_the_same_width() {
 /// `cell.w` measurement and the field returns to 417 and overruns.
 #[test]
 fn the_score_bars_right_field_lands_where_the_machine_put_it() {
-    let _g = app::v6_palette_at_boot();
     let Some((session, state)) = in_the_churchyard() else { return };
     assert!(state.v6_text.proportional(), "non-vacuity: the pen under test is the face's");
     let model = Engine::screen(&session);
@@ -926,7 +918,6 @@ fn f5_rows(node: &WinNode) -> Vec<String> {
 /// long, 759 px wide, and no span matches.
 #[test]
 fn the_engine_wraps_the_description_where_the_machine_wraps_it() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, state)) = in_the_churchyard() else { return };
     assert!(state.v6_text.proportional(), "non-vacuity: the pen under test is the face's");
     let _ = session.submit_char(137); // F5 — the room description
@@ -984,7 +975,6 @@ fn the_engine_wraps_the_description_where_the_machine_wraps_it() {
 /// own `y` falls in, and the overlap check below fails on the same three words.
 #[test]
 fn the_hybrid_grid_and_the_pixel_runs_are_one_layout() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, state)) = in_the_churchyard() else { return };
     assert!(state.v6_text.proportional(), "non-vacuity: the pen under test is the face's");
     let cell = state.v6_text.cell();
@@ -1106,7 +1096,6 @@ fn the_hybrid_grid_and_the_pixel_runs_are_one_layout() {
 /// ignores it is how this happened.)
 #[test]
 fn a_proportional_run_stops_at_its_windows_right_edge() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, state)) = in_the_churchyard() else { return };
     let _ = session.submit_char(137); // F5 — the long description, wrapped by the
                                       // game at the declared width and therefore
@@ -1193,7 +1182,6 @@ fn hybrid_rows(session: &GameSession, state: &mut app::state::AppState) -> Vec<S
 /// grid and passed for a whole round while this was broken on screen.
 #[test]
 fn hybrid_draws_the_score_bar_in_consecutive_cells() {
-    let _g = app::v6_palette_at_boot();
     let Some((session, mut state)) = in_the_churchyard() else { return };
     assert!(state.v6_text.proportional(), "non-vacuity: the pen under test is the face's");
     let rows = hybrid_rows(&session, &mut state);
@@ -1213,7 +1201,6 @@ fn hybrid_draws_the_score_bar_in_consecutive_cells() {
 /// and the grid line break in different places.
 #[test]
 fn hybrid_draws_the_description_in_consecutive_cells() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, mut state)) = in_the_churchyard() else { return };
     let _ = session.submit_char(137); // F5
     let rows = hybrid_rows(&session, &mut state);
@@ -1255,7 +1242,6 @@ fn hybrid_draws_the_description_in_consecutive_cells() {
 /// paints the bar. Sixteen turns and a `look`, then F3.
 #[test]
 fn reversed_spaces_rule_the_inventory_page_instead_of_flooding_it() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, mut state)) = in_the_churchyard() else { return };
     let _ = session.submit_char(135); // F3 — the inventory screen
 
@@ -1343,7 +1329,6 @@ fn reversed_spaces_rule_the_inventory_page_instead_of_flooding_it() {
 /// Falsified by dropping the artwork clause: rows 3..9 come back at 576 of 580 pixels.
 #[test]
 fn the_raster_inventory_page_keeps_its_rules_and_loses_the_flood() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, state)) = in_the_churchyard() else { return };
     let _ = session.submit_char(135); // F3 — the inventory screen
     let canvas = raster(&session, &state);
@@ -1386,6 +1371,77 @@ fn the_raster_inventory_page_keeps_its_rules_and_loses_the_flood() {
     }
 }
 
+// ── SQ-1592: the RASTER path's own `V6TextRun::bar` must agree ──────────────
+
+/// [`raster`], recording the frame's text runs through the public host route
+/// ([`app::render::screen::compose_v6_frame`]) instead of discarding them —
+/// the same inputs `build_v6_raster_frame` builds internally, with `text`
+/// overridden to keep the runs (public on `V6FrameInputs`, the same override
+/// `v6_headless_compose.rs::for_model_compose_with_text` uses).
+fn raster_runs(session: &GameSession, state: &app::state::AppState) -> Vec<v6::V6TextRun> {
+    let model = Engine::screen(session);
+    let WinNode::Layered(items) = &model.root else { panic!("{FIXTURE}: a v6 frame is Layered") };
+    let native = v6::native_extent(items, &state.v6_text);
+    let layout = v6::classify_windows(items, state.v6_text.cell());
+    let paint = state.v6_paint.borrow();
+    let prose = |cols: u16, rows: u16| app::render::screen::build_main_text(state, cols, rows);
+    let mut inputs = app::render::screen::V6FrameInputs::from_state(state, paint.as_deref(), &prose);
+    inputs.text = v6::V6TextMode::RasteriseAndRecord;
+    app::render::screen::compose_v6_frame(&layout, v6::RasterFrame::native(native), &inputs).text
+}
+
+/// **Cross-path agreement.** [`reversed_spaces_rule_the_inventory_page_instead_of_flooding_it`]
+/// (above) is the HYBRID ring's own evidence: the status row carrying
+/// "Churchyard" floods edge to edge (`row_is_reverse_bar` answers `true` for
+/// it), while the two column-rule rows one line up do not (every run on one of
+/// THOSE rows is a lone reversed space, which fails `row_is_reverse_bar`'s
+/// "must carry text" clause — SQ-1035's whole point: a reversed space is
+/// furniture, not a bar). The RASTER path asks the identical question through
+/// the identical primitive, independently, in `build_chrome_canvas_into`'s own
+/// per-row bucketing. This asserts the two paths agree, for the SAME frame:
+/// the status bar's own run is `bar: true`, and every lone reversed-space rule
+/// run is `bar: false`.
+#[test]
+fn raster_bar_agrees_with_the_hybrid_rings_own_classification() {
+    let Some((mut session, state)) = in_the_churchyard() else { return };
+    let _ = session.submit_char(135); // F3 — the inventory screen
+    let runs = raster_runs(&session, &state);
+    let chrome: Vec<&v6::V6TextRun> = runs.iter().filter(|r| r.source == v6::V6RunSource::Chrome).collect();
+    assert!(!chrome.is_empty(), "non-vacuity: no chrome runs recorded on the inventory frame");
+
+    let bar_run = chrome.iter().find(|r| r.text.contains("Churchyard")).unwrap_or_else(|| {
+        panic!(
+            "non-vacuity: no chrome run carries \"Churchyard\": {:?}",
+            chrome.iter().map(|r| &r.text).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        bar_run.bar,
+        "raster bar disagrees with the hybrid ring: the status row carrying {:?} should be a \
+         reverse bar (the hybrid ring floods it edge to edge)",
+        bar_run.text
+    );
+
+    // Excludes `bar_run`'s own ROW deliberately: the status bar's padding
+    // between "Churchyard" and the date field is ALSO a lone reversed space
+    // (SQ-1052's "eighty-eight padding spaces"), and it correctly IS part of
+    // the bar — `bar` classifies the whole row, not each run on it in
+    // isolation. Only the inventory page's own two divider columns (a
+    // DIFFERENT window, rows the bar never reaches) are the furniture case.
+    let rule_runs: Vec<&&v6::V6TextRun> = chrome
+        .iter()
+        .filter(|r| r.y != bar_run.y && r.text.trim().is_empty() && r.style & 1 != 0)
+        .collect();
+    assert!(!rule_runs.is_empty(), "non-vacuity: no reversed-space rule run recorded on the inventory frame");
+    for r in rule_runs {
+        assert!(
+            !r.bar,
+            "raster bar disagrees with the hybrid ring: a lone reversed space (a rule) must not \
+             be classified a bar: {r:?}"
+        );
+    }
+}
+
 /// SQ-1156: the declared cell is a HOST DECLARATION, and an in-game `@restart`
 /// must re-state it.
 ///
@@ -1413,7 +1469,6 @@ fn the_raster_inventory_page_keeps_its_rules_and_loses_the_flood() {
 /// the post-restart frame carries no `Churchyard` cell text at all.
 #[test]
 fn the_score_bar_comes_back_as_cells_after_an_in_game_restart() {
-    let _g = app::v6_palette_at_boot();
     let Some((mut session, machine)) = boot() else { return };
     let mut state = raster_state(&machine);
     state.config.v6_render = app::config::V6RenderMode::Hybrid;

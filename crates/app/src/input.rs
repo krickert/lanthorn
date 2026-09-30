@@ -34,7 +34,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use mapper::direction::Direction;
 use mapper::mapper::Mapper;
 
-use crate::complete::suggest;
 use crate::keymap::{Context, KeySpec};
 use crate::state::{AppState, Focus, TextEntryDialog, TextEntryKind};
 
@@ -165,6 +164,10 @@ pub enum Action {
     ExportDot(Option<String>),
     /// Caller: write an annotatable text/ASCII map dump. `Some(dest)` is the optional `[file]` arg.
     ExportMap(Option<String>),
+    /// Caller: export the map as the versioned `lanthorn-map` JSON (SQ-1336),
+    /// the same schema `lanthorn-mapgen` writes. `Some(dest)` is the optional
+    /// `[file]` arg.
+    ExportJson(Option<String>),
     /// Toggle the in-box alignment code overlay (palette-only since SQ-0446).
     ToggleAlignment,
     /// Toggle portal destination name labels beside in-room portal icons
@@ -272,13 +275,17 @@ pub enum Action {
     FilePickerPick,
     /// Close the VFS file-picker modal without picking.
     FilePickerClose,
-    /// Toggle the inventory strip at the bottom of the story pane.
+    /// Toggle the inventory panel.
     ToggleInventory,
     /// Open a confirmation prompt to reset the game to its opening state (keeps map).
     ResetGame,
     /// Open the bottom command band (its object columns fill from the engine's
     /// live object tree on the next tick).
     OpenCommandBand,
+    /// Cycle the story pane's border control: command panel → inventory panel →
+    /// none → command panel (SQ-1237). The two panels are mutually exclusive,
+    /// so opening one closes the other.
+    CyclePanel,
     /// `Tab` (`+1`) / `Shift-Tab` (`-1`) while the band is open and nothing is
     /// highlighted in the current column: step `focus` across the reachable
     /// columns (SQ-0677, 2026-08-05 — supersedes SQ-0676's arrow-drives-quick
@@ -322,6 +329,27 @@ pub enum Action {
     /// in-progress phrase untouched — a quick pick is an interjection, not a
     /// composition step, and composes nothing onto the input line either.
     BandQuickPick(usize),
+    /// Pick the inventory dock's item at this row index (mouse click, SQ-1244):
+    /// composes `AppState::inventory_click_words[idx]` onto the prompt exactly
+    /// as a click on the command band's WHAT column composes an item's word —
+    /// same one-space rule, same partial-word replacement — via
+    /// `compose_word_onto_prompt`, the same low-level composer
+    /// (`sync_band_phrase_to_input`) `band_pick_row` itself calls. The command
+    /// band is closed whenever the inventory panel shows (the two are
+    /// mutually exclusive, `SidePanel`), so there is no `CommandBandState` to
+    /// pick FROM — a typed verb stays and the item is simply appended.
+    InventoryClickRow(usize),
+    /// A mouse-wheel notch over the inventory dock (SQ-1630): scroll its
+    /// `AppState::inv_dock_scroll` by `delta` rows. The dock's own analogue
+    /// of `RoomDockScroll` — same reasoning: no keyboard focus, so the wheel
+    /// is the only way to move it, and it keeps its own viewport
+    /// (`AppState::inv_dock_body_viewport`) rather than sharing
+    /// `modal_list_viewport`.
+    InventoryDockScroll(i32),
+    /// Set (`Some`) or clear (`None`) the inventory dock's `filter-items`
+    /// query (SQ-1630). Resets the dock's scroll to the top — the content a
+    /// scrolled offset was into no longer exists once the filter changes.
+    SetInventoryFilter(Option<String>),
     /// Esc, one level per press: disarm the quick highlight → close the band
     /// (SQ-0676 — the filter rung retired with type-to-filter, and the phrase
     /// rung with it: the phrase is the prompt's text now, and Esc must never
@@ -391,11 +419,38 @@ pub enum Action {
     ToggleRoomDock,
     /// Show a specific room-dock body — a click on one of its two view tabs.
     SetRoomDockView(crate::state::RoomDockView),
+    /// A mouse-wheel notch over the room dock: scroll its ACTIVE body's
+    /// `ListScroll` by `delta` rows (SQ-1280). Same sign convention and the
+    /// same primitive as `ListWheel` — a body row is a `ListScroll` "item"
+    /// of height 1 — but a separate action, since the dock is not one of
+    /// `ListWheel`'s exclusive modal overlays: it coexists with the map and
+    /// story panes and keeps its own viewport (`AppState::room_dock_body_viewport`)
+    /// rather than sharing `modal_list_viewport`. The dock has no keyboard
+    /// focus, so this is the only way to move it.
+    RoomDockScroll(i32),
+    /// Right-click on a room (SQ-1265): pin the room dock on it (keeping
+    /// whichever body was last shown, like a left click) and open the room's
+    /// context menu anchored at the click's terminal cell (col, row).
+    OpenRoomMenu(mapper::graph::RoomId, u16, u16),
+    /// Move the room context menu's cursor by `delta` rows, wrapping.
+    RoomMenuNav(i32),
+    /// Dismiss the room context menu without acting.
+    CloseRoomMenu,
     /// Begin a middle-button drag-pan gesture at terminal cell (col, row).
     BeginDragPan(u16, u16),
-    /// Continue a middle-button drag-pan gesture at terminal cell (col, row).
+    /// Begin a left-button press on the map at terminal cell (col, row), which
+    /// may resolve to either a drag-to-pan or a plain click (SQ-1325): `click`
+    /// is what a press-release WITHOUT motion should do (pin/unpin the room
+    /// under the press, or unpin on empty map space) — resolved now, at Down,
+    /// since only `mouse_to_action` has the room hit-rects to resolve it,
+    /// and replayed by `EndDragPan` iff the pointer never moved.
+    BeginMapDrag(u16, u16, crate::state::MapClick),
+    /// Continue a middle-button OR left-button-on-map drag-pan gesture at
+    /// terminal cell (col, row).
     DragPanTo(u16, u16),
-    /// End a middle-button drag-pan gesture.
+    /// End a middle-button OR left-button-on-map drag-pan gesture. For the
+    /// latter, fires the deferred `MapClick` from `BeginMapDrag` when the
+    /// pointer never moved (a plain click); a genuine drag just ends the pan.
     EndDragPan,
     /// Begin a story-pane text selection at terminal cell (col, row).
     StartSelection(u16, u16),
@@ -409,6 +464,14 @@ pub enum Action {
     /// older lines, `-1` toward newer. Resolved by the run loop, which knows the
     /// last-rendered transcript viewport height and max scroll (see `page_scroll`).
     TranscriptScrollPage(i8),
+    /// Half-page the transcript (Ctrl-D/Ctrl-U, vim convention; SQ-1228). `+1`
+    /// scrolls toward older lines, `-1` toward newer — same sign convention as
+    /// `TranscriptScrollPage`, resolved the same way (see `half_page_scroll`).
+    /// Ctrl-D always means half-page down. Ctrl-U means half-page up only when
+    /// the story prompt's input line is empty; with text on the line, Ctrl-U
+    /// keeps its readline meaning of "delete to start of line"
+    /// (`Action::DeleteToStart`), which wins.
+    TranscriptScrollHalfPage(i8),
     /// Advance the `[more]` pager one screen toward the bottom; catching up exits
     /// the pager (SQ-0404).
     PagerAdvance,
@@ -459,6 +522,14 @@ pub enum KeyResolve {
 ///    config-screen/hotkey-dialog/room-panel) → their handlers (hardwired Actions).
 ///    6.7. Ctrl+A/E/U/K/W in Game focus with the line prompt live (not char_mode/
 ///    event_wait) → readline caret/delete ops on the input line.
+///    6.8. Ctrl+D in Game focus → TranscriptScrollHalfPage(-1) (SQ-1228, half
+///    page down). Ctrl+U in Game focus → TranscriptScrollHalfPage(1) (half
+///    page up) when the input line is EMPTY, else falls through to 6.7's
+///    DeleteToStart, which wins whenever there's something to delete. Both are
+///    DEFAULTS, not hardwires: either only fires when step 9's Global keymap
+///    lookup would find no binding for the key — a user's own Ctrl+D/Ctrl+U
+///    binding always wins, so this block falls through to step 9 when one
+///    exists.
 /// 7. Key == hotkeys.prefix → OpenHotkeyDialog.
 /// 8. Tab (no modifiers) → autocomplete-or-ToggleFocus.
 /// 9. Ctrl modifier → Global KeyMap lookup, filtered by hotkeys.is_direct_name.
@@ -514,6 +585,14 @@ pub fn key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
     if state.overlays.palette.is_some() {
         return palette_key_to_command(state, key);
     }
+    // 6.5c. Room context menu (SQ-1265): owns all keys while open, the same
+    // shape as the palette above it — Up/Down move the cursor, Enter (or an
+    // item's own hotkey, of which there are none by default — see
+    // `room_menu`) resolves to a command through the ordinary slash-dispatch
+    // path, Esc closes.
+    if let Some(menu) = &state.overlays.room_menu {
+        return room_menu_key_to_command(menu, key, &state.keymap);
+    }
     // 6.6. Resize mode: Tab cycles the target pane, arrows adjust it, 0 resets,
     // Esc/Enter exits. Placed ABOVE the verb-menu intercept (SQ-0238) so resize
     // mode owns Tab/arrows/0/Esc/Enter even when the verb menu is open — the two
@@ -523,7 +602,14 @@ pub fn key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
     if state.resize_mode {
         return KeyResolve::Action(resize_mode_key_to_action(key));
     }
-    if state.overlays.command_band.is_some() {
+    // SQ-1236: a modal dialog opened OVER the band (config_screen, hotkey_dialog
+    // — the two modal checks below this one) takes all input; the band underneath
+    // must intercept nothing until the dialog closes, so it stays gated on
+    // `!any_modal_overlay_open()` rather than only on being open itself. The band
+    // itself is excluded from `any_modal_overlay_open` (it's a dock, not dialog
+    // chrome — see that method's doc comment), so this reads as "band, unless
+    // something ACTUALLY modal is stacked on top of it."
+    if state.overlays.command_band.is_some() && !state.any_modal_overlay_open() {
         if let Some(a) = command_band_intercept(key, state) {
             return KeyResolve::Action(a);
         }
@@ -584,6 +670,10 @@ pub fn key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
         };
     }
 
+    // Computed here (ahead of step 7's own use) because step 6.8 below also
+    // needs it, to check whether a user keymap binding shadows its default.
+    let spec = KeySpec::from_key_event(key);
+
     // 6.7. Readline-style line-edit shortcuts at the story prompt (SQ-0447):
     // Ctrl+A/E/U/K/W act on the input line instead of falling through to the
     // generic Ctrl handling in step 9. Gated to Game focus with the line prompt
@@ -591,13 +681,20 @@ pub fn key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
     // and (per main.rs's char-input gate) route Ctrl combos to app dispatch
     // instead. Placed ahead of step 7 too: Ctrl+K used to be the hotkey-dialog
     // prefix, but that moved to Ctrl+P, freeing Ctrl+K for delete-to-end here.
+    //
+    // Ctrl+U is DeleteToStart only while there's text to delete (SQ-1228): an
+    // empty input line falls through — unhandled here — to step 6.8's vim
+    // half-page-up, which is the meaning readline's kill-line has nothing to
+    // contest on an empty line.
     if key.modifiers == KeyModifiers::CONTROL
         && state.focus == Focus::Game && !state.char_mode && !state.event_wait
     {
         match key.code {
             KeyCode::Char('a') => return KeyResolve::Action(Action::CursorHome),
             KeyCode::Char('e') => return KeyResolve::Action(Action::CursorEnd),
-            KeyCode::Char('u') => return KeyResolve::Action(Action::DeleteToStart),
+            KeyCode::Char('u') if !state.input.is_empty() => {
+                return KeyResolve::Action(Action::DeleteToStart);
+            }
             KeyCode::Char('k') => return KeyResolve::Action(Action::DeleteToEnd),
             KeyCode::Char('w') => return KeyResolve::Action(Action::DeleteWordBack),
             // Ctrl+↑/↓ recall command history (SQ-0677): plain ↑/↓ moved to
@@ -612,8 +709,32 @@ pub fn key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
         }
     }
 
+    // 6.8. Ctrl+D in Game focus: half-page the transcript toward newer lines
+    // (SQ-1228, the vim convention). Ctrl+U does the same toward older lines,
+    // but only when the input line is EMPTY — with text on the line, step 6.7
+    // above already returned `Action::DeleteToStart` for it, which wins.
+    //
+    // This is a DEFAULT, not a hardwire: unlike step 6.7's readline block, a
+    // user's own keymap binding for the key always wins. `window_dump_bound_key`
+    // (SQ-0759) binds Ctrl+D to `dump-windows` and requires it dispatch that
+    // command, not this built-in scroll — so this block only fires the
+    // default when `state.keymap` has NO Global binding for the key at all;
+    // otherwise it falls through to step 9 below, which resolves (or rejects)
+    // that binding the same way every other Ctrl combo does. Not gated to
+    // `!char_mode && !event_wait` the way the readline block above is: a Ctrl
+    // combo is never forwarded to the VM as game input (see the char-mode gate
+    // in main.rs), so there is no game meaning for this key to preempt, and
+    // scrolling the transcript is exactly as useful mid-menu as at the prompt.
+    if key.modifiers == KeyModifiers::CONTROL && state.focus == Focus::Game {
+        let half_page_down = key.code == KeyCode::Char('d');
+        let half_page_up = key.code == KeyCode::Char('u') && state.input.is_empty();
+        if (half_page_down || half_page_up) && state.keymap.lookup(&spec, Context::Global).is_none() {
+            let dir = if half_page_down { -1 } else { 1 };
+            return KeyResolve::Action(Action::TranscriptScrollHalfPage(dir));
+        }
+    }
+
     // 7. Prefix key → open the hotkey dialog.
-    let spec = KeySpec::from_key_event(key);
     if spec == state.hotkeys.prefix {
         return KeyResolve::Action(Action::OpenHotkeyDialog);
     }
@@ -753,22 +874,34 @@ fn hit(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
 /// anything else inside the dock is claimed and does nothing.
 ///
 /// Returns `None` when the event is not inside `dock`, which is the caller's cue to route it
-/// normally. `tabs` are the hit-rects `draw_room_dock` returned for the frame just drawn.
+/// normally. `tabs` and `close` are the hit-rects `draw_room_dock` returned for the frame just
+/// drawn — a click on the close box (SQ-1265) closes the dock, the same effect
+/// `toggle-room-panel` has while it is open. A wheel notch anywhere inside the dock scrolls the
+/// active body (SQ-1280), honouring `invert` the way every other wheel handler resolves
+/// `mouse_wheel_invert` — via [`wheel_delta`].
 pub fn room_dock_mouse_action(
     dock: ratatui::layout::Rect,
     tabs: &[(crate::state::RoomDockView, ratatui::layout::Rect)],
+    close: Option<ratatui::layout::Rect>,
     m: &crossterm::event::MouseEvent,
+    invert: bool,
 ) -> Option<Action> {
     use crossterm::event::{MouseButton, MouseEventKind};
     if dock.width == 0 || dock.height == 0 || !hit(dock, m.column, m.row) {
         return None;
     }
     if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if close.is_some_and(|r| hit(r, m.column, m.row)) {
+            return Some(Action::CloseRoomDock);
+        }
         if let Some(&(view, _)) = tabs.iter().find(|(_, r)| {
             r.width > 0 && r.height > 0 && hit(*r, m.column, m.row)
         }) {
             return Some(Action::SetRoomDockView(view));
         }
+    }
+    if let Some(d) = wheel_delta(m.kind, invert) {
+        return Some(Action::RoomDockScroll(d as i32));
     }
     Some(Action::None)
 }
@@ -1054,6 +1187,23 @@ pub fn mouse_to_action(
         && row >= story.y && row < story.bottom();
 
     match kind {
+        // ── Left-down in story with a completion showing: accept it (SQ-1326) ──
+        // Mirrors the "autocomplete-or-ToggleFocus" gate Tab uses (step 8 in this
+        // file's module doc and in `key_to_command` below): when a suggestion is
+        // live, a click ANYWHERE in the story pane — including on the input line
+        // itself — takes it exactly as Tab would, ahead of both CursorToClick and
+        // StartSelection below. `!state.pager.active` mirrors the precedence Tab
+        // itself has: the [MORE] pager intercepts every key before step 8 ever
+        // runs, so a suggestion cannot really be "showing" while it's up.
+        MouseEventKind::Down(MouseButton::Left)
+            if in_story
+                && state.focus == Focus::Game
+                && !state.pager.active
+                && !state.current_partial().is_empty()
+                && !state.suggestions.is_empty() =>
+        {
+            Action::Autocomplete
+        }
         // ── Left-down on the input line: place the caret ──────────────────────
         // Must precede the story arm below: the input line sits inside the story pane, so a click
         // on it would otherwise start a text selection instead of moving the caret (SQ-0354).
@@ -1066,47 +1216,59 @@ pub fn mouse_to_action(
         MouseEventKind::Down(MouseButton::Left) if in_story => {
             Action::StartSelection(col, row)
         }
+        // ── Left-drag while a map drag-pan is pending: pan, not select (SQ-1325) ─
+        // Must precede the generic story-selection drag arm below: a left-drag
+        // that began on the map (`BeginMapDrag`, any target) reaches this arm
+        // first and reuses the same `DragPanTo` the middle-button pan already
+        // has, rather than falling into `ExtendSelection` (a no-op there anyway,
+        // since no selection was ever started for a map press).
+        MouseEventKind::Drag(MouseButton::Left) if state.drag.is_some() => {
+            Action::DragPanTo(col, row)
+        }
         // ── Left-drag: extend an in-progress story selection ──────────────────
         MouseEventKind::Drag(MouseButton::Left) => {
             Action::ExtendSelection(col, row)
+        }
+        // ── Left-up while a map drag-pan is pending: end it (SQ-1325) ──────────
+        // Resolves to the SAME `EndDragPan` the middle button uses; it replays
+        // the deferred `MapClick` from `BeginMapDrag` when the pointer never
+        // moved, or just clears the drag when it did.
+        MouseEventKind::Up(MouseButton::Left) if state.drag.is_some() => {
+            Action::EndDragPan
         }
         // ── Left-up: finish a story selection (copy on release) ───────────────
         MouseEventKind::Up(MouseButton::Left) => {
             Action::EndSelection
         }
-        // ── Left-click in map ─────────────────────────────────────────────────
-        // Pin, unpin, follow (SQ-0692). A click on a room points the dock at it
-        // (opening the dock if it was closed); a second click on the SAME pinned
-        // room, or a click on empty map space, unpins and the dock goes back to
-        // following the player. Focus deliberately stays on the story pane so you
-        // can keep typing.
+        // ── Left-down in map: begin a click-or-drag-pan gesture (SQ-1325) ──────
+        // A plain press-release still pins/unpins exactly as before (SQ-0692) —
+        // opening the dock on a room, keeping whichever body was last shown
+        // (SQ-1265), or unpinning on empty map space — but that decision is now
+        // DEFERRED to `EndDragPan` rather than fired here immediately, because
+        // the same press may turn into a drag-to-pan instead: there is no
+        // separate "drag a room to move it" mouse gesture (`move-region`/
+        // `Action::MoveRegion` is a keyboard/command action, not a mouse one),
+        // so any Down in the map — room box or empty gutter alike — can pan.
+        // Focus deliberately stays on the story pane so you can keep typing.
         MouseEventKind::Down(MouseButton::Left) if in_map => {
-            match room_at_screen(room_rects, col, row) {
-                Some(id) if state.room_dock.open && state.selected_room == Some(id) => {
-                    Action::UnpinRoomDock
-                }
-                Some(id) => Action::PinRoomDock(id, crate::state::RoomDockView::Info),
+            let click = match room_at_screen(room_rects, col, row) {
+                Some(id) => crate::state::MapClick::Room(id),
                 // Empty map gutter: unpin only. This used to hand the keyboard to
                 // the map, which is exactly the invisible mode SQ-0599 removed — a
                 // stray click in the gutter would silently redirect every
                 // subsequent keystroke away from the story.
-                None => Action::UnpinRoomDock,
-            }
+                None => crate::state::MapClick::Empty,
+            };
+            Action::BeginMapDrag(col, row, click)
         }
         // ── Right-click in map ────────────────────────────────────────────────
-        // Same gestures, but pointed at the DIAGNOSTICS body. Only a click on a
-        // room already pinned AND already showing diagnostics unpins — otherwise
-        // the click has somewhere to take you.
+        // A click on a room opens its context menu (SQ-1265: Rename Room, Move
+        // Region, Rename Layer), pinning the dock on it exactly like a left
+        // click. A click on empty map space is the same "unpin only" as a left
+        // click there — no menu, nothing to open it on.
         MouseEventKind::Down(MouseButton::Right) if in_map => {
             match room_at_screen(room_rects, col, row) {
-                Some(id)
-                    if state.room_dock.open
-                        && state.selected_room == Some(id)
-                        && state.room_dock_view == crate::state::RoomDockView::Diagnostics =>
-                {
-                    Action::UnpinRoomDock
-                }
-                Some(id) => Action::PinRoomDock(id, crate::state::RoomDockView::Diagnostics),
+                Some(id) => Action::OpenRoomMenu(id, col, row),
                 None => Action::UnpinRoomDock,
             }
         }
@@ -1150,6 +1312,142 @@ pub fn mouse_to_action(
     }
 }
 
+// ── Deferred v6 game click (SQ-1378) ──────────────────────────────────────────
+//
+// The whole decision is `v6_mouse_outcome` below, so the run loop's arm is a thin
+// call and the gesture can be driven — and falsified — without the event loop.
+// See [`crate::state::PendingV6Click`] for why a v6 click is deferred at all.
+
+/// What the run loop does with one mouse event over a v6 pane (SQ-1378).
+///
+/// The pre-SQ-1378 answer to a press was "deliver the click to the VM and consume
+/// the event", which is why no press in a Zork Zero, Shogun or Arthur pane ever
+/// reached `Action::StartSelection`; this type is what says otherwise, and a test
+/// asking it about a press over story text is what pins the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V6MouseOutcome {
+    /// Nothing v6-specific: the event goes on to `mouse_to_action` as usual.
+    Route,
+    /// Remember this click, and STILL route the event — the same press may yet
+    /// turn out to be a text selection, so it anchors one on its way past.
+    DeferAndRoute(crate::state::PendingV6Click),
+    /// Drop the deferred click and route: the gesture is a drag-selection (or the
+    /// read it was aimed at has moved on).
+    ForgetAndRoute,
+    /// A release with no drag in between: deliver this click to the VM. The story
+    /// pane does not see the event.
+    Deliver(crate::state::PendingV6Click),
+}
+
+/// Which read a click would be delivered against, or `None` when the story is not
+/// asking for input a click can answer (SQ-0566).
+///
+/// A `read_char` always takes a click (ZSCII 254, ZMSD §3.8). A LINE read takes
+/// one only when the story lists a click among its terminating characters — Zork
+/// Zero, Shogun and Arthur do; Journey lists none, so a click there stays with the
+/// app.
+pub fn v6_click_read(
+    pending: Option<crate::session::InputKind>,
+    line_terminator: Option<u8>,
+) -> Option<crate::state::V6ClickRead> {
+    use crate::session::InputKind;
+    use crate::state::V6ClickRead;
+    match pending {
+        Some(InputKind::Char) => Some(V6ClickRead::Char),
+        Some(InputKind::Line) => line_terminator.map(|terminator| V6ClickRead::Line { terminator }),
+        _ => None,
+    }
+}
+
+/// The whole press-drag-release decision (SQ-1378), given what is already
+/// deferred, the read the story is waiting on, and — for a press — where the
+/// pointer lands in the game's own screen (`hit`, from `V6ClickMap::map_click`:
+/// `None` in the letterbox margin, outside the pane, or in the rows an extended
+/// frame added below the game's screen).
+///
+/// A press NEVER delivers. `map_click` covers the story text as well as the
+/// artwork, so delivering there is what left `Action::StartSelection` unreachable
+/// in every v6 game whose read takes a click.
+pub fn v6_mouse_outcome(
+    pending_click: Option<crate::state::PendingV6Click>,
+    read: Option<crate::session::InputKind>,
+    line_terminator: Option<u8>,
+    hit: Option<(u16, u16)>,
+    m: &MouseEvent,
+) -> V6MouseOutcome {
+    let forget_or_route = || match pending_click {
+        Some(_) => V6MouseOutcome::ForgetAndRoute,
+        None => V6MouseOutcome::Route,
+    };
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            match (v6_click_read(read, line_terminator), hit) {
+                (Some(read), Some(game_px)) => V6MouseOutcome::DeferAndRoute(
+                    crate::state::PendingV6Click { game_px, cell: (m.column, m.row), read },
+                ),
+                // Not a click the game can take (a Journey line read, a press in
+                // the margin): the story pane gets it, and any older deferral —
+                // a release this app never saw — goes with it.
+                _ => forget_or_route(),
+            }
+        }
+        // The gesture is a text selection after all.
+        MouseEventKind::Drag(MouseButton::Left) => forget_or_route(),
+        MouseEventKind::Up(MouseButton::Left) => match pending_click {
+            // The read can move on between the press and the release (a
+            // game-driven repaint). Deliver only against the read the click was
+            // actually aimed at; otherwise the release just ends the selection.
+            Some(click) if v6_click_read(read, line_terminator) == Some(click.read) => {
+                V6MouseOutcome::Deliver(click)
+            }
+            Some(_) => V6MouseOutcome::ForgetAndRoute,
+            None => V6MouseOutcome::Route,
+        },
+        _ => V6MouseOutcome::Route,
+    }
+}
+
+/// A deferred click belongs to ONE press-drag-release gesture: any non-mouse event
+/// ends it (SQ-1378), the way `pane_drag::interrupt` ends a boundary drag. A
+/// keypress can move the story to a different read entirely, and a click held over
+/// that would fire against a prompt it was never aimed at.
+pub fn v6_click_interrupt(state: &mut AppState, event: &crossterm::event::Event) {
+    if !matches!(event, crossterm::event::Event::Mouse(_)) {
+        state.pending_v6_click = None;
+    }
+}
+
+/// Finish a released story-pane selection: clear it, take the text this frame's
+/// render extracted from the full wrapped transcript (off-screen rows included),
+/// and — when there is any — report the copy as a meta line in the story output.
+/// The text comes back for the caller to put on the clipboard; the run loop is
+/// the only thing that may write OSC 52 to the terminal.
+///
+/// Lives here rather than inline in the run loop so the release half of a v6
+/// press-drag-release (SQ-1378) is reachable from a test.
+pub fn finish_selection(state: &mut AppState) -> Option<String> {
+    let copied = state.selection_text.borrow_mut().take();
+    state.selection = None;
+    state.selection_edge = 0;
+    let text = copied.filter(|t| !t.trim().is_empty())?;
+    // A meta line in the story output rather than a status-bar message (which
+    // has no natural dismissal).
+    state.push_transcript_internal(
+        &format!("Copied {} chars to clipboard", text.chars().count()),
+        crate::state::TranscriptKind::Meta,
+    );
+    Some(text)
+}
+
+/// Drop a selection without copying it: the release delivered a game click
+/// instead (SQ-1378), so the zero-length anchor the Down left behind must reach
+/// neither the clipboard nor the transcript.
+pub fn discard_selection(state: &mut AppState) {
+    state.selection = None;
+    state.selection_edge = 0;
+    state.selection_text.borrow_mut().take();
+}
+
 // ── Internal: hotkey dialog key routing ───────────────────────────────────────
 
 /// When the hotkey dialog is open, route keys to either close the dialog or
@@ -1187,19 +1485,42 @@ fn hotkey_dialog_key_to_action(state: &AppState, key: KeyEvent) -> KeyResolve {
     if let KeyCode::Char(c) = key.code {
         if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
             return match state.hotkeys.leader_command(c) {
-                Some(cmd) => {
-                    let name = cmd.split_whitespace().next().unwrap_or("");
-                    let ctx = crate::slash::find_command(name)
-                        .map(|c| c.context)
-                        .unwrap_or(Context::Global);
-                    KeyResolve::Command(cmd.to_string(), ctx)
-                }
+                // Gate against the LIVE context (SQ-1536), not the bound
+                // command's own declared context — the same fix as SQ-1535's
+                // palette dispatch, and the same bug shape: self-gating a
+                // command against its own `spec.context` trivially passes
+                // `parse_in_context`'s Browser check no matter where this
+                // dialog was opened from.
+                Some(cmd) => KeyResolve::Command(cmd.to_string(), live_slash_context(state)),
                 None => KeyResolve::Action(Action::CloseHotkeyDialog),
             };
         }
     }
 
     KeyResolve::Action(Action::CloseHotkeyDialog)
+}
+
+/// The `Context` slash dispatch should gate against right now, given the
+/// game's live focus and sub-mode — the same determination `key_to_command`
+/// already makes per keystroke (the `tidy_anim` check above, and the
+/// `Focus::Game`/`Focus::Map` match below). The command palette's two dispatch
+/// sites (the row-click in `main.rs` and `palette_key_to_command`'s Enter
+/// handling below) use this rather than the picked candidate's own
+/// `spec.context`, which trivially satisfies `parse_in_context`'s gate instead
+/// of tripping it: a command's own declared context says nothing about which
+/// world is actually live, so a Browser-only candidate reaching this call
+/// (SQ-1535) would otherwise parse successfully no matter where the palette
+/// was opened. The primary fix keeps a Browser command out of the palette's
+/// candidate list at all (`complete::palette_candidates`); this is the
+/// defense-in-depth half.
+pub fn live_slash_context(state: &AppState) -> Context {
+    if state.tidy_anim.is_some() {
+        Context::Anim
+    } else if state.focus == Focus::Map {
+        Context::Map
+    } else {
+        Context::Global
+    }
 }
 
 // ── Internal: command-palette key routing ─────────────────────────────────────
@@ -1228,7 +1549,7 @@ fn palette_key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
             match cands.get(palette.scroll.selected) {
                 Some(cand) => {
                     let spec = &crate::slash::COMMANDS[cand.cmd_index];
-                    KeyResolve::Command(palette.command_line(spec.name), spec.context)
+                    KeyResolve::Command(palette.command_line(spec.name), live_slash_context(state))
                 }
                 None => KeyResolve::Action(Action::PaletteClose),
             }
@@ -1240,6 +1561,36 @@ fn palette_key_to_command(state: &AppState, key: KeyEvent) -> KeyResolve {
             KeyResolve::Action(Action::PaletteChar(c))
         }
         _ => KeyResolve::None,
+    }
+}
+
+// ── Internal: room context menu key routing ───────────────────────────────────
+
+/// Route a key while the room context menu is open (SQ-1265). Up/Down move
+/// the cursor (mutated later, in `apply_action`'s `Action::RoomMenuNav` —
+/// this stays `&AppState` like `palette_key_to_command`, so it cannot mutate
+/// the menu itself); Enter, or an item's own hotkey (a user's `[keymap.map]`
+/// override — none of the three ship with one, see `room_menu`), resolves to
+/// that item's command through the ordinary slash-dispatch path, closing the
+/// menu; Esc closes without acting.
+fn room_menu_key_to_command(
+    menu: &crate::room_menu::RoomMenu,
+    key: KeyEvent,
+    km: &crate::keymap::KeyMap,
+) -> KeyResolve {
+    use crate::room_menu::ROOM_MENU;
+    match key.code {
+        KeyCode::Esc => KeyResolve::Action(Action::CloseRoomMenu),
+        KeyCode::Up => KeyResolve::Action(Action::RoomMenuNav(-1)),
+        KeyCode::Down => KeyResolve::Action(Action::RoomMenuNav(1)),
+        KeyCode::Enter => KeyResolve::Command(ROOM_MENU[menu.cursor].command.to_string(), Context::Map),
+        _ => {
+            let pressed = KeySpec::from_key_event(key);
+            match ROOM_MENU.iter().find(|it| km.first_key(Context::Map, it.command) == Some(pressed)) {
+                Some(it) => KeyResolve::Command(it.command.to_string(), Context::Map),
+                None => KeyResolve::None,
+            }
+        }
     }
 }
 
@@ -1409,22 +1760,58 @@ fn sync_band_phrase_to_input(input: &mut crate::text_field::TextField, old_text:
 /// Remove `old_text` from the end of `input`'s value, if it is still there —
 /// leaving whatever text (if any) preceded it untouched. No-op (rather than a
 /// wrong, partial delete) when the tail has diverged.
+///
+/// Matches against the value with any TRAILING whitespace ignored first
+/// (`parse_phrase` reads `old_text` off `split_whitespace`, so a space typed
+/// after the phrase — e.g. `examine ` — never shows up in it), and the
+/// trailing whitespace is discarded along with `old_text` rather than kept:
+/// [`sync_band_phrase_to_input`] re-adds exactly one separating space itself.
+/// Without this, `old_text` no longer matches the tail at all, and the pick
+/// falls through to being APPENDED after the untouched `old_text` instead of
+/// replacing it (`examine ` + click `rope` → `examine examine rope`).
 fn strip_band_tail(input: &mut crate::text_field::TextField, old_text: &str) {
-    if !old_text.is_empty() && input.value.ends_with(old_text) {
+    if old_text.is_empty() {
+        return;
+    }
+    let trimmed_len = input.value.trim_end().len();
+    if input.value[..trimmed_len].ends_with(old_text) {
         let mut v = input.value.clone();
-        v.truncate(v.len() - old_text.len());
+        v.truncate(trimmed_len - old_text.len());
         input.set(v, true);
     }
 }
 
 /// Pick row `idx` of `col` and compose it onto the prompt — the shared core
 /// of a mouse click (`Action::BandClickRow`) and a Tab-with-highlight pick
-/// (`Action::BandTabPick`, which truncates the partial word first and then
-/// calls this exactly the same way). `col` becomes the current column; `pick`
-/// then advances it again to the NEXT reachable one (SQ-0677: a pick — click
-/// or Tab — always moves the current column forward, symmetric with typing
-/// a verb/prep advancing it).
+/// (`Action::BandTabPick`). `col` becomes the current column; `pick` then
+/// advances it again to the NEXT reachable one (SQ-0677: a pick — click or
+/// Tab — always moves the current column forward, symmetric with typing a
+/// verb/prep advancing it).
+///
+/// Strips the word under construction FIRST, but ONLY when NOTHING has been
+/// picked yet (`phrase_text()` empty) — e.g. completing the very first word,
+/// `exa` → `examine`, where the partial verb isn't a recognized token yet so
+/// `parse_phrase` doesn't count it toward `phrase_text()` at all, leaving the
+/// tail-diff below (`old_text = ""`) nothing to strip on its own (mirrors
+/// `apply_completion`'s truncate-then-insert for that case). Once at least
+/// one slot IS picked, the partial word for whatever comes next (an object, a
+/// second object) already counts toward `phrase_text()` — see
+/// `CommandBandState::parse_phrase`'s doc, "the word still under construction
+/// counts as a token" — so the tail-diff below replaces it correctly on its
+/// own; pre-stripping here TOO would double-strip and leave a stray
+/// duplicate (`take take door`, the falsified symptom — see
+/// `typing_at_the_prompt_completes_from_the_live_object_columns` in
+/// `tests/command_band.rs`). Shared by click and Tab alike (SQ-1230: a click
+/// on a partial verb, e.g. `exa` + click `examine`, must replace it exactly
+/// like Tab does, not append after it).
 fn band_pick_row(state: &mut AppState, col: usize, idx: usize) {
+    let old_is_empty =
+        state.overlays.command_band.as_ref().is_some_and(|b| b.phrase_text().is_empty());
+    if old_is_empty {
+        let keep = state.input.char_len() - state.current_partial().chars().count();
+        state.input.truncate_chars(keep);
+    }
+
     let vp = state.modal_list_viewport;
     let anim = state.config.animation.clone();
     if let Some(b) = &mut state.overlays.command_band {
@@ -1439,6 +1826,28 @@ fn band_pick_row(state: &mut AppState, col: usize, idx: usize) {
             sync_band_phrase_to_input(&mut state.input, &old, &new);
         }
     }
+}
+
+/// Compose `word` onto the prompt exactly as a command-band WHAT-noun pick
+/// does — the inventory dock's counterpart of [`band_pick_row`] (SQ-1244),
+/// used when there is nothing to pick FROM: the inventory panel shows
+/// exactly when the command band is closed (the two are mutually exclusive,
+/// [`crate::state::SidePanel`]), so there is no `CommandBandState` whose
+/// `items`/`pick` this could index into.
+///
+/// Routes through the SAME low-level composer `band_pick_row` itself calls
+/// ([`sync_band_phrase_to_input`]), not a copy of its logic: `old_text` is
+/// the word still under construction at the prompt
+/// ([`AppState::current_partial`]), which the composer strips before
+/// appending `word` with its one separating space. That is exactly SQ-1230's
+/// "a partial word being typed is replaced" rule, read here off the raw
+/// prompt text rather than off band picks — a typed verb before the partial
+/// word is untouched (`sync_band_phrase_to_input` strips only the tail it is
+/// told to), so `examine ` stays and the item lands after it, while a bare
+/// unrecognized fragment (`exa`) is replaced outright.
+fn compose_word_onto_prompt(state: &mut AppState, word: &str) {
+    let partial = state.current_partial().to_string();
+    sync_band_phrase_to_input(&mut state.input, &partial, word);
 }
 
 /// The command a quick-row pick fires (SQ-0667 amendment, 2026-08-05):
@@ -1638,6 +2047,15 @@ pub fn page_scroll(current: u16, dir: i8, viewport_rows: u16, max_scroll: u16) -
     (next.min(u16::MAX as usize) as u16).min(max_scroll)
 }
 
+/// Compute the new transcript scroll offset for a half-page step (Ctrl-D, vim
+/// convention; SQ-1228). Same direction and clamp semantics as `page_scroll`,
+/// but the step is `floor(viewport_rows / 2)` (floored at 1) rather than a full
+/// page.
+pub fn half_page_scroll(current: u16, dir: i8, viewport_rows: u16, max_scroll: u16) -> u16 {
+    let next = crate::list_scroll::half_page_step(current as usize, dir as i32, viewport_rows as usize);
+    (next.min(u16::MAX as usize) as u16).min(max_scroll)
+}
+
 /// Cycle a button-focus index by `delta` (+1 Tab, -1 Shift-Tab), wrapping within
 /// `0..len`. Returns 0 when `len` is 0.
 pub fn cycle_focus(idx: usize, len: usize, delta: i32) -> usize {
@@ -1654,7 +2072,7 @@ pub fn cycle_focus(idx: usize, len: usize, delta: i32) -> usize {
 ///
 /// **Caller-handled actions** (silently ignored here — the run loop must act on
 /// them): `SubmitCommand` (game focus), `SaveGame`, `RestoreGame`, `ExportSvg`,
-/// `Quit`.
+/// `ExportJson`, `Quit`.
 ///
 /// The former bottom-bar prompt sub-mode is gone: rename/notes/relabel/layer/
 /// config-path/create-file open the `text_entry` modal (submit via
@@ -1672,7 +2090,7 @@ pub fn cycle_focus(idx: usize, len: usize, delta: i32) -> usize {
 ///
 /// The band's open/closed state is a per-game preference now, written by
 /// [`Action::OpenCommandBand`]. `startup` opens the band at boot from
-/// `[command_band] auto_open` (or this game's own override), and that must NOT
+/// `[command_panel] auto_open` (or this game's own override), and that must NOT
 /// write a sidecar key — a global default that quietly pinned itself to the
 /// first game you opened would be a trap. So the state change lives here and the
 /// action adds the persistence on top of it.
@@ -1692,7 +2110,7 @@ pub fn open_command_band(state: &mut AppState, mapper: &mut Mapper, open: bool) 
         }
         let mut band = crate::state::CommandBandState::new(
             verbs,
-            state.config.command_band.resolve_quick(),
+            state.config.command_band.resolve_quick_for(&state.game_dir),
         );
         // The band opens reading whatever is ALREADY on the prompt (SQ-0676): its
         // phrase state follows the typed line, so a half-typed `take ` must light
@@ -1703,6 +2121,83 @@ pub fn open_command_band(state: &mut AppState, mapper: &mut Mapper, open: bool) 
     }
     state.band_dock.toggle_to(true, false);
     state.band_dock.arm(&state.config.animation);
+}
+
+/// Open or close the inventory panel, without persisting anything (SQ-1237) —
+/// the state-only half `open_command_band` above is, for the same reason: boot
+/// and `cycle_panel` both need to change the panel without writing a per-game
+/// override on their own behalf, leaving that to the action arm that persists.
+pub fn open_inventory_panel(state: &mut AppState, open: bool) {
+    state.show_inventory = open;
+    state.inv_dock.toggle_to(open, false);
+    state.inv_dock.arm(&state.config.animation);
+}
+
+/// Cycle the story pane's border control: command panel → inventory panel →
+/// none → command panel (SQ-1237). The two panels are mutually exclusive, so
+/// landing on one closes the other; landing on `None` closes both. Persists
+/// the new state per-game, exactly as a direct `/toggle-command-panel` or
+/// `/toggle-inventory-panel` does — a click on the border control runs this
+/// through the same `slash::COMMANDS` dispatch every other control uses, so
+/// what it remembers is this function's job, not a second one.
+pub fn cycle_panel(state: &mut AppState, mapper: &mut Mapper) {
+    let next = state.current_side_panel().next();
+    match next {
+        crate::state::SidePanel::Command => {
+            open_inventory_panel(state, false);
+            open_command_band(state, mapper, true);
+        }
+        crate::state::SidePanel::Inventory => {
+            open_command_band(state, mapper, false);
+            open_inventory_panel(state, true);
+        }
+        crate::state::SidePanel::None => {
+            open_command_band(state, mapper, false);
+            open_inventory_panel(state, false);
+        }
+    }
+    if !state.game_dir.as_os_str().is_empty() {
+        let _ = crate::styles::write_per_game_panel(&state.game_dir, Some(next));
+    }
+}
+
+/// Pin the room dock on `id` in `view` (opening it if closed), the shared body
+/// of both `Action::PinRoomDock` (left click) and `Action::OpenRoomMenu`
+/// (right click, SQ-1265) — the two gestures pin the same way, so the panel
+/// and whichever popup opened over it always agree on which room is meant.
+fn pin_room_dock(
+    state: &mut AppState,
+    mapper: &Mapper,
+    id: mapper::graph::RoomId,
+    view: crate::state::RoomDockView,
+) {
+    // Pinning IS selecting (SQ-0692): one fact drives the map highlight, the
+    // matrix cross-highlight and the dock header, so they cannot drift apart.
+    state.selected_room = Some(id);
+    state.open_room_dock(view);
+    // Focus deliberately STAYS on the story pane. Taking map focus made every
+    // letter a map command (so typing reached nothing) and dimmed the story
+    // pane on top of that. The selected-room highlight does not need focus —
+    // `render/map.rs` reads only `selected_room`.
+
+    // SQ-0693: in the MATRIX view a click also asks "and how do I walk there
+    // from here?". Only there — the drawn map has no leave-by cell to mark, so
+    // computing a route for it would buy a toast and nothing else. A route to
+    // the room you are already standing in is empty and says nothing, which
+    // is the correct amount to say.
+    state.room_path.clear();
+    if state.map_shows_matrix(&mapper.graph) {
+        if let Some(here) = mapper.graph.current() {
+            match mapper::path::route(&mapper.graph, here, id) {
+                Some(steps) => state.room_path = steps,
+                // Falling silent here reads as a broken click: the room
+                // selects, its entrances bold, and nothing says why no route
+                // appeared. A partial route to somewhere nearer would be
+                // worse — it answers a question nobody asked.
+                None => state.set_status("no known route from here"),
+            }
+        }
+    }
 }
 
 pub fn apply_action(action: Action, state: &mut AppState, mapper: &mut Mapper) {
@@ -1936,8 +2431,10 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
                 MapView::Drawn => MapView::Matrix,
                 MapView::Matrix => MapView::Drawn,
             });
+            // `set_layer_view` bumps `Mapper::struct_gen` itself when the choice actually
+            // changes (SQ-1544), which `cached_map_render` reads directly — no separate
+            // invalidation needed.
             mapper.graph.set_layer_view(layer, Some(next));
-            state.bump_graph_gen(); // the pane draws something else entirely (SQ-0305)
             let label = match next {
                 MapView::Drawn => "drawn",
                 MapView::Matrix => "matrix",
@@ -1948,8 +2445,9 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             use mapper::layer::MapView;
             let layer = state.active_layer(&mapper.graph);
             let maze = !mapper.graph.layer_is_maze(layer);
+            // `set_layer_maze` bumps `Mapper::struct_gen` itself (SQ-1544) — see the comment on
+            // the `ViewMap` arm above.
             mapper.graph.set_layer_maze(layer, maze);
-            state.bump_graph_gen();
             // Flagging a maze is how most players will ever reach the matrix, and the flag alone
             // takes them there: it moves the layer's DEFAULT view. Nothing is written to the
             // layer's explicit choice, so an earlier `/view-map` still wins, and unflagging puts
@@ -1983,7 +2481,7 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
                     return;
                 }
                 let mut g = mapper.graph.clone();
-                let gen = state.graph_gen;
+                let gen = mapper.graph.struct_gen();
                 let total = mapper.graph.rooms_in_layer(layer).len() + 8;
                 let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let progress_clone = std::sync::Arc::clone(&progress);
@@ -2032,7 +2530,7 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             if state.anim_build_job.is_none() && state.tidy_anim.is_none() {
                 let layer = state.active_layer(&mapper.graph);
                 let mut g = mapper.graph.clone();
-                let gen = state.graph_gen;
+                let gen = mapper.graph.struct_gen();
                 // Estimate the final frame count from the layer's room count (one placement
                 // frame per room dominates), plus headroom for the fixed layout/cleanup stages.
                 // Only an estimate — the real total isn't known until the build finishes.
@@ -2127,7 +2625,7 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             if !state.config.enable_sound {
                 state.reset_sound_sidecars();
             } else if state.audio.is_none() {
-                state.audio = Some(audio::AudioBackend::new(state.config.volume));
+                state.audio = Some(crate::host::sound::default_sound_sink(state.config.volume));
             }
             // Sync the running Glulx VM's Sound gestalt (applied by the event loop).
             state.pending_vm_sound = Some(state.config.enable_sound);
@@ -2200,8 +2698,8 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
                 if let Some(conn) =
                     mapper.graph.connections().iter().find(|c| c.origin == id).cloned()
                 {
+                    // `delete_connection` bumps `Mapper::struct_gen` itself (SQ-1544).
                     mapper.delete_connection(conn.origin, conn.dir);
-                    state.bump_graph_gen(); // edge removed → invalidate map memo (SQ-0305)
                 }
             }
         }
@@ -2484,34 +2982,7 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
         }
 
         Action::PinRoomDock(id, view) => {
-            // Pinning IS selecting (SQ-0692): one fact drives the map highlight,
-            // the matrix cross-highlight and the dock header, so they cannot drift
-            // apart.
-            state.selected_room = Some(id);
-            state.open_room_dock(view);
-            // Focus deliberately STAYS on the story pane. Taking map focus made
-            // every letter a map command (so typing reached nothing) and dimmed the
-            // story pane on top of that. The selected-room highlight does not need
-            // focus — `render/map.rs` reads only `selected_room`.
-
-            // SQ-0693: in the MATRIX view a click also asks "and how do I walk
-            // there from here?". Only there — the drawn map has no leave-by cell
-            // to mark, so computing a route for it would buy a toast and nothing
-            // else. A route to the room you are already standing in is empty and
-            // says nothing, which is the correct amount to say.
-            state.room_path.clear();
-            if state.map_shows_matrix(&mapper.graph) {
-                if let Some(here) = mapper.graph.current() {
-                    match mapper::path::route(&mapper.graph, here, id) {
-                        Some(steps) => state.room_path = steps,
-                        // Falling silent here reads as a broken click: the room
-                        // selects, its entrances bold, and nothing says why no
-                        // route appeared. A partial route to somewhere nearer
-                        // would be worse — it answers a question nobody asked.
-                        None => state.set_status("no known route from here"),
-                    }
-                }
-            }
+            pin_room_dock(state, mapper, id, view);
         }
 
         Action::UnpinRoomDock => {
@@ -2532,6 +3003,21 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             state.room_dock_view = view;
         }
 
+        // SQ-1280: the wheel scrolls whichever body is showing. `len()` re-records
+        // the viewport the last render measured (`room_dock_body_viewport`, synced
+        // the same way `modal_list_viewport` is) before `scroll_by` clamps against
+        // it — the same two-step every `ListWheel` arm above takes, just against a
+        // per-body `ListScroll` instead of a shared modal one.
+        Action::RoomDockScroll(delta) => {
+            let vp = state.room_dock_body_viewport as usize;
+            let anim = state.config.animation.clone();
+            let scroll = match state.room_dock_view {
+                crate::state::RoomDockView::Info => &mut state.room_dock_info_scroll,
+                crate::state::RoomDockView::Diagnostics => &mut state.room_dock_diag_scroll,
+            };
+            scroll.scroll_by(delta as isize, vp, &anim);
+        }
+
         Action::ToggleRoomDock => {
             use crate::state::RoomDockView;
             if state.room_dock.open {
@@ -2541,11 +3027,42 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             }
         }
 
+        // ── Room context menu (SQ-1265) ───────────────────────────────────────
+
+        Action::OpenRoomMenu(id, col, row) => {
+            // The same pin a left click gives — keeping whichever body was last
+            // shown, per `pin_room_dock` — so the menu and the panel underneath
+            // always agree on which room is meant.
+            let view = state.room_dock_view;
+            pin_room_dock(state, mapper, id, view);
+            state.overlays.room_menu =
+                Some(crate::room_menu::RoomMenu::new(id, col, row));
+        }
+
+        Action::RoomMenuNav(delta) => {
+            if let Some(menu) = state.overlays.room_menu.as_mut() {
+                let n = crate::room_menu::ROOM_MENU.len() as i32;
+                menu.cursor = (menu.cursor as i32 + delta).rem_euclid(n) as usize;
+            }
+        }
+
+        Action::CloseRoomMenu => {
+            state.overlays.room_menu = None;
+        }
+
         // ── Mouse drag-pan actions ────────────────────────────────────────────
 
         Action::BeginDragPan(col, row) => {
             use crate::state::DragState;
-            state.drag = Some(DragState { last: (col, row), acc_x: 0, acc_y: 0 });
+            state.drag = Some(DragState { last: (col, row), acc_x: 0, acc_y: 0, moved: false, map_click: None });
+        }
+
+        // SQ-1325: same shape as `BeginDragPan` above, but records the plain-click
+        // target the press resolved to (via `mouse_to_action`'s room hit-test),
+        // for `EndDragPan` to replay if the pointer never moves.
+        Action::BeginMapDrag(col, row, click) => {
+            use crate::state::DragState;
+            state.drag = Some(DragState { last: (col, row), acc_x: 0, acc_y: 0, moved: false, map_click: Some(click) });
         }
 
         Action::DragPanTo(col, row) => {
@@ -2553,6 +3070,7 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
                 let dx = col as i32 - drag.last.0 as i32;
                 let dy = row as i32 - drag.last.1 as i32;
                 drag.last = (col, row);
+                drag.moved = true;
                 // Grab-and-drag: the content follows the cursor (dragging right
                 // moves the map right). char_pan is added to the draw offset, so
                 // add the delta directly. 1-character precision.
@@ -2561,8 +3079,30 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             }
         }
 
+        // SQ-1325: a left-button map drag with no motion is a plain click — replay
+        // exactly what `Down(Left) if in_map` used to do immediately (SQ-0692),
+        // now that `BeginMapDrag` deferred it. A middle-button pan (or a
+        // left-button drag that DID move) carries no `map_click` / has `moved`
+        // set, so this is a no-op for both.
         Action::EndDragPan => {
-            state.drag = None;
+            let click = state.drag.take().filter(|d| !d.moved).and_then(|d| d.map_click);
+            match click {
+                Some(crate::state::MapClick::Room(id))
+                    if state.room_dock.open && state.selected_room == Some(id) =>
+                {
+                    state.selected_room = None;
+                    state.room_path.clear();
+                }
+                Some(crate::state::MapClick::Room(id)) => {
+                    let view = state.room_dock_view;
+                    pin_room_dock(state, mapper, id, view);
+                }
+                Some(crate::state::MapClick::Empty) => {
+                    state.selected_room = None;
+                    state.room_path.clear();
+                }
+                None => {}
+            }
         }
 
         Action::StartSelection(col, row) => {
@@ -2616,29 +3156,58 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
         }
 
         Action::ToggleInventory => {
-            state.show_inventory = !state.show_inventory;
-            state.inv_dock.toggle_to(state.show_inventory, false);
-            state.inv_dock.arm(&state.config.animation);
+            let opening = !state.show_inventory;
+            // Mutually exclusive with the command panel (SQ-1237): opening the
+            // inventory panel closes the command panel, exactly as `cycle_panel`
+            // does when it lands on `Inventory`.
+            if opening {
+                open_command_band(state, mapper, false);
+            }
+            open_inventory_panel(state, opening);
+            // Persist per-game, the same rule `Action::OpenCommandBand` follows
+            // below — a preference chosen for one story stays with that story.
+            if !state.game_dir.as_os_str().is_empty() {
+                let next = if opening {
+                    crate::state::SidePanel::Inventory
+                } else {
+                    crate::state::SidePanel::None
+                };
+                let _ = crate::styles::write_per_game_panel(&state.game_dir, Some(next));
+            }
         }
 
         Action::OpenCommandBand => {
             state.overlays.hotkey_dialog = false;
-            // F2 / `/open-command-band` is a TOGGLE (bug fix, SQ-0677): with
+            // F2 / `/toggle-command-panel` is a TOGGLE (bug fix, SQ-0677): with
             // the band already open (its dock target is `open`, whether or
             // not the slide has settled), the SAME key/command closes it —
             // Esc's ladder must never be the only one-key way out.
             let open = !(state.overlays.command_band.is_some() && state.band_dock.open);
+            // Mutually exclusive with the inventory panel (SQ-1237).
+            if open {
+                open_inventory_panel(state, false);
+            }
             open_command_band(state, mapper, open);
-            // Persist the band's on/off state per-game so it is restored the next
+            // Persist the panel's state per-game so it is restored the next
             // time this story opens (SQ-1123) — the same rule `Action::ToggleMap`
             // has followed since SQ-0304, and the reason `startup` opens the band
             // through `open_command_band` directly instead of through this action:
-            // a global `[command_band] auto_open` must not silently become one
+            // a global `[command_panel] auto_open` must not silently become one
             // game's pinned override. No game_dir → no sidecar (and it keeps unit
             // tests off the filesystem).
             if !state.game_dir.as_os_str().is_empty() {
-                let _ = crate::styles::write_per_game_command_band(&state.game_dir, Some(open));
+                let next = if open {
+                    crate::state::SidePanel::Command
+                } else {
+                    crate::state::SidePanel::None
+                };
+                let _ = crate::styles::write_per_game_panel(&state.game_dir, Some(next));
             }
+        }
+
+        Action::CyclePanel => {
+            state.overlays.hotkey_dialog = false;
+            cycle_panel(state, mapper);
         }
 
         Action::BandColumnStep(delta) => {
@@ -2694,34 +3263,10 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
 
         Action::BandClickRow(col, idx) => band_pick_row(state, col, idx),
 
-        Action::BandTabPick(col, idx) => {
-            // Strip the word under construction FIRST, but ONLY when NOTHING
-            // has been picked yet (`phrase_text()` empty) — e.g. completing
-            // the very first word, `unl` → `unlock`, where the partial verb
-            // isn't a recognized token yet so `parse_phrase` doesn't count it
-            // toward `phrase_text()` at all, leaving `band_pick_row`'s own
-            // tail-diff (`old_text = ""`) nothing to strip on its own
-            // (mirrors `apply_completion`'s truncate-then-insert for that
-            // case). Once at least one slot IS picked, the partial word for
-            // whatever comes next (an object, a second object) already
-            // counts toward `phrase_text()` — see `CommandBandState::
-            // parse_phrase`'s doc, "the word still under construction counts
-            // as a token" — so `band_pick_row`'s existing diff replaces it
-            // correctly on its own; pre-stripping here TOO would double-strip
-            // and leave a stray duplicate (`take take door`, the falsified
-            // symptom — see `typing_at_the_prompt_completes_from_the_live_
-            // object_columns` in tests/command_band.rs).
-            let old_is_empty = state
-                .overlays
-                .command_band
-                .as_ref()
-                .is_some_and(|b| b.phrase_text().is_empty());
-            if old_is_empty {
-                let keep = state.input.char_len() - state.current_partial().chars().count();
-                state.input.truncate_chars(keep);
-            }
-            band_pick_row(state, col, idx);
-        }
+        // The partial-word pre-strip (Tab completing `unl` -> `unlock`
+        // rather than appending) lives in `band_pick_row` itself now,
+        // shared with `Action::BandClickRow` -- see its doc.
+        Action::BandTabPick(col, idx) => band_pick_row(state, col, idx),
 
         Action::BandFocusCol(col) => {
             if let Some(b) = &mut state.overlays.command_band {
@@ -2762,6 +3307,27 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
             // amendment is that a quick pick does NOT touch the band's
             // in-progress phrase (it's an interjection, not a pick), so there
             // is nothing for this arm to do even in principle.
+        }
+
+        Action::InventoryClickRow(idx) => {
+            if let Some(word) = state.inventory_click_words.get(idx).cloned() {
+                compose_word_onto_prompt(state, &word);
+            }
+        }
+
+        // SQ-1630: the wheel scrolls the dock's one body. `len()` re-records the
+        // viewport the last render measured (`inv_dock_body_viewport`, synced the
+        // same way `room_dock_body_viewport` is) before `scroll_by` clamps
+        // against it — the same two-step `RoomDockScroll` takes.
+        Action::InventoryDockScroll(delta) => {
+            let vp = state.inv_dock_body_viewport as usize;
+            let anim = state.config.animation.clone();
+            state.inv_dock_scroll.scroll_by(delta as isize, vp, &anim);
+        }
+
+        Action::SetInventoryFilter(query) => {
+            state.inv_dock_filter = query;
+            state.inv_dock_scroll = crate::list_scroll::ListScroll::new();
         }
 
         Action::BandEscape => {
@@ -2953,83 +3519,12 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
         }
 
         Action::ConfigSave => {
-            if let Some(cs) = state.overlays.config_screen.take() {
-                state.config = clone_config(&cs.working);
-                // The config screen edits the GLOBAL honor default; keep the
-                // SQ-0318 base in sync so a later reload_style doesn't revert it
-                // (a per-game override, if any, still wins on the next reload).
-                state.honor_game_colours_base = state.config.honor_game_colours;
-                // SQ-0860: the base alone is not enough when a one-run source is
-                // holding this key, because `reload_style` only falls back to the
-                // base when nothing per-story is speaking. Editing the row calls
-                // `one_run.release` (see `one_run_key_for_row`), so a missing pin
-                // on a key that had one IS the deliberate edit — end the holds that
-                // live on `AppState` too, or the next style reload recomputes the
-                // user's own choice straight back off. Untouched rows keep their
-                // pin, so saving some unrelated setting changes nothing here.
-                if !state.config.one_run.holds(crate::config::keys::HONOR_GAME_COLOURS) {
-                    state.game_colours_cli = None;
-                    state.artwork_declines_colours = false;
-                }
-                if let Some(b) = state.audio.as_mut() {
-                    b.set_volume(state.config.volume);
-                } else if state.config.enable_sound {
-                    state.audio = Some(audio::AudioBackend::new(state.config.volume));
-                }
-                if !state.config.enable_sound {
-                    state.reset_sound_sidecars();
-                }
-                // Sync the running Glulx VM's Sound gestalt (applied by the event loop).
-                state.pending_vm_sound = Some(state.config.enable_sound);
-                // Reconcile the style file-watcher live (the run loop owns it).
-                state.pending_watch_style = Some(state.config.watch_style);
-                // SQ-1161: two settings are mirrored onto `AppState` at boot and
-                // read from THERE by render — `startup.rs` seeds both and the
-                // toggle keys drive the mirror, not the config. Saving the row
-                // without lowering it wrote config.toml and changed nothing on
-                // screen until the next launch, which is exactly the silent
-                // half-application the screen's contract forbids.
-                state.show_status_bar = state.config.show_status_bar;
-                state.show_room_numbers = state.config.show_room_numbers;
-                // SQ-1161: and four more keys keep a `_base` on `AppState` — the
-                // GLOBAL default a per-story source overrides for one launch, and
-                // what `/set-guidance auto` (and its siblings) fall back to. The
-                // honour row's base is lowered above for the same reason; without
-                // these, saving the row moved the live value and left `auto`
-                // pointing at the value the session started with.
-                //
-                // Only when nothing per-story is pinning the key: a pin means the
-                // row was NOT edited (editing releases it, above), so `working`
-                // still holds someone else's value for this run and lowering it
-                // would turn one game's choice into everyone's (SQ-0807).
-                if !state.config.one_run.holds(crate::config::keys::GUIDANCE) {
-                    state.guidance_base = state.config.guidance;
-                }
-                if !state.config.one_run.holds(crate::config::keys::RETURN_PROBE) {
-                    state.return_probe_base = state.config.return_probe;
-                }
-                if !state.config.one_run.holds(crate::config::keys::V6_PIXEL_LOCK) {
-                    state.v6_pixel_lock_base = state.config.v6_pixel_lock;
-                }
-                if !state.config.one_run.holds(crate::config::keys::V6_RENDER) {
-                    state.v6_render_base = state.config.v6_render;
-                }
-                // Re-resolving the live look is caller-handled, and deliberately
-                // runs AFTER `write_config_file` (SQ-1161). It used to happen here
-                // as a bare global `load_style` + `resolve`, which dropped the
-                // per-game style overlay and the garglk overlay from the live look
-                // and never recomputed `state.period_look` — so saving the
-                // `period_look` row did nothing until something else happened to
-                // reload the style. `reload::reload_style` is the ONE place the
-                // theme is built and fixes all three, but it also recomputes
-                // `honor_game_colours` from this story's sidecar and re-PINS it,
-                // and `ConfigDoc::put` skips a pinned key: run here, it would
-                // silently drop the honour row's edit from the file it was just
-                // asked to write. Ordering is the whole fix — the file first, then
-                // the story's own overrides back over the top of the live look.
-                // The style-file write + config repoint is caller-handled
-                // (main.rs snapshots working before this runs).
-            }
+            // The whole of Save's `AppState` half lives in `host::settings::apply`
+            // (SQ-1559) so a non-terminal host runs the same bookkeeping. Writing
+            // config.toml and re-resolving the live look run AFTER it, in
+            // `host::settings::commit` — caller-handled (main.rs), so a test that
+            // drives this action writes nothing to disk.
+            config_save(state);
         }
 
         Action::ConfigCancel => {
@@ -3052,10 +3547,12 @@ fn apply_action_inner(action: Action, state: &mut AppState, mapper: &mut Mapper)
         | Action::ExportSvg(_)
         | Action::ExportDot(_)
         | Action::ExportMap(_)
+        | Action::ExportJson(_)
         | Action::SavesLoad
         | Action::SavesImport
         | Action::FbEnter
         | Action::TranscriptScrollPage(_)
+        | Action::TranscriptScrollHalfPage(_)
         | Action::PagerAdvance
         | Action::PagerDismiss
         | Action::Quit => {}
@@ -3237,7 +3734,7 @@ pub fn refresh_seen_words(state: &mut AppState, engine: &dyn crate::engine::Engi
     // As the folded any-object SET, not the `Vec<ObjectWords>`: `is_thing`
     // below never asks WHICH object answers, and walking the vec re-truncated
     // the story's whole vocabulary for every fresh word (SQ-1176).
-    let objects = engine.introspect().and_then(|i| i.object_word_set());
+    let objects = engine.object_word_set();
     // Newest first: walk the batch backwards and keep the first sighting of each
     // word, which is its LAST printing.
     let (fresh, fresh_nouns): (Vec<String>, Vec<String>) = {
@@ -3247,10 +3744,12 @@ pub fn refresh_seen_words(state: &mut AppState, engine: &dyn crate::engine::Engi
         // Is this word a THING rather than an action or a joining word?
         //
         // The story's own objects where they can be read, which is exact and
-        // needs no flag layout. Otherwise the dictionary's role bits, which is
-        // what Glulx and Scott have and is unchanged for them: a word the story
-        // marks a NOUN and does not write literally into a grammar line
-        // (SQ-1042). Measured on `stories/advent.blb` at the opening room that
+        // needs no flag layout — the Z-machine's, and since SQ-1210 Glulx's
+        // too (`Engine::object_word_set`). Otherwise the dictionary's role
+        // bits, which is what Scott and an unreadable Glulx image have: a word
+        // the story marks a NOUN and does not write literally into a grammar
+        // line (SQ-1042). Measured on `stories/advent.blb` at the opening room
+        // — back when that title still took this branch — that
         // cuts 20 scraped words to 12 — `at`, `in`, `of`, `to`, `down` and `out`
         // are prepositions the grammar writes down, `don` and `release` are
         // verbs. What it does NOT reach is Inform's `a`, `and` and `the`, which
@@ -3377,21 +3876,13 @@ pub(crate) fn slash_suggestions(body_token: &str, names: &[String], limit: usize
 /// Lengths are counted in CHARS, not bytes. The byte arithmetic this replaces would panic outright
 /// on a multi-byte partial word: `String::truncate` rejects a non-char boundary, and subtracting a
 /// byte length from a byte length lands on one as soon as the word holds anything non-ASCII.
+///
+/// A thin wrapper over [`crate::complete::apply_completion_to_line`] (SQ-1549), the pure twin a
+/// host with no `AppState` of its own can call directly.
 fn apply_completion(state: &mut AppState, completion: &str) {
     let prefix = state.config.command_prefix;
-    // Slash-command suggestions hold the bare name (no prefix). When completing the first token of
-    // a slash command, rebuild the line as prefix + name so the leading prefix survives.
-    let is_slash_name = state.input.value.starts_with(prefix)
-        && !state.input.value[prefix.len_utf8()..].contains(' ');
-    if is_slash_name {
-        state.input.clear();
-        state.input.insert(prefix);
-    } else {
-        let keep = state.input.char_len() - state.current_partial().chars().count();
-        state.input.truncate_chars(keep);
-        state.input.end();
-    }
-    state.input.insert_str(completion);
+    let new_line = crate::complete::apply_completion_to_line(&state.input.value, prefix, completion);
+    state.input.set(new_line, true);
 }
 
 /// Recompute `state.suggestions` from `state.dict_words`, the story's own words
@@ -3402,51 +3893,20 @@ fn apply_completion(state: &mut AppState, completion: &str) {
 /// When the input starts with `state.config.command_prefix`, completes the
 /// first token after the prefix from `slash::slash_names()` instead of the
 /// dictionary.
+///
+/// A thin wrapper over [`crate::complete::completion_candidates`] (SQ-1549), the pure twin a
+/// host with no `AppState` of its own can call directly.
 pub(crate) fn recompute_suggestions(state: &mut AppState) {
-    const SUGGESTION_LIMIT: usize = 6;
-    let prefix = state.config.command_prefix;
-    // Check if the whole input starts with the command prefix.
-    if state.input.value.starts_with(prefix) {
-        // Extract the body (everything after the prefix).
-        let body = &state.input.value[prefix.len_utf8()..];
-        // Complete only the first token (before any space).
-        let first_token = body.split_whitespace().next().unwrap_or("");
-        // Only offer completions while the user is still on the first token
-        // (no space yet in the body, or trailing chars still form the first word).
-        let body_has_space = body.contains(' ');
-        if body_has_space {
-            // Command name already chosen; no further name completions.
-            state.suggestions.clear();
-            return;
-        }
-        let names = crate::slash::slash_names();
-        state.suggestions = slash_suggestions(first_token, &names, SUGGESTION_LIMIT);
-        return;
-    }
-    let partial = state.current_partial().to_owned();
-    if partial.is_empty() {
-        state.suggestions.clear();
-        return;
-    }
-    // Three tiers, best first (SQ-1042): the words for the things that are
-    // ACTUALLY HERE, then the words the story has just printed, then the flat
-    // dictionary. `suggest` ranks its second argument above its first, so the
-    // scope pass runs against no dictionary at all and the prose pass fills
-    // whatever room is left — a player typing `lan` in Zork I's Living Room
-    // wants the lantern in front of them before the four hundred words the
-    // story also knows.
-    let mut hits = suggest(&[], &state.scope_words, &partial, SUGGESTION_LIMIT);
-    if hits.len() < SUGGESTION_LIMIT {
-        for w in suggest(&state.dict_words, &state.seen_words, &partial, SUGGESTION_LIMIT) {
-            if !hits.iter().any(|h| h.eq_ignore_ascii_case(&w)) {
-                hits.push(w);
-            }
-            if hits.len() == SUGGESTION_LIMIT {
-                break;
-            }
-        }
-    }
-    state.suggestions = hits;
+    let slash_names = crate::slash::slash_names();
+    state.suggestions = crate::complete::completion_candidates(
+        &state.input.value,
+        state.input.char_len(),
+        state.config.command_prefix,
+        &slash_names,
+        &state.dict_words,
+        &state.seen_words,
+        &state.scope_words,
+    );
 }
 
 // ── Bracketed paste (SQ-0653) ─────────────────────────────────────────────────
@@ -3570,8 +4030,9 @@ pub fn apply_paste(state: &mut AppState, text: &str) -> bool {
 
 /// Apply a submitted text-entry dialog. Byte-identical to the retired
 /// `apply_prompt`, per kind (SQ-0307):
-///   - map-edit kinds mutate the mapper and bump `graph_gen` so the edit shows
-///     this frame instead of waiting for the next turn (the Wave-1 choke);
+///   - map-edit kinds mutate the mapper, which bumps `Mapper::struct_gen` itself
+///     for a real change (SQ-1544) so the edit shows this frame instead of
+///     waiting for the next turn (the Wave-1 choke);
 ///   - `ConfigEditPath` writes the config-screen working copy;
 ///   - `CreateFile` flag-hops the chosen filename (empty → cancel) to the run
 ///     loop's `resolve_filename_request`.
@@ -3586,22 +4047,18 @@ pub fn apply_text_entry(dlg: TextEntryDialog, state: &mut AppState, mapper: &mut
         TextEntryKind::RenameRoom(id) => {
             let label = if value.is_empty() { None } else { Some(value) };
             mapper.rename_room(id, label);
-            state.bump_graph_gen(); // a graph-mutating edit was applied (SQ-0305)
         }
         TextEntryKind::EditNotes(id) => {
             mapper.set_notes(id, value);
-            state.bump_graph_gen();
         }
         TextEntryKind::RelabelEdge(id, old_dir) => {
             // Parse the user's input as a direction name.
             if let Some(new_dir) = mapper::direction::parse_direction(&value) {
                 mapper.relabel_edge(id, old_dir, new_dir);
             }
-            state.bump_graph_gen();
         }
         TextEntryKind::RenameLayer(id) => {
             mapper.graph.set_layer_name(id, value);
-            state.bump_graph_gen();
         }
         TextEntryKind::ConfigEditPath { field } => {
             if let Some(cs) = &mut state.overlays.config_screen {
@@ -3748,7 +4205,12 @@ fn parse_move_region_arg(
 
 /// Why the rooms to move could not be settled — a refusal that belongs to the SEAM, not to the
 /// destination (SQ-0439).
-enum SeamRefusal {
+///
+/// `pub` since SQ-1551: a host embedding `AppState` without the terminal UI offers its own
+/// "Move to another layer…" action and needs [`choose_region`]'s own refusals to explain why a
+/// move can't happen, rather than reinventing them.
+#[derive(Debug)]
+pub enum SeamRefusal {
     /// The seam was named and the region walk turned it down; the pair is the passage tried.
     Region(mapper::layer::RegionRefusal, Option<(mapper::graph::RoomId, Direction)>),
     /// Several passages lead into the room and each cuts a different map. Nothing to auto-pick
@@ -3778,7 +4240,11 @@ enum SeamRefusal {
 /// direction first — so the command a tier-3 refusal suggests means what the list said it meant —
 /// falling back to the passage of that direction OUT of the room, which is the only way to name a
 /// one-way exit.
-fn choose_region(
+///
+/// `pub` since SQ-1551: a host without the TUI's "move-region" command still needs "which rooms
+/// would a move take from here" for its own layer-editing UI, and reimplementing this ordering
+/// against `mapper`'s public API can silently drift from what the TUI actually does.
+pub fn choose_region(
     graph: &mapper::graph::MapGraph,
     room: mapper::graph::RoomId,
     dir: Option<Direction>,
@@ -3815,7 +4281,10 @@ fn choose_region(
 /// Mirrors [`mapper::layer::move_region`]'s own refusals rather than inventing a second rule: a new
 /// layer is only a rename when the region is its whole layer, and Main may be moved out of but
 /// never emptied.
-fn move_targets(
+///
+/// `pub` since SQ-1551: a host's "Move to another layer…" action needs the same destination list
+/// the TUI offers, from `mapper`'s public API alone.
+pub fn move_targets(
     graph: &mapper::graph::MapGraph,
     region: &mapper::layer::Region,
 ) -> Vec<mapper::layer::MoveTarget> {
@@ -3924,7 +4393,7 @@ fn perform_move(
     let moved = region.rooms.len();
     match mapper::layer::move_region(&mut mapper.graph, region, target) {
         Ok(landed) => {
-            state.bump_graph_gen(); // rooms changed layer → invalidate the render memo (SQ-0305)
+            // `move_region` bumps `Mapper::struct_gen` itself (SQ-1544).
             // A seam the player did not name was chosen FOR them, so say which passage was cut —
             // otherwise a bare move silently picks a boundary and the map simply changes shape.
             if let Some((from, d)) = cut {
@@ -3955,7 +4424,7 @@ fn perform_move(
 
 /// A room's name, or `#id` when the map has forgotten it.
 fn room_label(graph: &mapper::graph::MapGraph, id: mapper::graph::RoomId) -> String {
-    graph.room(id).map(|r| r.label().to_string()).unwrap_or_else(|| format!("#{id}"))
+    graph.room(id).map(|r| r.label().to_string()).unwrap_or_else(|| crate::roomid::room_label_no(graph, id))
 }
 
 /// Every room a region holds, named, in region order — the bulleted list under the question.
@@ -4064,10 +4533,17 @@ pub fn open_layer_suggestion(
         // The seam is the way IN, and the region is the maze side of it.
         Trigger::Name => (
             "This looks like a maze.".to_string(),
-            vec![
-                format!("{} calls itself a maze.", room_label(graph, suggestion.region.anchor)),
-                "Separating it also flags the layer as a maze.".to_string(),
-            ],
+            {
+                let mut body =
+                    vec![format!("{} calls itself a maze.", room_label(graph, suggestion.region.anchor))];
+                // Read from `suggestion_sets_maze_flag` rather than stated as a bare fact: that is
+                // also what `accept_layer_suggestion` consults to decide whether to actually set
+                // the flag (SQ-1551), so this sentence cannot promise something accepting won't do.
+                if suggestion_sets_maze_flag(suggestion.trigger) {
+                    body.push("Separating it also flags the layer as a maze.".to_string());
+                }
+                body
+            },
         ),
     };
     let options = dest_options(graph, &suggestion.destinations);
@@ -4160,13 +4636,13 @@ fn open_dest_prompt(
 
 /// Apply what the player told the region prompt to do, and close it (SQ-0439).
 ///
-/// The three suggestion outcomes are a gradient over one mechanism — separate now / ask again next
-/// crossing / never ask about this passage — so only the last two write anything down, and
-/// accepting writes nothing at all: the move puts the seam across two layers, which silences it by
-/// construction.
+/// The suggestion outcomes are a gradient over one mechanism — separate now / ask again next
+/// crossing / never ask about this passage / never ask about anything on this map (SQ-1298) — so
+/// only the last three write anything down, and accepting writes nothing at all: the move puts the
+/// seam across two layers, which silences it by construction.
 pub fn apply_region_prompt(state: &mut AppState, mapper: &mut Mapper, act: crate::state::RegionPromptAct) {
     use crate::state::{RegionOption, RegionPromptAct as A, RegionPromptKind as K};
-    use mapper::suggest::{SeamDecision, Trigger};
+    use mapper::suggest::SeamDecision;
     let Some(prompt) = state.overlays.region_prompt.take() else { return };
     let chosen = prompt.chosen().cloned();
     match (&prompt.kind, act) {
@@ -4177,17 +4653,18 @@ pub fn apply_region_prompt(state: &mut AppState, mapper: &mut Mapper, act: crate
         (K::Suggest { seam, .. }, A::Never) => {
             mapper.graph.set_seam_decision(*seam, SeamDecision::Ignored);
         }
+        (K::Suggest { .. }, A::NeverForStory) => {
+            mapper.graph.set_suggestions_disabled(true);
+        }
         // A pick has nothing to remember: declining to choose decided nothing.
-        (_, A::Defer | A::Never) => {}
+        (_, A::Defer | A::Never | A::NeverForStory) => {}
         (K::Suggest { trigger, region, .. }, A::Accept) => {
             let Some(RegionOption::Dest { target, .. }) = chosen else { return };
-            if let Some(landed) = perform_move(state, mapper, region, None, target) {
-                // The player confirmed it is a maze by accepting a prompt that said so. A
-                // structural suggestion sets nothing — a cellar is not a maze.
-                if *trigger == Trigger::Name {
-                    mapper.graph.set_layer_maze(landed, true);
-                }
-            }
+            // The player confirmed it is a maze by accepting a prompt that said so. A structural
+            // suggestion sets nothing — a cellar is not a maze. `suggestion_sets_maze_flag` is the
+            // one place that rule lives, so the prompt's own "flags it as a maze" line (built in
+            // `open_layer_suggestion`) cannot say something this accept doesn't actually do.
+            accept_layer_suggestion(state, mapper, region, target, suggestion_sets_maze_flag(*trigger));
         }
         (K::PickSeam { room, dest }, A::Accept) => {
             let Some(RegionOption::Seam { from, dir, .. }) = chosen else { return };
@@ -4211,6 +4688,40 @@ pub fn apply_region_prompt(state: &mut AppState, mapper: &mut Mapper, act: crate
     }
 }
 
+/// Whether accepting a layer suggestion with this trigger sets the maze flag on the layer the
+/// rooms land on (SQ-1551) — the player confirmed it is a maze by accepting a prompt that said so,
+/// and a structural suggestion (no such claim) sets nothing.
+///
+/// This is the one place that rule lives: [`accept_layer_suggestion`]'s own maze-flag step reads
+/// it, and so does [`open_layer_suggestion`]'s "Separating it also flags the layer as a maze"
+/// line, so the sentence a host or the TUI shows before accepting can never promise something the
+/// accept itself doesn't do.
+pub fn suggestion_sets_maze_flag(trigger: mapper::suggest::Trigger) -> bool {
+    trigger == mapper::suggest::Trigger::Name
+}
+
+/// Accept a layer suggestion: move the region, and — only when `set_maze_flag` says so — flag the
+/// layer it landed on as a maze (SQ-1551).
+///
+/// Split out of what was a single bundled step in [`apply_region_prompt`] so a host that does not
+/// use maze flags (and shows a suggested layer in its own matrix view instead of a maze view) can
+/// accept the very same suggestion without the flag, rather than reimplementing the move to skip
+/// one side effect. The TUI's own accept path is unchanged: it always calls this with
+/// `set_maze_flag = suggestion_sets_maze_flag(trigger)`.
+pub fn accept_layer_suggestion(
+    state: &mut AppState,
+    mapper: &mut Mapper,
+    region: &mapper::layer::Region,
+    target: mapper::layer::MoveTarget,
+    set_maze_flag: bool,
+) -> Option<mapper::layer::LayerId> {
+    let landed = perform_move(state, mapper, region, None, target)?;
+    if set_maze_flag {
+        mapper.graph.set_layer_maze(landed, true);
+    }
+    Some(landed)
+}
+
 /// Say which of the several quite different reasons the REGION could not be computed (SQ-0360).
 ///
 /// The refusals are not variations on "no": a layer with no seam in it needs a direction naming
@@ -4229,7 +4740,7 @@ fn region_refusal_message(
 ) -> String {
     use mapper::layer::RegionRefusal as R;
     let name = |id: mapper::graph::RoomId| {
-        graph.room(id).map(|r| r.label().to_string()).unwrap_or_else(|| format!("#{id}"))
+        graph.room(id).map(|r| r.label().to_string()).unwrap_or_else(|| crate::roomid::room_label_no(graph, id))
     };
     let here = name(room);
     let layer = graph.layer_name(graph.layer_of(room));
@@ -4400,6 +4911,15 @@ fn nearest_room(
 /// Number of rows in the config screen — derived from the row list so it cannot drift.
 pub(crate) const CONFIG_ROW_COUNT: usize = crate::render::config_screen::CONFIG_ROWS.len();
 
+/// Save the open settings screen's working copy into the running session's
+/// state (`Action::ConfigSave`): close the screen and hand the working copy to
+/// [`crate::host::settings::apply`]. `None` when no settings screen was open.
+/// The caller runs [`crate::host::settings::commit`] with the result.
+pub fn config_save(state: &mut AppState) -> Option<crate::host::settings::Applied> {
+    let cs = state.overlays.config_screen.take()?;
+    Some(crate::host::settings::apply(state, cs.working, None))
+}
+
 /// Clone a Config (Config derives Clone, this is a convenience wrapper for tests).
 pub(crate) fn clone_config(cfg: &crate::config::Config) -> crate::config::Config {
     cfg.clone()
@@ -4566,7 +5086,7 @@ fn config_cycle(working: &mut crate::config::Config, row: usize, delta: i32) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "t-input"))]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use mapper::mapper::Mapper;
@@ -4787,9 +5307,14 @@ mod tests {
         assert!(matches!(key_to_command(&s, ctrl(KeyCode::Char('s'))), KeyResolve::Command(c, _) if c == "save-state"));
         assert!(matches!(key_to_command(&s, ctrl(KeyCode::Char('r'))), KeyResolve::Command(c, _) if c == "restore-state"));
         // Non-direct commands return None when dialog is closed. (Ctrl+E is the
-        // readline move-to-end at the story prompt, so it is not one of them.)
+        // readline move-to-end at the story prompt, so it is not one of them.
+        // Ctrl+D is not one of them either since SQ-1228: it half-pages the
+        // transcript in Game focus, hardwired ahead of this dialog lookup.)
         assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('g'))), Action::None));
-        assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('d'))), Action::None));
+        assert!(matches!(
+            key_to_action(&s, ctrl(KeyCode::Char('d'))),
+            Action::TranscriptScrollHalfPage(-1)
+        ));
         assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('l'))), Action::None));
         // Ctrl-combos always close the dialog now (never fire); the underlying
         // commands fire via their authored leader letters instead (SQ-0446 layout).
@@ -5029,14 +5554,16 @@ mod tests {
         }
     }
 
-    // ── Map-memo invalidation: production paths bump graph_gen (SQ-0305) ──────────
-    // The map render model is memoized on (graph_gen, viewed_layer). Any graph edit
-    // that reaches the live path with an unchanged graph_gen paints a STALE MAP, so
-    // each edit path must bump. These drive the real apply_action code, not a manual
-    // bump, so a regression that drops a bump fails here.
+    // ── Map-memo invalidation: production paths bump Mapper::struct_gen (SQ-1544) ─
+    // The map render model is memoized on (struct_gen, viewed_layer) — see
+    // `AppState::cached_map_render`, which reads `MapGraph::struct_gen` straight off
+    // the live graph. Any graph edit that reaches the live path with an unchanged
+    // struct_gen paints a STALE MAP, so each edit path must actually mutate the
+    // graph. These drive the real apply_action/apply_text_entry code, not a manual
+    // bump, so a regression that drops the underlying mutation fails here.
 
     #[test]
-    fn rename_room_prompt_submit_bumps_graph_gen() {
+    fn rename_room_prompt_submit_bumps_struct_gen() {
         let mut s = AppState::default();
         let mut m = Mapper::default();
         m.observe(1, "Old Name", None);
@@ -5045,15 +5572,15 @@ mod tests {
             crate::state::TextEntryKind::RenameRoom(1),
             "New Name",
         );
-        let before = s.graph_gen;
+        let before = m.struct_gen();
         apply_text_entry(dlg, &mut s, &mut m);
         assert_eq!(m.graph.room(1).unwrap().label_override.as_deref(), Some("New Name"),
             "rename actually applied");
-        assert_ne!(s.graph_gen, before, "renaming a room must invalidate the map memo");
+        assert_ne!(m.struct_gen(), before, "renaming a room must invalidate the map memo");
     }
 
     #[test]
-    fn delete_connection_bumps_graph_gen() {
+    fn delete_connection_bumps_struct_gen() {
         let mut s = AppState::default();
         let mut m = Mapper::default();
         m.observe(1, "A", None);
@@ -5061,10 +5588,10 @@ mod tests {
         assert!(m.graph.connections().iter().any(|c| c.origin == 1),
             "fixture must have an outgoing edge from room 1");
         s.select_room(Some(1));
-        let before = s.graph_gen;
+        let before = m.struct_gen();
         apply_action(Action::DeleteSelectedConnection, &mut s, &mut m);
         assert!(!m.graph.connections().iter().any(|c| c.origin == 1), "edge actually deleted");
-        assert_ne!(s.graph_gen, before, "deleting a connection must invalidate the map memo");
+        assert_ne!(m.struct_gen(), before, "deleting a connection must invalidate the map memo");
     }
 
     #[test]
@@ -5105,9 +5632,9 @@ mod tests {
         );
         // The worker's frames and tidied graph match the instant-tidy result room-for-room.
         for id in [1u16, 2, 3] {
-            let inst = m_inst.graph.room(id).unwrap().pos;
-            assert_eq!(frames.last().unwrap().graph.room(id).unwrap().pos, inst);
-            assert_eq!(tidied.room(id).unwrap().pos, inst);
+            let inst = m_inst.graph.room(id.into()).unwrap().pos;
+            assert_eq!(frames.last().unwrap().graph.room(id.into()).unwrap().pos, inst);
+            assert_eq!(tidied.room(id.into()).unwrap().pos, inst);
         }
     }
 
@@ -5368,6 +5895,7 @@ mod tests {
         // Regression: launching with enable_sound = false never constructs an
         // AudioBackend (see main.rs), so flipping the config flag alone leaves
         // state.audio == None forever. ToggleSound must build the backend too.
+        #[cfg(feature = "playback")]
         audio::disable_output_for_tests(); // ToggleSound builds a real backend; keep it silent
         let mut s = AppState::default();
         s.config.enable_sound = false;
@@ -5499,6 +6027,7 @@ mod tests {
     /// read that as "still the flag's" and refuse to save the user's actual choice.
     #[test]
     fn editing_a_settings_row_promotes_a_one_run_value_to_a_persisted_one() {
+        #[cfg(feature = "playback")]
         audio::disable_output_for_tests();
         let dir = std::env::temp_dir().join(format!("bm-row-promote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5846,11 +6375,11 @@ mod tests {
 
     #[test]
     fn i_in_map_focus_yields_toggle_inventory() {
-        // SQ-0446: 'i' is the View-group leader letter for toggle-inventory now
+        // SQ-0446: 'i' is the View-group leader letter for toggle-inventory-panel now
         // (toggle-inspector moved to the '/' palette).
         let mut s = AppState::default();
         s.focus = Focus::Map;
-        // toggle-inventory is dialog-only: returns None when dialog is closed.
+        // toggle-inventory-panel is dialog-only: returns None when dialog is closed.
         assert!(matches!(key_to_action(&s, key(KeyCode::Char('i'))), Action::None));
         // Returns the action when dialog is open.
         s.overlays.hotkey_dialog = true;
@@ -5891,7 +6420,7 @@ mod tests {
         assert_eq!(s.room_dock_view, RoomDockView::Diagnostics);
     }
 
-    /// `toggle-room-dock` is the primary open/close command, and it opens on Info.
+    /// `toggle-room-panel` is the primary open/close command, and it opens on Info.
     #[test]
     fn toggle_room_dock_opens_on_info_and_closes() {
         use crate::state::RoomDockView;
@@ -5917,7 +6446,7 @@ mod tests {
         let mut m = Mapper::default();
         apply_action(Action::ToggleRoomDock, &mut s, &mut m);
         assert!(s.room_dock.open);
-        assert!(!s.any_overlay_open(), "an open room dock is not an overlay");
+        assert!(!s.any_overlay_open(), "an open room panel is not an overlay");
         assert!(!s.any_modal_overlay_open(), "…and certainly not a modal one");
 
         apply_action(Action::PinRoomDock(3, crate::state::RoomDockView::Diagnostics), &mut s, &mut m);
@@ -5939,7 +6468,7 @@ mod tests {
 
         apply_action(Action::PinRoomDock(5, RoomDockView::Diagnostics), &mut s, &mut m);
         assert_eq!(s.selected_room, Some(5));
-        assert_eq!(s.room_dock_view, RoomDockView::Diagnostics, "a right-click re-points the view");
+        assert_eq!(s.room_dock_view, RoomDockView::Diagnostics, "re-pinning with an explicit view sets it");
 
         apply_action(Action::UnpinRoomDock, &mut s, &mut m);
         assert_eq!(s.selected_room, None, "unpinned: the dock follows the player again");
@@ -5962,9 +6491,13 @@ mod tests {
         // Direct ctrl commands work without the dialog.
         assert!(matches!(key_to_command(&s, ctrl(KeyCode::Char('s'))), KeyResolve::Command(c, _) if c == "save-state"));
         assert!(matches!(key_to_command(&s, ctrl(KeyCode::Char('r'))), KeyResolve::Command(c, _) if c == "restore-state"));
-        // Non-direct ctrl commands return None when dialog is closed.
+        // Non-direct ctrl commands return None when dialog is closed. Ctrl+D is
+        // not one of them since SQ-1228 (transcript half-page-down).
         assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('g'))), Action::None));
-        assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('d'))), Action::None));
+        assert!(matches!(
+            key_to_action(&s, ctrl(KeyCode::Char('d'))),
+            Action::TranscriptScrollHalfPage(-1)
+        ));
         assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('l'))), Action::None));
         assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('t'))), Action::None));
         assert!(matches!(key_to_action(&s, ctrl(KeyCode::Char('y'))), Action::None));
@@ -6248,8 +6781,9 @@ mod tests {
         // Down/Up (and Shift-Tab as Up) cycle the selection with wrap.
         let mut s = AppState::default();
         s.overlays.palette = Some(crate::state::PaletteState::new(false));
-        // Empty query → the whole registry is the candidate list.
-        let n = crate::slash::COMMANDS.len();
+        // Empty query → every non-browser-only command is the candidate list
+        // (SQ-1535: the story browser's commands never reach the in-game palette).
+        let n = crate::complete::palette_candidates("").len();
         // Down moves to index 1.
         apply_action(key_to_action(&s, key(KeyCode::Down)), &mut s, &mut Mapper::default());
         assert_eq!(s.overlays.palette.as_ref().unwrap().scroll.selected, 1);
@@ -6298,6 +6832,57 @@ mod tests {
         assert_ne!(s.show_alignment, before, "the toggle command mutated state end-to-end");
     }
 
+    // ── SQ-1535: dispatch-time hardening (defense in depth) ───────────────────
+    //
+    // `complete::palette_candidates` already keeps a Context::Browser command out
+    // of the palette's candidate list, so neither dispatch site should be able to
+    // reach one via the palette any more. This is the independent regression
+    // guard for the OTHER half of the fix: both dispatch sites used to gate a
+    // picked command against its OWN `spec.context` rather than the game's live
+    // context, which trivially self-satisfies `parse_in_context`'s Browser gate
+    // (Context::Browser == Context::Browser is always true) instead of tripping
+    // it. `live_slash_context` fixes that by gating against the live context
+    // instead — demonstrated here directly, independent of the candidate filter.
+    #[test]
+    fn spec_context_self_gate_trivially_passes_the_bug_this_fix_closes() {
+        // fetch-story is Context::Browser. Gating its dispatch against its OWN
+        // declared context (the bug) always "succeeds", because it is
+        // definitionally the same value on both sides of the comparison.
+        let spec = crate::slash::find_command("fetch-story").expect("fetch-story is in the registry");
+        assert_eq!(spec.context, Context::Browser);
+        let outcome = crate::slash::parse_in_context("fetch-story", '/', spec.context);
+        assert!(
+            matches!(outcome, crate::slash::SlashOutcome::Browser(_)),
+            "self-gating with the command's own context trivially passes: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn live_slash_context_rejects_a_browser_only_command_while_playing() {
+        // The fix: both palette dispatch sites now gate against
+        // `live_slash_context(state)`, not the picked command's own context.
+        // While playing (any focus, no tidy-anim) that is never Context::Browser,
+        // so the same fetch-story dispatch the previous test showed trivially
+        // passing is correctly rejected here.
+        let s = AppState::default(); // Focus::Game, no tidy_anim.
+        let live = live_slash_context(&s);
+        assert_ne!(live, Context::Browser);
+        let outcome = crate::slash::parse_in_context("fetch-story", '/', live);
+        assert!(
+            matches!(outcome, crate::slash::SlashOutcome::Error(_)),
+            "expected the browser gate to reject fetch-story under the live context, got {outcome:?}"
+        );
+
+        // And in Map focus / during tidy-anim, still never Browser.
+        let mut m = AppState::default();
+        m.focus = Focus::Map;
+        assert_eq!(live_slash_context(&m), Context::Map);
+        assert!(matches!(
+            crate::slash::parse_in_context("fetch-story", '/', live_slash_context(&m)),
+            crate::slash::SlashOutcome::Error(_)
+        ));
+    }
+
     #[test]
     fn palette_enter_passes_typed_args_to_the_command() {
         // "zoom-map in" → the args ride along into the executed command line.
@@ -6325,7 +6910,7 @@ mod tests {
             key_to_action(&s, shift(KeyCode::Char('R'))),
             Action::None
         ));
-        // toggle-inventory ('i') is also dialog-only (SQ-0446).
+        // toggle-inventory-panel ('i') is also dialog-only (SQ-0446).
         assert!(matches!(
             key_to_action(&s, key(KeyCode::Char('i'))),
             Action::None
@@ -6406,8 +6991,55 @@ mod tests {
         s.focus = Focus::Map;
         s.overlays.hotkey_dialog = true;
         assert!(matches!(key_to_action(&s, key(KeyCode::Char('r'))), Action::RenameRoom));
-        // toggle-inventory fires too (SQ-0446 gave 'i' to inventory).
+        // toggle-inventory-panel fires too (SQ-0446 gave 'i' to inventory).
         assert!(matches!(key_to_action(&s, key(KeyCode::Char('i'))), Action::ToggleInventory));
+    }
+
+    #[test]
+    fn hotkey_leader_letter_self_gate_trivially_passes_the_bug_this_fix_closes() {
+        // Mirrors `spec_context_self_gate_trivially_passes_the_bug_this_fix_closes`
+        // above, for the hotkey-dialog leader-letter path (SQ-1536): nothing
+        // stops a user from binding a Context::Browser-only registry command
+        // (e.g. fetch-story) to a leader letter in `[hotkeys]` — that's a
+        // separate, larger feature (config-time validation) this quest doesn't
+        // add. Gating its dispatch against its OWN declared context always
+        // "succeeds" for the same reason SQ-1535's palette bug did: it is
+        // definitionally the same value on both sides of the comparison.
+        let spec = crate::slash::find_command("fetch-story").expect("fetch-story is in the registry");
+        assert_eq!(spec.context, Context::Browser);
+        let outcome = crate::slash::parse_in_context("fetch-story", '/', spec.context);
+        assert!(
+            matches!(outcome, crate::slash::SlashOutcome::Browser(_)),
+            "self-gating with the command's own context trivially passes: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn hotkey_leader_letter_dispatches_with_live_context_not_the_commands_own() {
+        // The fix (SQ-1536): `hotkey_dialog_key_to_action` now resolves the
+        // dispatch context via `live_slash_context(state)`, matching what
+        // SQ-1535 already did for the palette's two dispatch sites, instead of
+        // trusting the bound command's own `spec.context`.
+        let mut s = AppState::default(); // Focus::Game, no tidy_anim.
+        s.overlays.hotkey_dialog = true;
+        s.hotkeys.groups = vec![("Test".to_string(), vec![('x', "fetch-story".to_string(), None)])];
+
+        let resolved = key_to_command(&s, key(KeyCode::Char('x')));
+        let (cmd, ctx) = match resolved {
+            KeyResolve::Command(cmd, ctx) => (cmd, ctx),
+            other => panic!("expected a Command, got {other:?}"),
+        };
+        assert_eq!(cmd, "fetch-story");
+        assert_ne!(ctx, Context::Browser, "must gate against the live context, not fetch-story's own");
+        assert_eq!(ctx, live_slash_context(&s));
+
+        // And dispatching through parse_in_context with the resolved context
+        // now correctly rejects it, where the self-gated context above did not.
+        let outcome = crate::slash::parse_in_context(&cmd, '/', ctx);
+        assert!(
+            matches!(outcome, crate::slash::SlashOutcome::Error(_)),
+            "expected the browser gate to reject fetch-story dispatched from the hotkey dialog while playing, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -6565,8 +7197,8 @@ mod tests {
         use mapper::layer::MAIN_LAYER;
 
         let mut g = MapGraph::new();
-        g.upsert_room(id, "Room".into());
-        g.set_pos(id, cell);
+        g.upsert_room(id.into(), "Room".into());
+        g.set_pos(id.into(), cell);
 
         let mut s = AppState::default();
         s.zoom = Zoom::Compact;
@@ -6882,73 +7514,112 @@ mod tests {
     /// SQ-0692: a left-click on a room used to open a floating Room Info popup.
     /// It now PINS the room dock to that room — opening the dock if it was closed
     /// — which is the same gesture with a panel that does not cover the map.
+    ///
+    /// SQ-1325: the pin/unpin no longer fires on Down — it is deferred to a
+    /// matching Up with no motion in between (`BeginMapDrag` / `EndDragPan`),
+    /// so the same press can turn into a drag-to-pan instead. A plain click
+    /// (Down then Up at the SAME cell, exercised via `press_release` below)
+    /// still resolves to exactly what the old immediate-on-Down click did.
     #[test]
-    fn left_down_on_room_cell_pins_the_dock_in_info_view() {
+    fn left_down_on_room_cell_pins_the_dock_keeping_the_current_view() {
         use crossterm::event::MouseEventKind;
-        use crate::state::{RoomDockView, Zoom};
+        use crate::state::{MapClick, RoomDockView, Zoom};
+
+        // Simulates a plain click (no drag motion): Down begins the gesture,
+        // Up at the same cell ends it, replaying the deferred click.
+        fn press_release(
+            s: &mut AppState,
+            rects: &[(mapper::graph::RoomId, ratatui::layout::Rect)],
+            col: u16,
+            row: u16,
+        ) {
+            let down = mouse_event(MouseEventKind::Down(MouseButton::Left), col, row, KeyModifiers::NONE);
+            let begin = mouse_to_action(s, down, map_rect(), story_rect(), rects, &None);
+            apply_action(begin, s, &mut Mapper::default());
+            let up = mouse_event(MouseEventKind::Up(MouseButton::Left), col, row, KeyModifiers::NONE);
+            let end = mouse_to_action(s, up, map_rect(), story_rect(), rects, &None);
+            assert!(matches!(end, Action::EndDragPan), "an unmoved release resolves to EndDragPan, got {:?}", end);
+            apply_action(end, s, &mut Mapper::default());
+        }
 
         let mut s = AppState::default();
         s.zoom = Zoom::Compact; // step = (12, 5)
         s.scroll = (0, 0);
         assert!(!s.room_dock.open, "the dock starts closed");
+        assert_eq!(s.room_dock_view, RoomDockView::Info, "the default view");
 
         // Room 1 at cell (0,0). Build room_rects using render pipeline.
         let rects = room_rects_for_compact(1, (0, 0), map_rect());
 
-        // Click at (0,0) which is inside the Compact box (8x3).
+        // Down alone only records the deferred target — it does not pin yet.
         let m = mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0, KeyModifiers::NONE);
         let action = mouse_to_action(&s, m, map_rect(), story_rect(), &rects, &None);
         assert!(
-            matches!(action, Action::PinRoomDock(1, RoomDockView::Info)),
-            "left-down on a room with the dock CLOSED opens it pinned in Info, got {:?}", action
+            matches!(action, Action::BeginMapDrag(0, 0, MapClick::Room(1))),
+            "left-down on a room begins a click-or-drag-pan targeting it, got {:?}", action
         );
 
-        // Applying it opens the dock, pinned.
-        apply_action(action, &mut s, &mut Mapper::default());
-        assert!(s.room_dock.open);
+        // Click at (0,0) which is inside the Compact box (8x3) — Down then Up,
+        // no motion, resolves to the same pin the old immediate click gave.
+        press_release(&mut s, &rects, 0, 0);
+        assert!(s.room_dock.open, "a plain click opens the dock, pinned");
         assert_eq!(s.selected_room, Some(1));
 
-        // With the dock already open, the same click on the SAME room unpins.
-        let m = mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0, KeyModifiers::NONE);
-        assert!(
-            matches!(mouse_to_action(&s, m, map_rect(), story_rect(), &rects, &None), Action::UnpinRoomDock),
-            "a click on the already-pinned room unpins"
-        );
+        // SQ-1265: with Diagnostics showing (switched some other way — a tab
+        // click, a keybinding), a left click no longer forces Info back.
+        s.room_dock_view = RoomDockView::Diagnostics;
+        s.selected_room = None; // so the click pins rather than unpinning
+        press_release(&mut s, &rects, 0, 0);
+        assert_eq!(s.room_dock_view, RoomDockView::Diagnostics, "…still Diagnostics");
+        assert_eq!(s.selected_room, Some(1), "…and pinned again");
+
+        // With the dock already open and pinned, the same click on the SAME room unpins.
+        press_release(&mut s, &rects, 0, 0);
+        assert_eq!(s.selected_room, None, "a click on the already-pinned room unpins");
     }
 
+    /// SQ-1265: right-click no longer switches to Diagnostics — it opens the
+    /// room's context menu and pins the dock exactly like a left click
+    /// (keeping the current view), so the menu and the panel agree on which
+    /// room is meant.
     #[test]
-    fn right_down_on_room_cell_pins_the_dock_in_diagnostics_view() {
+    fn right_down_on_room_cell_opens_the_room_menu_and_pins_the_dock() {
         use crossterm::event::MouseEventKind;
         use crate::state::{RoomDockView, Zoom};
 
         let mut s = AppState::default();
         s.zoom = Zoom::Compact;
         s.scroll = (0, 0);
+        assert_eq!(s.room_dock_view, RoomDockView::Info, "the default view");
 
         let rects = room_rects_for_compact(2, (0, 0), map_rect());
 
         let m = mouse_event(MouseEventKind::Down(MouseButton::Right), 0, 0, KeyModifiers::NONE);
         let action = mouse_to_action(&s, m, map_rect(), story_rect(), &rects, &None);
         assert!(
-            matches!(action, Action::PinRoomDock(2, RoomDockView::Diagnostics)),
-            "right-down on a room pins the dock in Diagnostics, got {:?}", action
+            matches!(action, Action::OpenRoomMenu(2, 0, 0)),
+            "right-down on a room opens its context menu anchored at the click, got {:?}", action
         );
         apply_action(action, &mut s, &mut Mapper::default());
-        assert_eq!(s.room_dock_view, RoomDockView::Diagnostics);
 
-        // Right-clicking the same room again — pinned AND already diagnostics — unpins.
-        let m = mouse_event(MouseEventKind::Down(MouseButton::Right), 0, 0, KeyModifiers::NONE);
-        assert!(
-            matches!(mouse_to_action(&s, m, map_rect(), story_rect(), &rects, &None), Action::UnpinRoomDock),
-            "a right-click on the pinned room already showing diagnostics unpins"
-        );
+        assert_eq!(s.selected_room, Some(2), "the right-click pins the dock");
+        assert_eq!(s.room_dock_view, RoomDockView::Info, "…keeping the current (default) view");
+        assert!(s.room_dock.open, "…opening it if it was closed");
+        let menu = s.overlays.room_menu.expect("the menu is open");
+        assert_eq!(menu.room, 2);
+        assert_eq!(menu.anchor, (0, 0));
+        assert_eq!(menu.cursor, 0);
 
-        // …but a LEFT click there re-points it to Info rather than unpinning: the
-        // gesture still has somewhere to take you.
-        let m = mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0, KeyModifiers::NONE);
+        // A right-click on empty map space is the same "unpin only" as a left
+        // click there — no menu, nothing to open it on.
+        let empty_rects: Vec<(mapper::graph::RoomId, ratatui::layout::Rect)> = Vec::new();
+        let m = mouse_event(MouseEventKind::Down(MouseButton::Right), 5, 5, KeyModifiers::NONE);
         assert!(
-            matches!(mouse_to_action(&s, m, map_rect(), story_rect(), &rects, &None), Action::UnpinRoomDock),
-            "left-click on the pinned room unpins regardless of view"
+            matches!(
+                mouse_to_action(&s, m, map_rect(), story_rect(), &empty_rects, &None),
+                Action::UnpinRoomDock
+            ),
+            "a right-click outside every room is the same unpin-only gutter click",
         );
     }
 
@@ -7030,13 +7701,117 @@ mod tests {
         assert!(matches!(dn, Action::TranscriptScrollPage(-1)));
     }
 
+    // ── Ctrl-D/Ctrl-U half-page transcript scrolling (SQ-1228) ─────────────────
+
+    #[test]
+    fn half_page_scroll_steps_by_floor_half_viewport() {
+        // viewport 20 rows → half page = 10 (floor(20/2), no overlap).
+        assert_eq!(half_page_scroll(0, 1, 20, 100), 10);
+        assert_eq!(half_page_scroll(10, 1, 20, 100), 20);
+        // dir < 0 moves toward newer (smaller offset), saturating at 0.
+        assert_eq!(half_page_scroll(10, -1, 20, 100), 0);
+        // Clamped to max_scroll.
+        assert_eq!(half_page_scroll(95, 1, 20, 100), 100);
+    }
+
+    #[test]
+    fn half_page_scroll_odd_viewport_floors_and_minimum_is_one() {
+        // floor(9/2) = 4.
+        assert_eq!(half_page_scroll(0, 1, 9, 100), 4);
+        // viewport of 0 or 1 still steps by at least 1.
+        assert_eq!(half_page_scroll(0, 1, 1, 100), 1);
+        assert_eq!(half_page_scroll(0, 1, 0, 100), 1);
+    }
+
+    #[test]
+    fn ctrl_d_half_pages_the_transcript_in_game_focus() {
+        let s = AppState::default(); // focus = Game
+        let dn = key_to_action(&s, ctrl(KeyCode::Char('d')));
+        assert!(!matches!(dn, Action::ZoomIn | Action::ZoomOut));
+        assert!(matches!(dn, Action::TranscriptScrollHalfPage(-1)));
+    }
+
+    /// SQ-1228: Ctrl-U is the vim half-page-up convention, but at the story
+    /// prompt Ctrl-U also means "delete to start of line" (SQ-0447's readline
+    /// shortcut, step 6.7). The two are disambiguated by whether the input
+    /// line has anything to delete: empty → half-page up.
+    #[test]
+    fn ctrl_u_half_pages_up_when_the_input_line_is_empty() {
+        let s = AppState::default(); // focus = Game, input line empty
+        assert!(s.input.is_empty());
+        let up = key_to_action(&s, ctrl(KeyCode::Char('u')));
+        assert!(matches!(up, Action::TranscriptScrollHalfPage(1)));
+    }
+
+    /// SQ-1228: with text on the input line, Ctrl-U keeps its readline
+    /// meaning of DeleteToStart — that convention wins whenever there's
+    /// something to delete.
+    #[test]
+    fn ctrl_u_keeps_its_readline_meaning_when_input_has_text() {
+        let mut s = AppState::default(); // focus = Game, not char_mode/event_wait
+        s.input = crate::text_field::TextField::new("look");
+        let up = key_to_action(&s, ctrl(KeyCode::Char('u')));
+        assert!(matches!(up, Action::DeleteToStart));
+    }
+
+    /// SQ-1228: outside Game focus, Ctrl-U isn't bound to either meaning here
+    /// — it falls through to whatever the focus's own handling does with it.
+    #[test]
+    fn ctrl_u_outside_game_focus_is_not_half_paged() {
+        let mut s = AppState::default();
+        s.focus = Focus::Map;
+        let up = key_to_action(&s, ctrl(KeyCode::Char('u')));
+        assert!(!matches!(up, Action::TranscriptScrollHalfPage(_)));
+        assert!(!matches!(up, Action::DeleteToStart));
+    }
+
+    /// A state whose keymap is exactly what the user typed into `config.toml`
+    /// (mirrors `window_dump_bound_key.rs`'s `state_bound` helper).
+    fn state_with_ctrl_binding(key: &str, cmd: &str) -> AppState {
+        let mut cfg = crate::config::KeymapConfig::default();
+        cfg.global.insert(key.to_string(), cmd.to_string());
+        let (keymap, warnings) = crate::keymap::KeyMap::resolve(&cfg);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut s = AppState::default(); // focus = Game
+        s.keymap = keymap;
+        s
+    }
+
+    /// SQ-1228 (CI fix): the transcript half-page keys are DEFAULTS, not
+    /// hardwires — a user's own Ctrl+D binding must win. `window_dump_bound_key`
+    /// (SQ-0759) already relies on this for `dump-windows`; this pins the same
+    /// contract at the unit level. FALSIFY: reverting the keymap check in step
+    /// 6.8 makes this resolve to TranscriptScrollHalfPage(-1) instead.
+    #[test]
+    fn ctrl_d_bound_in_the_keymap_dispatches_the_command_not_half_page() {
+        let s = state_with_ctrl_binding("ctrl+d", "dump-windows");
+        assert!(s.hotkeys.is_direct_name("dump-windows"));
+        match key_to_command(&s, ctrl(KeyCode::Char('d'))) {
+            KeyResolve::Command(cmd, _) => assert_eq!(cmd, "dump-windows"),
+            other => panic!("a bound Ctrl+D must dispatch the command, got {other:?}"),
+        }
+    }
+
+    /// Same contract for the empty-prompt half-page-up default: a user's own
+    /// Ctrl+U binding wins over TranscriptScrollHalfPage(1) too. FALSIFY:
+    /// reverting the keymap check makes this resolve to the half-page action.
+    #[test]
+    fn ctrl_u_bound_in_the_keymap_dispatches_the_command_when_prompt_is_empty() {
+        let s = state_with_ctrl_binding("ctrl+u", "dump-windows");
+        assert!(s.input.is_empty());
+        match key_to_command(&s, ctrl(KeyCode::Char('u'))) {
+            KeyResolve::Command(cmd, _) => assert_eq!(cmd, "dump-windows"),
+            other => panic!("a bound Ctrl+U must dispatch the command, got {other:?}"),
+        }
+    }
+
     /// SQ-0692: an empty-space click used to close the popup. It now UNPINS — the
     /// dock stays up and goes back to following the player, which is the state you
     /// wanted when you clicked away from a room in the first place.
     #[test]
     fn left_down_on_gutter_unpins_without_taking_focus() {
         use crossterm::event::MouseEventKind;
-        use crate::state::Zoom;
+        use crate::state::{MapClick, Zoom};
 
         let mut s = AppState::default();
         s.zoom = Zoom::Compact; // step = (12, 5)
@@ -7044,13 +7819,26 @@ mod tests {
         // Room is at cell (0,0), box is 8 wide so cols 0..8 hit the room.
         // Click at col 50 misses the room entirely.
         let rects = room_rects_for_compact(1, (0, 0), map_rect());
+        s.selected_room = Some(1); // so unpinning is observable below
 
-        let m = mouse_event(MouseEventKind::Down(MouseButton::Left), 50, 0, KeyModifiers::NONE);
-        let action = mouse_to_action(&s, m, map_rect(), story_rect(), &rects, &None);
+        // SQ-1325: Down defers to a click-or-drag-pan rather than unpinning
+        // immediately, so the map gutter can also be dragged to pan.
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 50, 0, KeyModifiers::NONE);
+        let action = mouse_to_action(&s, down, map_rect(), story_rect(), &rects, &None);
         assert!(
-            matches!(action, Action::UnpinRoomDock),
-            "left-down on the map gutter unpins, and must not hand the keyboard to the map (SQ-0599), got {:?}", action
+            matches!(action, Action::BeginMapDrag(50, 0, MapClick::Empty)),
+            "left-down on the map gutter begins a click-or-drag-pan with no target, got {:?}", action
         );
+        assert_eq!(s.focus, Focus::Game, "must not hand the keyboard to the map (SQ-0599)");
+        apply_action(action, &mut s, &mut Mapper::default());
+
+        // Release with no motion in between replays the deferred unpin.
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 50, 0, KeyModifiers::NONE);
+        let end = mouse_to_action(&s, up, map_rect(), story_rect(), &rects, &None);
+        assert!(matches!(end, Action::EndDragPan));
+        apply_action(end, &mut s, &mut Mapper::default());
+        assert_eq!(s.selected_room, None, "an unmoved release on the gutter unpins");
+        assert_eq!(s.focus, Focus::Game, "…and still never hands the keyboard to the map (SQ-0599)");
     }
 
     #[test]
@@ -7221,7 +8009,7 @@ mod tests {
         // ActivatePane(Game) sets game focus and leaves the dock exactly as it was.
         apply_action(Action::ActivatePane(Focus::Game), &mut s, &mut m);
         assert_eq!(s.focus, Focus::Game, "ActivatePane(Game) must set focus to Game");
-        assert!(s.room_dock.open, "ActivatePane must NOT close the room dock");
+        assert!(s.room_dock.open, "ActivatePane must NOT close the room panel");
         assert_eq!(s.selected_room, Some(1), "…nor unpin it");
         assert_eq!(s.room_dock_view, crate::state::RoomDockView::Diagnostics, "…nor change its view");
 
@@ -7368,6 +8156,133 @@ mod tests {
         assert!(s.drag.is_none(), "EndDragPan should clear drag state");
     }
 
+    // ── Left-button map drag-pan tests (SQ-1325) ──────────────────────────────
+
+    /// A press on empty map space that then moves pans the viewport by exactly
+    /// the pointer's motion, one terminal cell of drag per cell of pan — the
+    /// same `char_pan` mechanism (and the same lack of any bounds clamp) the
+    /// middle-button drag-pan already uses, so the map stays exactly as "in
+    /// bounds" as keyboard panning already leaves it.
+    #[test]
+    fn left_drag_on_empty_map_pans_by_the_exact_delta_and_release_ends_it() {
+        use crossterm::event::MouseEventKind;
+        use crate::state::{MapClick, Zoom};
+
+        let mut s = AppState::default();
+        s.zoom = Zoom::Boxes;
+        let mut m = Mapper::default();
+
+        // Down on empty map space (no rooms at all).
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 30, 20, KeyModifiers::NONE);
+        let begin = mouse_to_action(&s, down, map_rect(), story_rect(), &[], &None);
+        assert!(matches!(begin, Action::BeginMapDrag(30, 20, MapClick::Empty)));
+        apply_action(begin, &mut s, &mut m);
+        assert!(s.drag.is_some());
+
+        // Drag by (dx, dy) = (-7, 4) cells of pointer motion.
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 23, 24, KeyModifiers::NONE);
+        let pan = mouse_to_action(&s, drag, map_rect(), story_rect(), &[], &None);
+        assert!(matches!(pan, Action::DragPanTo(23, 24)), "a left-drag while state.drag is set pans, got {:?}", pan);
+        apply_action(pan, &mut s, &mut m);
+        assert_eq!(s.char_pan, (-7, 4), "the viewport moved by exactly the pointer's motion");
+        assert_eq!(s.scroll, (0, 0), "scroll (the whole-grid-cell offset) is untouched by the drag");
+
+        // Release ends the pan; no click fires (selected_room is untouched).
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 23, 24, KeyModifiers::NONE);
+        let end = mouse_to_action(&s, up, map_rect(), story_rect(), &[], &None);
+        assert!(matches!(end, Action::EndDragPan));
+        apply_action(end, &mut s, &mut m);
+        assert!(s.drag.is_none(), "the drag ends on release");
+        assert_eq!(s.selected_room, None, "a genuine drag never fires the deferred click");
+        assert_eq!(s.char_pan, (-7, 4), "the pan the drag made is kept after release");
+    }
+
+    /// A press-release with NO motion in between keeps today's behaviour exactly
+    /// (SQ-0692's unpin-on-empty-space click) — covered end-to-end already by
+    /// `left_down_on_gutter_unpins_without_taking_focus`; this case only pins
+    /// down that a `Drag` event with the SAME coordinates as `Down` (a jittery
+    /// but stationary pointer) still counts as "no motion" and does not itself
+    /// suppress the click.
+    #[test]
+    fn left_drag_at_the_same_cell_as_down_does_not_suppress_the_click() {
+        use crossterm::event::MouseEventKind;
+
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        s.selected_room = Some(1);
+        let rects = room_rects_for_compact(1, (0, 0), map_rect());
+        s.zoom = crate::state::Zoom::Compact;
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 50, 0, KeyModifiers::NONE);
+        apply_action(mouse_to_action(&s, down, map_rect(), story_rect(), &rects, &None), &mut s, &mut m);
+
+        // A Drag event at the SAME cell: dx=dy=0, but `DragPanTo` still runs and
+        // sets `moved = true` — a real terminal can and does report these.
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 50, 0, KeyModifiers::NONE);
+        apply_action(mouse_to_action(&s, drag, map_rect(), story_rect(), &rects, &None), &mut s, &mut m);
+        assert_eq!(s.char_pan, (0, 0), "a zero-delta drag pans by nothing");
+
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 50, 0, KeyModifiers::NONE);
+        apply_action(mouse_to_action(&s, up, map_rect(), story_rect(), &rects, &None), &mut s, &mut m);
+        // `moved` is now true (a Drag event occurred), so the deferred unpin is
+        // suppressed — documenting today's actual behaviour rather than
+        // asserting the click still fires (it does not: any Drag event marks
+        // the gesture as a pan, whatever its delta).
+        assert_eq!(s.selected_room, Some(1), "any Drag event, even a zero-delta one, is treated as a pan");
+    }
+
+    /// SQ-1325: there is no mouse gesture that drags a ROOM to move it —
+    /// `move-region` / `Action::MoveRegion` only ever fires from a keyboard
+    /// binding or the room context menu's typed argument (see
+    /// `apply_move_region`), never from `mouse_to_action`. So a drag that
+    /// STARTS on a room box pans the map exactly like one starting on empty
+    /// space; only a press-release with no motion still pins/unpins.
+    #[test]
+    fn left_drag_starting_on_a_room_also_pans_since_there_is_no_room_drag_feature() {
+        use crossterm::event::MouseEventKind;
+        use crate::state::{MapClick, Zoom};
+
+        let mut s = AppState::default();
+        s.zoom = Zoom::Compact;
+        let mut m = Mapper::default();
+        let rects = room_rects_for_compact(1, (0, 0), map_rect());
+
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0, KeyModifiers::NONE);
+        let begin = mouse_to_action(&s, down, map_rect(), story_rect(), &rects, &None);
+        assert!(matches!(begin, Action::BeginMapDrag(0, 0, MapClick::Room(1))));
+        apply_action(begin, &mut s, &mut m);
+
+        let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 6, 3, KeyModifiers::NONE);
+        apply_action(mouse_to_action(&s, drag, map_rect(), story_rect(), &rects, &None), &mut s, &mut m);
+        assert_eq!(s.char_pan, (6, 3), "a drag that started on a room still pans the viewport");
+
+        let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 6, 3, KeyModifiers::NONE);
+        apply_action(mouse_to_action(&s, up, map_rect(), story_rect(), &rects, &None), &mut s, &mut m);
+        assert_eq!(s.selected_room, None, "the room under the original press is never pinned once the pointer moved");
+        assert!(!s.room_dock.open, "…nor does the dock open");
+    }
+
+    /// The drag-to-pan gesture is zoom-agnostic (SQ-1325): `char_pan` is a raw
+    /// terminal-cell offset applied at render time regardless of the map's zoom
+    /// step, so it works identically at Boxes, Compact and Overview.
+    #[test]
+    fn left_drag_pans_at_every_zoom_level() {
+        use crossterm::event::MouseEventKind;
+        use crate::state::Zoom;
+
+        for zoom in [Zoom::Boxes, Zoom::Compact, Zoom::Overview] {
+            let mut s = AppState::default();
+            s.zoom = zoom;
+            let mut m = Mapper::default();
+
+            let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 10, KeyModifiers::NONE);
+            apply_action(mouse_to_action(&s, down, map_rect(), story_rect(), &[], &None), &mut s, &mut m);
+            let drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 13, 8, KeyModifiers::NONE);
+            apply_action(mouse_to_action(&s, drag, map_rect(), story_rect(), &[], &None), &mut s, &mut m);
+            assert_eq!(s.char_pan, (3, -2), "{:?}: drag-pan should apply at every zoom level", zoom);
+        }
+    }
+
     #[test]
     fn pinning_the_dock_keeps_story_focus_so_you_can_keep_typing() {
         // Opening a room panel used to hand the keyboard to the map, which made
@@ -7393,8 +8308,182 @@ mod tests {
         let mut s = AppState::default(); // starts as Focus::Game
         let mut m = Mapper::default();
         apply_action(Action::PinRoomDock(2, RoomDockView::Diagnostics), &mut s, &mut m);
-        assert_eq!(s.focus, Focus::Game, "a right-click pin must NOT steal keyboard focus");
+        assert_eq!(s.focus, Focus::Game, "pinning to Diagnostics must NOT steal keyboard focus either");
         assert_eq!(s.selected_room, Some(2), "the room is still selected for rendering");
+    }
+
+    // ── Deferred v6 game click (SQ-1378) ──────────────────────────────────────
+    //
+    // The run loop delivered a v6 click on the Down (SQ-0566), and `map_click`
+    // covers the story TEXT as well as the artwork — so in Zork Zero, Shogun and
+    // Arthur every press in the pane ended the line read as a click and
+    // `StartSelection` never ran. These pin the press-drag-release state machine
+    // the run loop's three arms are now thin calls onto.
+
+    /// The compass press, as Zork Zero delivers it: game pixel (322, 12) is the
+    /// rose's north spoke, at terminal cell (39, 0) of a 1:1 640x400 frame.
+    fn compass_press() -> crossterm::event::MouseEvent {
+        mouse_event(
+            crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            39, 0, KeyModifiers::NONE,
+        )
+    }
+
+    #[test]
+    fn a_press_over_the_v6_image_is_recorded_rather_than_delivered() {
+        use crate::session::InputKind;
+        use crate::state::{PendingV6Click, V6ClickRead};
+
+        let north = Some((322u16, 12u16));
+        // A char read takes a click unconditionally (ZSCII 254, ZMSD §3.8) — but
+        // the press only RECORDS it. Delivering here is the defect.
+        assert_eq!(
+            v6_mouse_outcome(None, Some(InputKind::Char), None, north, &compass_press()),
+            V6MouseOutcome::DeferAndRoute(PendingV6Click {
+                game_px: (322, 12),
+                cell: (39, 0),
+                read: V6ClickRead::Char,
+            }),
+            "a read_char press defers the click and still routes the event"
+        );
+        // A line read takes one only when the story lists a click terminator.
+        assert_eq!(
+            v6_mouse_outcome(None, Some(InputKind::Line), Some(254), north, &compass_press()),
+            V6MouseOutcome::DeferAndRoute(PendingV6Click {
+                game_px: (322, 12),
+                cell: (39, 0),
+                read: V6ClickRead::Line { terminator: 254 },
+            }),
+            "SQ-0566: Zork Zero's `>` prompt still takes a compass click"
+        );
+        assert_eq!(
+            v6_mouse_outcome(None, Some(InputKind::Line), None, north, &compass_press()),
+            V6MouseOutcome::Route,
+            "Journey lists no terminator, so a click at its line read stays with the app"
+        );
+        // Outside the drawn image (letterbox margin, off-pane, an extended
+        // frame's own scrollback rows) there is no game click to defer.
+        assert_eq!(
+            v6_mouse_outcome(None, Some(InputKind::Char), None, None, &compass_press()),
+            V6MouseOutcome::Route,
+            "a press that maps to no game pixel records nothing"
+        );
+        assert_eq!(
+            v6_mouse_outcome(None, Some(InputKind::Event), Some(254), north, &compass_press()),
+            V6MouseOutcome::Route,
+            "a story waiting on an event has no read a click can answer"
+        );
+        assert_eq!(
+            v6_mouse_outcome(None, None, Some(254), north, &compass_press()),
+            V6MouseOutcome::Route,
+            "no z-machine, no click"
+        );
+    }
+
+    #[test]
+    fn a_drag_cancels_the_deferred_v6_click_and_a_release_delivers_it() {
+        use crossterm::event::MouseEventKind;
+        use crate::session::InputKind;
+        use crate::state::{PendingV6Click, V6ClickRead};
+
+        let click = PendingV6Click {
+            game_px: (322, 12),
+            cell: (39, 0),
+            read: V6ClickRead::Line { terminator: 254 },
+        };
+        let at = |kind| mouse_event(kind, 41, 0, KeyModifiers::NONE);
+        let (read, term) = (Some(InputKind::Line), Some(254));
+
+        assert_eq!(
+            v6_mouse_outcome(Some(click), read, term, None, &at(MouseEventKind::Drag(MouseButton::Left))),
+            V6MouseOutcome::ForgetAndRoute,
+            "the gesture turned out to be a text selection"
+        );
+        assert_eq!(
+            v6_mouse_outcome(Some(click), read, term, None, &at(MouseEventKind::Up(MouseButton::Left))),
+            V6MouseOutcome::Deliver(click),
+            "an unmoved release delivers exactly the click the press recorded"
+        );
+        assert_eq!(
+            v6_mouse_outcome(Some(click), read, term, None, &at(MouseEventKind::Moved)),
+            V6MouseOutcome::Route,
+            "pointer motion with no button held is not part of the gesture"
+        );
+        assert_eq!(
+            v6_mouse_outcome(None, read, term, None, &at(MouseEventKind::Up(MouseButton::Left))),
+            V6MouseOutcome::Route,
+            "with nothing deferred a release is an ordinary end-of-selection"
+        );
+        // The read moved on between the press and the release: the click was
+        // aimed at a prompt that is no longer there.
+        assert_eq!(
+            v6_mouse_outcome(
+                Some(click), Some(InputKind::Char), None, None,
+                &at(MouseEventKind::Up(MouseButton::Left)),
+            ),
+            V6MouseOutcome::ForgetAndRoute,
+            "a click is delivered only against the read it was aimed at"
+        );
+    }
+
+    #[test]
+    fn a_key_event_clears_a_deferred_v6_click_and_a_mouse_event_does_not() {
+        use crossterm::event::{Event, MouseEventKind};
+        use crate::state::{PendingV6Click, V6ClickRead};
+
+        let click = PendingV6Click { game_px: (322, 12), cell: (39, 0), read: V6ClickRead::Char };
+        let mut s = AppState::default();
+
+        s.pending_v6_click = Some(click);
+        v6_click_interrupt(&mut s, &Event::Mouse(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left), 41, 0, KeyModifiers::NONE,
+        )));
+        assert_eq!(s.pending_v6_click, Some(click), "a mouse event is the gesture itself");
+
+        v6_click_interrupt(&mut s, &Event::Key(key(KeyCode::Char('n'))));
+        assert_eq!(
+            s.pending_v6_click, None,
+            "a keypress can move the story to another read; the click must not outlive it"
+        );
+
+        s.pending_v6_click = Some(click);
+        v6_click_interrupt(&mut s, &Event::Resize(80, 24));
+        assert_eq!(s.pending_v6_click, None, "a resize ends the gesture too");
+    }
+
+    #[test]
+    fn a_delivered_click_copies_nothing_while_a_real_selection_still_does() {
+        // The press anchors a zero-length selection on its way past
+        // `StartSelection`; delivering the click on the release must not turn
+        // that into a clipboard write or a "Copied 0 chars" line.
+        let mut s = AppState::default();
+        s.selection = Some(crate::clipboard::Selection::new(crate::clipboard::Point { row: 3, col: 5 }));
+        s.selection_edge = 1;
+        *s.selection_text.borrow_mut() = Some(String::new());
+        let before = s.transcript.len();
+        discard_selection(&mut s);
+        assert!(s.selection.is_none() && s.selection_edge == 0, "the anchor is gone");
+        assert!(s.selection_text.borrow().is_none(), "and nothing is left to copy");
+        assert_eq!(s.transcript.len(), before, "no meta line for a click that was not a copy");
+
+        // A drag that really selected text reports the copy, and hands the text
+        // back for the run loop to put on the clipboard.
+        s.selection = Some(crate::clipboard::Selection::new(crate::clipboard::Point { row: 3, col: 5 }));
+        *s.selection_text.borrow_mut() = Some("west of house".to_string());
+        let copied = finish_selection(&mut s);
+        assert_eq!(copied.as_deref(), Some("west of house"));
+        assert!(s.selection.is_none(), "the selection is released");
+        assert!(
+            s.transcript.iter().any(|l| l.contains("Copied 13 chars to clipboard")),
+            "the copy is reported in the story output: {:?}",
+            s.transcript
+        );
+
+        // An empty extract is not a copy at all.
+        *s.selection_text.borrow_mut() = Some("   ".to_string());
+        let lines = s.transcript.len();
+        assert_eq!(finish_selection(&mut s), None, "whitespace is not a copy");
+        assert_eq!(s.transcript.len(), lines, "and says nothing about it");
     }
 
     // ── Leaf 1: ToggleMap ─────────────────────────────────────────────────────
@@ -7456,24 +8545,174 @@ mod tests {
 
         apply_action(Action::OpenCommandBand, &mut s, &mut m);
         assert!(s.command_band_visible(), "it opens");
-        assert_eq!(crate::styles::read_per_game_command_band(&game_dir), Some(true));
+        assert_eq!(
+            crate::styles::read_per_game_panel(&game_dir),
+            Some(crate::state::SidePanel::Command),
+        );
 
         apply_action(Action::OpenCommandBand, &mut s, &mut m);
         assert_eq!(
-            crate::styles::read_per_game_command_band(&game_dir), Some(false),
-            "closing is a choice too, and an explicit false is not an absence",
+            crate::styles::read_per_game_panel(&game_dir), Some(crate::state::SidePanel::None),
+            "closing is a choice too, and an explicit None is not an absence",
         );
 
-        // …and the boot path does NOT write: a global `[command_band] auto_open`
+        // …and the boot path does NOT write: a global `[command_panel] auto_open`
         // must not pin itself to whichever story you happened to launch, which is
         // the whole reason `open_command_band` exists beside the action.
-        crate::styles::write_per_game_command_band(&game_dir, None).unwrap();
+        crate::styles::write_per_game_panel(&game_dir, None).unwrap();
         open_command_band(&mut s, &mut m, true);
         assert_eq!(
-            crate::styles::read_per_game_command_band(&game_dir), None,
+            crate::styles::read_per_game_panel(&game_dir), None,
             "startup's own open leaves the sidecar alone",
         );
         let _ = std::fs::remove_dir_all(&game_dir);
+    }
+
+    // ── SQ-1237: the three-state panel cycle ─────────────────────────────────
+
+    fn cycle_panel_game_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("bm-cyclepanel-{tag}-{}-{}.save", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Command → Inventory → None → Command, driven entirely by
+    /// `Action::CyclePanel` (what a click on the border control runs). Each
+    /// step is asserted, not just the round trip, so a cycle that skips a state
+    /// (e.g. Command → None directly) would fail here even though it returns to
+    /// Command eventually.
+    #[test]
+    fn cycle_panel_visits_command_then_inventory_then_none_then_command() {
+        use crate::state::{AppState, SidePanel};
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        assert_eq!(s.current_side_panel(), SidePanel::None, "starts closed");
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(s.current_side_panel(), SidePanel::Command);
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(s.current_side_panel(), SidePanel::Inventory);
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(s.current_side_panel(), SidePanel::None);
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(s.current_side_panel(), SidePanel::Command, "the cycle wraps");
+    }
+
+    /// Falsifies the mutual-exclusion rule: reverting `cycle_panel` to a version
+    /// that does not close the panel it is leaving would show this test a
+    /// command band still open once the cycle reaches Inventory — which is
+    /// exactly what "the two are never open at once" means. Checked at every
+    /// step, not just the one transition, since a bug could plausibly appear on
+    /// either edge.
+    #[test]
+    fn the_two_panels_are_never_open_at_once() {
+        use crate::state::AppState;
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        for _ in 0..6 {
+            apply_action(Action::CyclePanel, &mut s, &mut m);
+            // The band's TARGET (`band_dock.open`), not `command_band_visible()`
+            // — the latter stays true through a close's slide-out by design
+            // (the drawer's content persists so it can animate away, trimmed
+            // only once `settle_command_band` runs on a later tick), which is
+            // right for "should this still be drawn this frame" and wrong for
+            // "did the cycle actually leave the command panel". The two panels
+            // occupy different regions on screen anyway (the command panel
+            // below the story pane, the inventory panel carved from the map
+            // pane), so this is about state exclusivity, not a visual overlap.
+            assert!(
+                !(s.band_dock.open && s.show_inventory),
+                "both panels open at once after a cycle step",
+            );
+        }
+    }
+
+    /// `Action::ToggleInventory` and `Action::OpenCommandBand` also close the
+    /// OTHER panel when they open theirs — not only `cycle_panel` — since a
+    /// player can reach either panel directly (leader key, slash command) as
+    /// well as through the border control's cycle.
+    #[test]
+    fn opening_either_panel_directly_closes_the_other() {
+        use crate::state::AppState;
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+
+        apply_action(Action::OpenCommandBand, &mut s, &mut m);
+        assert!(s.band_dock.open);
+        apply_action(Action::ToggleInventory, &mut s, &mut m);
+        assert!(s.show_inventory, "inventory opened");
+        assert!(!s.band_dock.open, "…and closed the command panel");
+
+        apply_action(Action::OpenCommandBand, &mut s, &mut m);
+        assert!(s.band_dock.open, "command panel opened");
+        assert!(!s.show_inventory, "…and closed the inventory panel");
+    }
+
+    /// The three-state value round-trips through the SAME per-game sidecar
+    /// mechanism the command band's on/off state already used (SQ-1123) — no
+    /// second persistence path was added for the inventory panel.
+    #[test]
+    fn cycle_panel_persists_the_new_state_to_game_dir() {
+        use crate::state::{AppState, SidePanel};
+        let game_dir = cycle_panel_game_dir("persist");
+        let mut s = AppState::default();
+        s.game_dir = game_dir.clone();
+        let mut m = Mapper::default();
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(crate::styles::read_per_game_panel(&game_dir), Some(SidePanel::Command));
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(crate::styles::read_per_game_panel(&game_dir), Some(SidePanel::Inventory));
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        assert_eq!(crate::styles::read_per_game_panel(&game_dir), Some(SidePanel::None));
+
+        let _ = std::fs::remove_dir_all(&game_dir);
+    }
+
+    /// Each of the three states draws its own glyph and its own tooltip line —
+    /// falsified by reverting the border control to a plain two-way toggle,
+    /// which would make the Inventory-state glyph equal the Command-state glyph
+    /// (both would read `band_hide`) and the hint text would still say
+    /// Command Panel for a panel that is actually the inventory one.
+    #[test]
+    fn each_panel_state_draws_its_own_glyph_and_tooltip() {
+        use crate::render::controls::{controls_for, BorderControl};
+        use crate::state::AppState;
+
+        let find = |state: &AppState| {
+            controls_for(state)
+                .into_iter()
+                .find(|v| v.id == BorderControl::VerbPanel)
+                .expect("the panel-cycle control is always drawn")
+        };
+
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        let none = find(&s);
+        assert!(none.hint[0].to_lowercase().contains("closed"), "{:?}", none.hint);
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        let command = find(&s);
+        assert!(command.hint[0].to_lowercase().contains("command panel"), "{:?}", command.hint);
+
+        apply_action(Action::CyclePanel, &mut s, &mut m);
+        let inventory = find(&s);
+        assert!(inventory.hint[0].to_lowercase().contains("inventory panel"), "{:?}", inventory.hint);
+
+        // Three states, three distinct glyphs — not merely three distinct hints
+        // over the same shape.
+        assert_ne!(none.glyph, command.glyph);
+        assert_ne!(command.glyph, inventory.glyph);
+        assert_ne!(none.glyph, inventory.glyph);
     }
 
     // ── Leaf 2: ResetGame opens the dialog ───────────────────────────────────
@@ -7516,10 +8755,10 @@ mod tests {
     #[test]
     fn minizork_reset_restores_opening_room_and_clears_turns() {
         use crate::session::{apply_turn, GameSession, TurnResult};
-        use zvm::current_location;
+        use zvm::location::current_location;
 
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../zvm/tests/fixtures/minizork.z3");
+            .join("tests/fixtures/stories/minizork-r34-s871124.z3");
         if !fixture_path.exists() {
             return; // fixture absent — skip
         }
@@ -7537,7 +8776,11 @@ mod tests {
             let seed_result = TurnResult {
                 transcript: String::new(),
                 transcript_runs: Vec::new(),
-                location: Some(snap),
+                location: Some(crate::engine::LocationInfo {
+                    number: snap.number.into(),
+                    parent: snap.parent,
+                    name: snap.name.clone(),
+                }),
                 quit: false,
                 erase_lower: false,
                 info: None,
@@ -7551,6 +8794,9 @@ mod tests {
                 pictures: Vec::new(),
                 transcript_elems: Vec::new(),
                 prose_retired: None,
+                declared_exit: None,
+            description: None,
+            items: Vec::new(),
             };
             apply_turn(&mut mapper, "", &seed_result, &mut Default::default());
             state.select_room(Some(snap_number as mapper::graph::RoomId));
@@ -7585,7 +8831,11 @@ mod tests {
             let seed_result = TurnResult {
                 transcript: String::new(),
                 transcript_runs: Vec::new(),
-                location: Some(snap),
+                location: Some(crate::engine::LocationInfo {
+                    number: snap.number.into(),
+                    parent: snap.parent,
+                    name: snap.name.clone(),
+                }),
                 quit: false,
                 erase_lower: false,
                 info: None,
@@ -7599,6 +8849,9 @@ mod tests {
                 pictures: Vec::new(),
                 transcript_elems: Vec::new(),
                 prose_retired: None,
+                declared_exit: None,
+            description: None,
+            items: Vec::new(),
             };
             apply_turn(&mut mapper, "", &seed_result, &mut Default::default());
             state.select_room(Some(snap_number as mapper::graph::RoomId));
@@ -8026,7 +9279,7 @@ mod tests {
         assert!(!s.band_dock.open, "(c) armed: two Escs close");
     }
 
-    /// The other half of the same bug fix: `open-command-band`/F2 is a
+    /// The other half of the same bug fix: `toggle-command-panel`/F2 is a
     /// TOGGLE, so the band always has a one-key exit independent of Esc.
     /// Falsifies against `Action::OpenCommandBand` always (re-)opening
     /// regardless of the current state.
@@ -8082,6 +9335,46 @@ mod tests {
 
         apply_action(Action::BandClose, &mut s, &mut mapper);
         assert_eq!(s.input.value, "well, take mailbox", "closing the band does not clear it");
+    }
+
+    /// SQ-1230, repro 1: autocompleting `examine` and pressing SPACE leaves
+    /// `examine ` on the prompt — a trailing space `parse_phrase` never sees
+    /// (it reads `split_whitespace`), so `phrase_text()` is still bare
+    /// `examine` while the real input line has an extra character
+    /// `strip_band_tail`'s old exact `ends_with` match could not see past.
+    /// Clicking a WHAT noun must still REPLACE `examine`, appending the noun
+    /// with exactly one separating space, not duplicate the verb.
+    #[test]
+    fn clicking_what_after_a_trailing_space_does_not_duplicate_the_verb() {
+        use crate::render::command_band::{COL_HERE, COL_VERB};
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_band(&mut s);
+        pick_text(&mut s, &mut mapper, COL_VERB, "examine");
+        assert_eq!(s.input.value, "examine");
+        type_text(&mut s, &mut mapper, " ");
+        assert_eq!(s.input.value, "examine ", "sanity: the trailing space landed");
+
+        pick_text(&mut s, &mut mapper, COL_HERE, "mailbox");
+        assert_eq!(s.input.value, "examine mailbox", "not `examine examine mailbox`");
+    }
+
+    /// SQ-1230, repro 2: a partial word typed at the VERB column (`exa`,
+    /// short of any exact match `parse_phrase` recognizes) must be REPLACED
+    /// by a clicked verb, exactly like `Action::BandTabPick` already replaces
+    /// it rather than appending after it — a mouse click and a Tab pick are
+    /// the same gesture and must leave the same prompt.
+    #[test]
+    fn clicking_a_verb_replaces_the_partial_word_being_typed() {
+        use crate::render::command_band::COL_VERB;
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_band(&mut s);
+        type_text(&mut s, &mut mapper, "exa");
+        assert_eq!(s.input.value, "exa");
+
+        pick_text(&mut s, &mut mapper, COL_VERB, "examine");
+        assert_eq!(s.input.value, "examine", "the partial word was REPLACED, not appended to");
     }
 
     /// Tab with NOTHING highlighted is pure column movement (SQ-0677):
@@ -8539,7 +9832,7 @@ mod tests {
         assert!(s.overlays.command_band.is_none(), "cleared once the slide-out settles");
     }
 
-    /// `open-command-band`/F2 is now a TOGGLE (SQ-0677): re-invoking it while
+    /// `toggle-command-panel`/F2 is now a TOGGLE (SQ-0677): re-invoking it while
     /// still mid-close (the content hasn't settled to `None` yet) reopens the
     /// band with its phrase intact, rather than starting fresh — the same
     /// property `reopening_does_not_reset_the_phrase` pinned before the
@@ -8956,8 +10249,8 @@ mod tests {
 
     /// F2 was the direct default binding until SQ-1142 unbound every F-key: a
     /// v4+ story may claim them through its own $2E terminating-characters
-    /// table, and Arthur does. The band's ways in are the leader panel's `v`,
-    /// the `/open-command-band` command, and the `≡` control on the pane
+    /// table, and Arthur does. The panel's ways in are the leader panel's `v`,
+    /// the `/toggle-command-panel` command, and the `≡` control on the pane
     /// border — the palette row here is what this case pins.
     #[test]
     fn f2_no_longer_opens_the_command_band_by_default() {
@@ -8966,9 +10259,9 @@ mod tests {
         let spec = KeySpec { code: KeyCode::F(2), ctrl: false, shift: false, alt: false };
         assert_eq!(km.lookup(&spec, crate::keymap::Context::Global), None);
         assert_eq!(
-            km.primary_key("open-command-band"),
+            km.primary_key("toggle-command-panel"),
             None,
-            "open-command-band is leader-, command- and click-reachable: no default key",
+            "toggle-command-panel is leader-, command- and click-reachable: no default key",
         );
     }
 
@@ -8983,7 +10276,7 @@ mod tests {
             .iter()
             .find(|(title, _)| title == "Map \u{b7} View")
             .expect("Map \u{b7} View group should exist");
-        assert!(cmds.iter().any(|c| c.1 == "open-command-band"));
+        assert!(cmds.iter().any(|c| c.1 == "toggle-command-panel"));
     }
 
     // ── File-browser sub-mode key tests ───────────────────────────────────────
@@ -9460,7 +10753,7 @@ mod tests {
             open_band(&mut s);
             let a = key_to_action(&s, key(KeyCode::Char('q')));
             assert!(!matches!(a, Action::BandClose | Action::BandEscape),
-                "q must not close the command band");
+                "q must not close the command panel");
         }
 
         // Config screen: q → not ConfigCancel
@@ -9479,7 +10772,7 @@ mod tests {
             s.room_dock.toggle_to(true, true);
             let a = key_to_action(&s, key(KeyCode::Char('q')));
             assert!(!matches!(a, Action::CloseRoomDock | Action::UnpinRoomDock),
-                "q must not close or unpin the room dock");
+                "q must not close or unpin the room panel");
         }
     }
 
@@ -9505,13 +10798,16 @@ mod tests {
         let story_r = story_rect();
         let live_room_rects = room_rects_for_compact(1, (0, 0), map_r);
 
-        // Confirm that without any dialog open, clicking (0,0) hits the room.
+        // Confirm that without any dialog open, clicking (0,0) hits the room
+        // (SQ-1325: Down defers to a click-or-drag-pan rather than pinning
+        // immediately — see `left_down_on_room_cell_pins_the_dock_keeping_the_current_view`
+        // for the full Down+Up round trip).
         {
             let s = AppState::default();
             let a = mouse_to_action(&s, mouse_left_click(0, 0), map_r, story_r, &live_room_rects, &None);
             assert!(
-                matches!(a, Action::PinRoomDock(1, crate::state::RoomDockView::Info)),
-                "sanity: without dialog, a click on a room pins the dock to it, got {:?}", a
+                matches!(a, Action::BeginMapDrag(0, 0, crate::state::MapClick::Room(1))),
+                "sanity: without dialog, a click on a room begins a click-or-drag-pan targeting it, got {:?}", a
             );
         }
 
@@ -9536,7 +10832,7 @@ mod tests {
         let a = mouse_to_action(&state, mouse_left_click(0, 0), map_r, story_r, &live_room_rects, &dialog);
         assert!(
             matches!(a, Action::None),
-            "outside-config-screen click with the room dock also open must be swallowed (None), got {:?}", a
+            "outside-config-screen click with the room panel also open must be swallowed (None), got {:?}", a
         );
     }
 
@@ -10420,6 +11716,59 @@ mod tests {
         assert!(s.overlays.region_prompt.is_none(), "and it never asks again");
     }
 
+    /// "Never for this story" (SQ-1298) is story-wide, not per-seam: it silences a passage the
+    /// prompt was never even asked about, which is exactly what the field report complained
+    /// "Never" (now labelled "Not this passage") could not do.
+    #[test]
+    fn never_for_story_silences_a_seam_it_was_never_asked_about() {
+        use crate::state::RegionPromptAct;
+        let mut s = AppState::default();
+        let mut m = manor();
+        m.observe(1, "Hall", Some(Direction::Up));
+        offer_layer_suggestion(&mut s, &mut m);
+        assert!(s.overlays.region_prompt.is_some(), "the cellar wing asks, same as ever");
+        apply_region_prompt(&mut s, &mut m, RegionPromptAct::NeverForStory);
+        assert!(m.graph.suggestions_disabled(), "the story-wide flag is set");
+
+        // A different four-room wing, behind a different portal from Hall, that the flag was never
+        // asked about — it must stay silent too, which is the whole point of "for this story".
+        m.observe(2, "Study", Some(Direction::E));
+        m.observe(7, "Attic", Some(Direction::In));
+        m.observe(8, "Loft", Some(Direction::E));
+        m.observe(9, "Rafters", Some(Direction::E));
+        m.observe(10, "Belfry", Some(Direction::E));
+        m.observe(9, "Rafters", Some(Direction::W));
+        m.observe(8, "Loft", Some(Direction::W));
+        m.observe(7, "Attic", Some(Direction::W));
+        m.observe(2, "Study", Some(Direction::Out));
+        offer_layer_suggestion(&mut s, &mut m);
+        assert!(
+            s.overlays.region_prompt.is_none(),
+            "never-for-story silenced a seam it was never asked about"
+        );
+    }
+
+    /// The story-wide flag stops the NAME trigger too, not just the structural one — SQ-1298 asked
+    /// for both `Trigger::Structural` and `Trigger::Name` to go quiet.
+    #[test]
+    fn never_for_story_also_silences_the_name_trigger() {
+        use crate::state::RegionPromptAct;
+        let mut s = AppState::default();
+        let mut m = manor();
+        m.observe(1, "Hall", Some(Direction::Up));
+        offer_layer_suggestion(&mut s, &mut m);
+        apply_region_prompt(&mut s, &mut m, RegionPromptAct::NeverForStory);
+
+        // A room simply called "Maze" would otherwise speak up immediately, on first contact.
+        m.observe(2, "Study", Some(Direction::E));
+        m.observe(20, "Maze", Some(Direction::N));
+        offer_layer_suggestion(&mut s, &mut m);
+        assert!(
+            s.overlays.region_prompt.is_none(),
+            "the name trigger is silenced too, not just the structural one"
+        );
+    }
+
     /// It must not steal focus mid-turn: a modal the player asked for outranks a suggestion nobody
     /// did. Dropping the suggestion costs nothing, because declining to show it writes nothing
     /// down and the same crossing raises it again.
@@ -10580,9 +11929,9 @@ mod tests {
         // Three rooms whose bounding box centres uniquely on room 3, at (6, 6): the box runs
         // (2,2)-(10,2) x (2,2)-(6,6) → centre (6, 4), and only room 3 sits near it.
         for (id, pos) in [(2u16, (2, 2)), (3, (6, 6)), (4, (10, 2))] {
-            m.graph.upsert_room(id, format!("Room {id}"));
-            m.graph.set_pos(id, pos);
-            m.graph.set_room_layer(id, l);
+            m.graph.upsert_room(id.into(), format!("Room {id}"));
+            m.graph.set_pos(id.into(), pos);
+            m.graph.set_room_layer(id.into(), l);
         }
         assert_eq!(m.graph.last_visited(l), None, "never visited");
 
@@ -10636,9 +11985,9 @@ mod tests {
         m.graph.set_layer_view(maze, Some(mapper::layer::MapView::Matrix));
         // Ten rooms on the maze layer — more than a small pane can show at once.
         for id in 2..=11u16 {
-            m.graph.upsert_room(id, format!("Room {id}"));
-            m.graph.set_room_layer(id, maze);
-            m.graph.set_pos(id, (0, id as i32));
+            m.graph.upsert_room(id.into(), format!("Room {id}"));
+            m.graph.set_room_layer(id.into(), maze);
+            m.graph.set_pos(id.into(), (0, id as i32));
         }
         m.graph.set_current(9); // visits room 9 — recorded as the maze's last-visited room
         m.graph.set_current(1); // then leaves, back to Main
@@ -10728,6 +12077,103 @@ mod tests {
         apply_action(Action::CursorRight, &mut s, &mut m);
         assert_eq!(s.input.value, before, "mid-line Right leaves the text alone");
         assert_eq!(s.input.cursor, 1, "it just moves the caret");
+    }
+
+    // ── SQ-1326: a click in the story pane accepts a showing completion ───────
+
+    /// A left click anywhere in the story pane, with a suggestion showing,
+    /// accepts it exactly as Tab would — same input-line result, same
+    /// `suggestion_active` flip.
+    #[test]
+    fn left_click_in_story_accepts_a_showing_completion_exactly_as_tab_would() {
+        use crossterm::event::MouseEventKind;
+
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        for c in "/toggle-roo".chars() {
+            apply_action(Action::InputChar(c), &mut s, &mut m);
+        }
+        assert!(!s.suggestions.is_empty(), "a suggestion is showing: {:?}", s.suggestions);
+        let want = format!("/{}", s.suggestions[0]);
+
+        // A click well clear of the input line — anywhere in the story pane.
+        let click = mouse_event(MouseEventKind::Down(MouseButton::Left), 85, 5, KeyModifiers::NONE);
+        let action = mouse_to_action(&s, click, map_rect(), story_rect(), &[], &None);
+        assert!(matches!(action, Action::Autocomplete), "a showing completion is accepted, got {:?}", action);
+        apply_action(action, &mut s, &mut m);
+        assert_eq!(s.input.value, want, "the click applied the SAME completion Tab would have");
+        assert!(s.suggestion_active, "and marks it applied, exactly as Tab does");
+    }
+
+    /// The same click, even when it lands ON the input line (where a click
+    /// would otherwise place the caret via `CursorToClick`), still accepts the
+    /// completion first — "anywhere in the story pane" includes the line
+    /// itself.
+    #[test]
+    fn left_click_on_the_input_line_accepts_a_showing_completion_ahead_of_the_caret() {
+        use crossterm::event::MouseEventKind;
+
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        for c in "/toggle-roo".chars() {
+            apply_action(Action::InputChar(c), &mut s, &mut m);
+        }
+        // story_rect() is x=80..120, y=0..40 — the origin and click must sit inside it.
+        s.input_text_origin.set(Some((85, 5)));
+        assert!(s.input_click_index(87, 5).is_some(), "sanity: this click would otherwise hit the input line");
+
+        let click = mouse_event(MouseEventKind::Down(MouseButton::Left), 87, 5, KeyModifiers::NONE);
+        let action = mouse_to_action(&s, click, map_rect(), story_rect(), &[], &None);
+        assert!(
+            matches!(action, Action::Autocomplete),
+            "a showing completion wins over CursorToClick, got {:?}", action
+        );
+    }
+
+    /// With no completion showing, a click in the story pane keeps today's
+    /// behaviour (`StartSelection`, activating the game pane) — covered
+    /// end-to-end by `left_down_in_story_starts_selection_and_activates_game`;
+    /// this pins down the negative case explicitly: a non-empty input with NO
+    /// matching suggestions must not spuriously accept anything.
+    #[test]
+    fn left_click_in_story_with_no_completion_behaves_as_before() {
+        use crossterm::event::MouseEventKind;
+
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        for c in "zzzznosuchword".chars() {
+            apply_action(Action::InputChar(c), &mut s, &mut m);
+        }
+        assert!(s.suggestions.is_empty(), "sanity: no suggestions for this gibberish: {:?}", s.suggestions);
+
+        let click = mouse_event(MouseEventKind::Down(MouseButton::Left), 85, 5, KeyModifiers::NONE);
+        let action = mouse_to_action(&s, click, map_rect(), story_rect(), &[], &None);
+        assert!(matches!(action, Action::StartSelection(85, 5)), "no completion showing -> unchanged click behaviour, got {:?}", action);
+        apply_action(action, &mut s, &mut m);
+        assert_eq!(s.focus, Focus::Game, "the click still activates the game pane");
+    }
+
+    /// Mirrors Tab's own precedence (`key_to_command`'s pager-active early
+    /// return, ahead of step 8's autocomplete): while the [MORE] pager is up, a
+    /// click must not accept a completion either.
+    #[test]
+    fn left_click_in_story_does_not_accept_a_completion_while_the_pager_is_active() {
+        use crossterm::event::MouseEventKind;
+
+        let mut s = AppState::default();
+        let mut m = Mapper::default();
+        for c in "/toggle-roo".chars() {
+            apply_action(Action::InputChar(c), &mut s, &mut m);
+        }
+        assert!(!s.suggestions.is_empty());
+        s.pager.active = true;
+
+        let click = mouse_event(MouseEventKind::Down(MouseButton::Left), 85, 5, KeyModifiers::NONE);
+        let action = mouse_to_action(&s, click, map_rect(), story_rect(), &[], &None);
+        assert!(
+            !matches!(action, Action::Autocomplete),
+            "the pager owns the click while active, got {:?}", action
+        );
     }
 
     #[test]
@@ -11134,6 +12580,214 @@ mod tests {
             key_to_action(&s, key(KeyCode::Down)),
             Action::BandRowNav(1),
             "↓ drives the band's row highlight when not resizing"
+        );
+    }
+
+    // ── SQ-1236: a modal dialog over the band owns all input ───────────────────
+
+    /// Open Settings with a known `ConfigScreenState`, mirroring
+    /// `config_esc_maps_to_config_cancel`'s setup.
+    fn open_config_screen(s: &mut AppState) {
+        let working = crate::input::clone_config(&s.config);
+        s.overlays.config_screen =
+            Some(crate::state::ConfigScreenState { working, scroll: Default::default() });
+    }
+
+    #[test]
+    fn config_screen_over_band_preempts_the_band_intercept() {
+        // Falsified by reverting the `!any_modal_overlay_open()` guard on the
+        // band's intercept in `key_to_command`: before the fix, Up/Down/Esc
+        // resolved to `BandRowNav`/`BandEscape` here instead — the band, not
+        // the dialog on top of it, ate the keys.
+        let mut s = AppState::default();
+        open_band(&mut s);
+        open_config_screen(&mut s);
+
+        assert_eq!(
+            key_to_action(&s, key(KeyCode::Down)),
+            Action::ConfigNav(1),
+            "↓ must drive the dialog, not BandRowNav"
+        );
+        assert_eq!(
+            key_to_action(&s, key(KeyCode::Up)),
+            Action::ConfigNav(-1),
+            "↑ must drive the dialog, not BandRowNav"
+        );
+        assert_eq!(
+            key_to_action(&s, key(KeyCode::Esc)),
+            Action::ConfigCancel,
+            "Esc must close the dialog, not BandEscape"
+        );
+
+        // The band's own selection state is untouched by any of the above —
+        // none of those keys ever reached `command_band_intercept`.
+        assert_eq!(band(&s).row_sel, None, "band selection must be unchanged");
+    }
+
+    #[test]
+    fn config_screen_esc_closes_dialog_and_leaves_band_open() {
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_band(&mut s);
+        open_config_screen(&mut s);
+
+        let a = key_to_action(&s, key(KeyCode::Esc));
+        apply_action(a, &mut s, &mut mapper);
+
+        assert!(s.overlays.config_screen.is_none(), "Esc must close the dialog");
+        assert!(s.overlays.command_band.is_some(), "…and must NOT close the band underneath");
+    }
+
+    #[test]
+    fn band_mouse_click_is_inert_while_config_screen_is_open() {
+        // `band_mouse_action` lives in main.rs and isn't reachable from here,
+        // but the guard it now shares with the keyboard path
+        // (`state.any_modal_overlay_open()`) is: assert the shared predicate
+        // is true exactly when it must gate the band's mouse routing too.
+        let mut s = AppState::default();
+        open_band(&mut s);
+        assert!(!s.any_modal_overlay_open(), "band alone is not modal (SQ-0664)");
+        open_config_screen(&mut s);
+        assert!(
+            s.any_modal_overlay_open(),
+            "a dialog stacked over the band must read as modal, so band_mouse_action's \
+             any_modal_overlay_open guard fires and the click falls through to the dialog's \
+             own hit-testing instead of picking a band row"
+        );
+    }
+
+    #[test]
+    fn band_tab_does_not_fire_while_config_screen_is_open() {
+        // Tab's dialog-focus cycling happens upstream in main.rs regardless of
+        // the band (unconditional, keyed only on `config_screen.is_some()`), so
+        // it is not exercised here. What IS this layer's job: Tab must resolve
+        // to the dialog's own (non-)handling of it, not to the band's
+        // `BandColumnStep`/`BandTabPick` — before the fix it produced both.
+        let mut s = AppState::default();
+        open_band(&mut s);
+        open_config_screen(&mut s);
+        assert_eq!(
+            key_to_action(&s, key(KeyCode::Tab)),
+            Action::None,
+            "Tab must not resolve to a band action while the dialog is open"
+        );
+    }
+
+    #[test]
+    fn band_arrows_resume_after_config_screen_closes() {
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_band(&mut s);
+        open_config_screen(&mut s);
+        apply_action(Action::ConfigCancel, &mut s, &mut mapper);
+        assert!(s.overlays.config_screen.is_none());
+
+        assert_eq!(
+            key_to_action(&s, key(KeyCode::Down)),
+            Action::BandRowNav(1),
+            "with the dialog gone, ↓ drives the band's row highlight again"
+        );
+    }
+
+    // ── SQ-1244: the inventory panel's items click into the prompt ─────────────
+    //
+    // The command panel and the inventory panel are mutually exclusive
+    // (`SidePanel`), so the inventory dock's click always lands with
+    // `state.overlays.command_band` closed — there is no `CommandBandState`
+    // to pick FROM. `Action::InventoryClickRow` resolves the word from
+    // `AppState::inventory_click_words` (what a real loop tick refreshes
+    // from the engine; these tests seed it directly, mirroring `open_band`'s
+    // synthetic object model) and composes it via `compose_word_onto_prompt`
+    // — the SAME composer (`sync_band_phrase_to_input`) `band_pick_row` uses.
+
+    /// Seed the inventory panel open with a known, synthetic click-word list
+    /// — the panel's counterpart of `open_band`'s synthetic object model.
+    fn open_inventory_panel_for_test(state: &mut AppState, words: &[&str]) {
+        state.show_inventory = true;
+        state.inv_dock.toggle_to(true, true);
+        state.inventory_click_words = words.iter().map(|w| w.to_string()).collect();
+    }
+
+    /// Falsified by removing the `compose_word_onto_prompt` call from
+    /// `Action::InventoryClickRow`'s `apply_action` arm: before the fix the
+    /// click did nothing and the prompt stayed exactly `"examine "`.
+    #[test]
+    fn inventory_click_with_a_typed_verb_and_trailing_space_appends_the_item() {
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_inventory_panel_for_test(&mut s, &["lamp", "leaflet"]);
+        s.input.set("examine ".to_string(), true);
+
+        apply_action(Action::InventoryClickRow(1), &mut s, &mut mapper);
+
+        assert_eq!(s.input.value, "examine leaflet");
+    }
+
+    /// Command panel closed, inventory panel open, EMPTY prompt: the WHAT-noun
+    /// path's own rule with no verb typed — `compose_word_onto_prompt` strips
+    /// nothing (there is no partial word) and composes the bare item.
+    #[test]
+    fn inventory_click_on_an_empty_prompt_composes_the_bare_item() {
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_inventory_panel_for_test(&mut s, &["leaflet"]);
+        assert_eq!(s.input.value, "");
+
+        apply_action(Action::InventoryClickRow(0), &mut s, &mut mapper);
+
+        assert_eq!(s.input.value, "leaflet");
+    }
+
+    /// An unrecognized partial word (`exa`, not yet a complete verb) at the
+    /// prompt is REPLACED outright, not appended after — SQ-1230's rule
+    /// ("a partial word being typed is replaced"), pinned here for the
+    /// no-`CommandBandState` composer exactly as `band_pick_row` already
+    /// pins it for a table pick in `arity_drives_column_reachability` and
+    /// friends.
+    #[test]
+    fn inventory_click_replaces_an_unrecognized_partial_word() {
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_inventory_panel_for_test(&mut s, &["leaflet"]);
+        s.input.set("exa".to_string(), true);
+
+        apply_action(Action::InventoryClickRow(0), &mut s, &mut mapper);
+
+        assert_eq!(s.input.value, "leaflet", "the partial word is replaced, not appended after");
+    }
+
+    /// A stale/out-of-range index (the click landed after the panel's
+    /// contents changed underneath it) composes nothing rather than
+    /// panicking or picking the wrong item.
+    #[test]
+    fn inventory_click_with_a_stale_index_is_a_no_op() {
+        let mut s = AppState::default();
+        let mut mapper = Mapper::default();
+        open_inventory_panel_for_test(&mut s, &["leaflet"]);
+        s.input.set("examine ".to_string(), true);
+
+        apply_action(Action::InventoryClickRow(5), &mut s, &mut mapper);
+
+        assert_eq!(s.input.value, "examine ", "an out-of-range index composes nothing");
+    }
+
+    /// SQ-1236's rule extended to the inventory dock: a modal dialog stacked
+    /// on top takes all mouse input. `inventory_mouse_action` lives in
+    /// main.rs and isn't reachable from here, but the guard it shares with
+    /// the band's own mouse routing (`state.any_modal_overlay_open()`) is:
+    /// assert the shared predicate is true exactly when it must gate the
+    /// inventory dock's mouse routing too.
+    #[test]
+    fn inventory_panel_alone_is_not_modal_but_a_dialog_over_it_is() {
+        let mut s = AppState::default();
+        open_inventory_panel_for_test(&mut s, &["leaflet"]);
+        assert!(!s.any_modal_overlay_open(), "the inventory panel alone is not modal (SQ-1244)");
+        open_config_screen(&mut s);
+        assert!(
+            s.any_modal_overlay_open(),
+            "a dialog stacked over the inventory panel must read as modal, so \
+             inventory_mouse_action's any_modal_overlay_open guard fires and the click falls \
+             through to the dialog's own hit-testing instead of composing an item"
         );
     }
 
