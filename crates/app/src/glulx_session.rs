@@ -1536,33 +1536,45 @@ impl GlulxSession {
         let mem = self.machine.mem();
         let is_scenery_or_door =
             |id: u32| names.is_some_and(|n| n.is_scenery_or_door(mem, id));
-        if let Some(loc) = location {
-            for ow in self.room_objects_excluding(loc.number, player) {
-                if is_scenery_or_door(ow.id) {
-                    continue;
-                }
-                // SQ-1631 Fix 1: a display name, not the raw printed name alone — Inform 7's
-                // objects routinely have no hardware short name at all, only parse words, and a
-                // filter on the bare printed name drops every one of them (the exact SQ-1042 bug
-                // this mirrors; see `render::room_info::list_room_objects_excluding`'s own doc).
-                // SQ-1648: `item_tracker_display_name`, not `display_name` directly — see that
-                // function's own doc for why.
-                let Some(name) = item_tracker_display_name(&ow, prose) else {
-                    continue;
-                };
-                out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::RoomDirect, words: ow });
-            }
+
+        let room: Vec<grammar_model::ObjectWords> = match location {
+            Some(loc) => self
+                .room_objects_excluding(loc.number, player)
+                .into_iter()
+                .filter(|ow| !is_scenery_or_door(ow.id))
+                .collect(),
+            None => Vec::new(),
+        };
+        let carried: Vec<grammar_model::ObjectWords> = match player {
+            Some(p) => self.contents(p).into_iter().filter(|ow| !is_scenery_or_door(ow.id)).collect(),
+            None => Vec::new(),
+        };
+
+        // SQ-1652: see `GameSession::zvm_item_observations`'s matching comment — every item
+        // observed this turn shares one turn-wide `prose` string, so names are resolved only
+        // once every item under consideration this turn is known.
+        let all_words: Vec<&grammar_model::ObjectWords> = room.iter().chain(carried.iter()).collect();
+        let others_for = |id: u32| -> Vec<&grammar_model::ObjectWords> {
+            all_words.iter().copied().filter(|ow| ow.id != id).collect()
+        };
+
+        for ow in &room {
+            // SQ-1631 Fix 1: a display name, not the raw printed name alone — Inform 7's
+            // objects routinely have no hardware short name at all, only parse words, and a
+            // filter on the bare printed name drops every one of them (the exact SQ-1042 bug
+            // this mirrors; see `render::room_info::list_room_objects_excluding`'s own doc).
+            // SQ-1648: `item_tracker_display_name`, not `display_name` directly — see that
+            // function's own doc for why.
+            let Some(name) = item_tracker_display_name(ow, prose, &others_for(ow.id)) else {
+                continue;
+            };
+            out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::RoomDirect, words: ow.clone() });
         }
-        if let Some(p) = player {
-            for ow in self.contents(p) {
-                if is_scenery_or_door(ow.id) {
-                    continue;
-                }
-                let Some(name) = item_tracker_display_name(&ow, prose) else {
-                    continue;
-                };
-                out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::Carried, words: ow });
-            }
+        for ow in &carried {
+            let Some(name) = item_tracker_display_name(ow, prose, &others_for(ow.id)) else {
+                continue;
+            };
+            out.push(ItemObservation { key: ow.id, name, location: ObservedItemLocation::Carried, words: ow.clone() });
         }
         out
     }

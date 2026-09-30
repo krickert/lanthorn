@@ -848,3 +848,85 @@ fn a_genuine_portable_item_is_still_tracked_after_the_scenery_filter() {
     let taken = s.submit("take cup");
     assert!(taken.transcript.contains("Taken"), "the real success text: {:?}", taken.transcript);
 }
+
+// ── SQ-1652: a display name resolved from one item's own prose must never bleed onto another ──
+//
+// The reported defect: `x umbrella`'s whole turn is the umbrella's own examine description
+// ("Olive green, with a hook-shaped handle…"), never a word about the unrelated `clothes` item —
+// but `clothes`' own vocabulary ALSO has "green" (its own separately-described "tasteful ensemble
+// in muted browns and greens"), and `item_tracker_display_name`'s tier 1, called once per
+// currently-tracked item against that SAME turn-wide prose with no awareness of what the OTHER
+// items' own vocabularies looked like, wrongly renamed `clothes` to `"green"` too. Confirmed
+// against the real `stories/AnchorheadDemo.gblorb` before writing the fix (`x umbrella` relabels
+// both "umbrella" and "clothes" to "green"; falsified by reverting `item_tracker_display_name`'s
+// `other_items` disambiguation and confirming this exact case fails again), and again here.
+
+/// Anchorhead's Special Edition demo (Michael Gentry, Inform 6/Glulx): `stories/AnchorheadDemo.gblorb`
+/// — past its splash to the first command prompt outside the real estate office, carrying the
+/// umbrella/clothes/trenchcoat/wedding-ring starting inventory the case below needs.
+fn boot_anchorhead_demo() -> Option<GlulxSession> {
+    let image = glulx_image("AnchorheadDemo.gblorb")?;
+    let mut s = GlulxSession::new(image, 80, 24, true, false, false, (1.0, 1.0), None, &[]).ok()?;
+    for _ in 0..6 {
+        if s.pending_input() != app::session::InputKind::Char {
+            break;
+        }
+        s.submit_key(KeyInput::Enter);
+    }
+    Some(s)
+}
+
+#[test]
+fn examining_the_umbrella_never_relabels_the_unrelated_clothes_item() {
+    let Some(mut s) = boot_anchorhead_demo() else {
+        eprintln!("SKIP: gitignored stories/AnchorheadDemo.gblorb missing");
+        return;
+    };
+    let before = s.submit("look");
+    let clothes_before = before
+        .items
+        .iter()
+        .find(|i| i.words.refers_to("clothes"))
+        .expect("clothes is carried from the very first turn");
+    assert_eq!(clothes_before.name, "clothes", "premise: clothes starts out named for itself");
+
+    let r = s.submit("x umbrella");
+    assert!(
+        r.transcript.contains("green"),
+        "premise: the umbrella's own description is this turn's whole transcript, and it \
+         contains \"green\", the word the bug misattributed to clothes: {:?}",
+        r.transcript
+    );
+    let clothes_after = r
+        .items
+        .iter()
+        .find(|i| i.words.refers_to("clothes"))
+        .expect("clothes is still tracked this turn, just not examined");
+    assert_eq!(
+        clothes_after.name, "clothes",
+        "SQ-1652: \"x umbrella\" printed nothing about clothes, so its resolved name must not \
+         change at all — got {:?}",
+        clothes_after
+    );
+
+    // The report's own follow-up: `x clothes` relabels clothes to a word from ITS OWN
+    // description ("tasteful") — correct — but must never touch the umbrella's own resolved
+    // name, exactly as `x umbrella` above must never touch clothes'.
+    let r2 = s.submit("x clothes");
+    assert!(
+        r2.transcript.contains("tasteful"),
+        "premise: clothes' own description is this turn's whole transcript: {:?}",
+        r2.transcript
+    );
+    let umbrella_after = r2
+        .items
+        .iter()
+        .find(|i| i.words.refers_to("umbrella"))
+        .expect("umbrella is still tracked this turn, just not examined");
+    assert_eq!(
+        umbrella_after.name, "umbrella",
+        "SQ-1652: \"x clothes\" printed nothing about the umbrella, so its resolved name must \
+         not change at all — got {:?}",
+        umbrella_after
+    );
+}

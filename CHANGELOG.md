@@ -71,6 +71,11 @@ while any such tag, or this Unreleased section, still exists.*
   Anchorhead's intro and quote splash) now all stay readable, and clicking a
   picture and returning no longer risks wiping everything you played since
   the last screen change.
+- Fixed a bug where examining one tracked item could rename an unrelated one
+  in the same turn — if both items' vocabularies happened to share a word (an
+  adjective like "green" describing two different things), examining the
+  first could relabel the second to that shared word too, even though
+  nothing about the second item was actually printed.
 
 ## v0.8.1 — 2026-09-29
 

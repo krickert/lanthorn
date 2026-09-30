@@ -4731,16 +4731,31 @@ fn take_command_target(cmd: &str, vocab: Option<&crate::vocab::StoryVocabulary>)
 ///    prose word doesn't need to spell a stored dictionary key exactly, it needs to TRUNCATE to
 ///    it), so the untruncated prose spelling is returned and the truncation problem is solved for
 ///    free: `prose` containing "proprietor" resolves Anchorhead's shopkeeper to `"proprietor"`,
-///    not the stored `"proprieto"`.
-/// 2. No word in `prose` matches (rare — an item observed some other way before any prose named
-///    it): the FIRST of `ow.words`, unspelled. Checked against Anchorhead's own registry before
-///    picking first-over-last: every sampled case had its real name as the FIRST stored word
-///    (Inform 7 compiles an object's own declared name before any `understand ... as name`
-///    synonyms) — `"universit rooftops things …"` is Miskatonic University, `"trenchcoa player's
-///    holdalls …"` is the trenchcoat, never the last word in either list.
+///    not the stored `"proprieto"`. **But only when that stored word is uniquely this item's**
+///    (SQ-1652) — see `other_items` below; a candidate match shared with another item this same
+///    turn is skipped in favour of a later, unambiguous word in `ow.words`, or tier 2 if none
+///    exists.
+/// 2. No word in `prose` unambiguously matches (rare — an item observed some other way before any
+///    prose named it, or every prose match it has is shared with another item): the FIRST of
+///    `ow.words`, unspelled. Checked against Anchorhead's own registry before picking
+///    first-over-last: every sampled case had its real name as the FIRST stored word (Inform 7
+///    compiles an object's own declared name before any `understand ... as name` synonyms) —
+///    `"universit rooftops things …"` is Miskatonic University, `"trenchcoa player's holdalls …"`
+///    is the trenchcoat, never the last word in either list.
+///
+/// `other_items`: every OTHER item being resolved the same turn (never `ow` itself), passed by
+/// every call site because every item this turn shares one turn-wide `prose` string (SQ-1652).
+/// Without this, tier 1 attributes a shared vocabulary word to EVERY item that owns it, not just
+/// the one `prose` is actually about: examining Anchorhead's green umbrella prints only the
+/// umbrella's own description, but the unrelated `clothes` item's own vocabulary also has
+/// "green" (a separately-described "green ensemble" elsewhere in the game), so unguarded tier 1
+/// renamed `clothes` to `"green"` too, from prose that never mentioned it. A stored word present
+/// in more than one item's own `ow.words` this turn is therefore untrustworthy evidence for
+/// EITHER of them and is skipped, even though it did appear in the shared prose.
 pub(crate) fn item_tracker_display_name(
     ow: &grammar_model::ObjectWords,
     prose: &str,
+    other_items: &[&grammar_model::ObjectWords],
 ) -> Option<String> {
     if !ow.printed_name.is_empty() && !printed_name_is_a_non_name(&ow.printed_name) {
         return Some(ow.printed_name.clone());
@@ -4760,7 +4775,12 @@ pub(crate) fn item_tracker_display_name(
             Some(n) => w.chars().take(n).collect::<String>() == *stored,
             None => *w == stored,
         });
-        if let Some(w) = found {
+        let Some(w) = found else { continue };
+        // SQ-1652: this stored word is trustworthy evidence for `ow` only if no other item
+        // resolved this same turn also claims it — otherwise `prose` may be describing one of
+        // those other items instead, and there is no way to tell from a shared string alone.
+        let shared = other_items.iter().any(|other| other.words.iter().any(|s| s == stored));
+        if !shared {
             return Some(w.clone());
         }
     }
@@ -6530,71 +6550,93 @@ impl GameSession {
         let player_obj = self
             .player_hint
             .or_else(|| zvm::location::find_player_object_with(&self.machine, self.player_candidates()));
+
+        let mut direct: Vec<grammar_model::ObjectWords> = Vec::new();
+        let mut nested: Vec<grammar_model::ObjectWords> = Vec::new();
+        let mut nested_room_num: Option<u16> = None;
         if let Some(loc) = location {
             if let Ok(room_num) = u16::try_from(loc.number) {
+                nested_room_num = Some(room_num);
                 // The room's own top level. The player object is structurally a child of
                 // whatever room they stand in (SQ-0667's exact hazard) — excluded by id, not name.
-                let direct = crate::inventory::list_inventory(&self.machine.mem, names, room_num)
+                direct = crate::inventory::list_inventory(&self.machine.mem, names, room_num)
                     .into_iter()
                     .filter(|o| Some(o.id) != player_obj.map(u32::from))
                     .collect::<Vec<_>>();
                 let direct_ids: std::collections::BTreeSet<u32> = direct.iter().map(|o| o.id).collect();
-                for o in &direct {
-                    // SQ-1631 Fix 1: a display name, not the raw printed name alone — see
-                    // `list_room_objects_excluding`'s own doc for why filtering on the bare printed
-                    // name drops every Inform 7 object. SQ-1648: `item_tracker_display_name`, not
-                    // `display_name` directly — see that function's own doc for why.
-                    let Some(name) = item_tracker_display_name(o, prose) else {
-                        continue; // nothing a panel could show, nothing a player could type
-                    };
-                    out.push(ItemObservation {
-                        key: o.id,
-                        name,
-                        location: ObservedItemLocation::RoomDirect,
-                        words: o.clone(),
-                    });
-                }
                 // Everything else the room reveals is nested by construction: it was excluded
                 // from `direct` above, so any object here that isn't in `direct_ids` was reached
                 // only by recursing into a supporter/container/scenery bucket.
-                for o in crate::render::room_info::list_room_objects_excluding(
+                nested = crate::render::room_info::list_room_objects_excluding(
                     self.world_model(),
                     names,
                     &self.machine.mem,
                     loc.number,
                     player_obj.unwrap_or(0),
-                ) {
-                    if direct_ids.contains(&o.id) {
-                        continue;
-                    }
-                    let Some(name) = item_tracker_display_name(&o, prose) else {
-                        continue;
-                    };
-                    // SQ-1632 Fix 5: a "nested" sighting the visibility walk reached is not
-                    // necessarily a genuinely CONTAINED one — local-global/shared scenery (a
-                    // window, a house, visible from many rooms) is never a real child of any of
-                    // them (`WorldModel::real_container_in_room`'s own doc). Skip it outright
-                    // rather than recording it as nested-with-no-container, which would read as a
-                    // portable item that mysteriously follows the player from room to room.
-                    let Some(container) = self.world_model().real_container_in_room(&self.machine.mem, room_num, o.id as u16) else {
-                        continue;
-                    };
-                    out.push(ItemObservation {
-                        key: o.id,
-                        name,
-                        location: ObservedItemLocation::RoomNested { container: Some(container as u32) },
-                        words: o,
-                    });
-                }
+                )
+                .into_iter()
+                .filter(|o| !direct_ids.contains(&o.id))
+                .collect();
             }
         }
-        if let Some(p) = player_obj {
-            for o in crate::inventory::list_inventory(&self.machine.mem, names, p) {
-                let Some(name) = item_tracker_display_name(&o, prose) else {
+        let carried: Vec<grammar_model::ObjectWords> = match player_obj {
+            Some(p) => crate::inventory::list_inventory(&self.machine.mem, names, p),
+            None => Vec::new(),
+        };
+
+        // SQ-1652: every item observed this turn shares one turn-wide `prose` string, so names
+        // are resolved only once every item under consideration this turn is known — see
+        // `item_tracker_display_name`'s own doc for why (a stored word two items both know, e.g.
+        // Anchorhead's "green" umbrella/clothes, would otherwise be attributed to whichever
+        // item's loop ran first).
+        let all_words: Vec<&grammar_model::ObjectWords> =
+            direct.iter().chain(nested.iter()).chain(carried.iter()).collect();
+        let others_for = |id: u32| -> Vec<&grammar_model::ObjectWords> {
+            all_words.iter().copied().filter(|o| o.id != id).collect()
+        };
+
+        for o in &direct {
+            // SQ-1631 Fix 1: a display name, not the raw printed name alone — see
+            // `list_room_objects_excluding`'s own doc for why filtering on the bare printed
+            // name drops every Inform 7 object. SQ-1648: `item_tracker_display_name`, not
+            // `display_name` directly — see that function's own doc for why.
+            let Some(name) = item_tracker_display_name(o, prose, &others_for(o.id)) else {
+                continue; // nothing a panel could show, nothing a player could type
+            };
+            out.push(ItemObservation {
+                key: o.id,
+                name,
+                location: ObservedItemLocation::RoomDirect,
+                words: o.clone(),
+            });
+        }
+        if let Some(room_num) = nested_room_num {
+            for o in &nested {
+                let Some(name) = item_tracker_display_name(o, prose, &others_for(o.id)) else {
                     continue;
                 };
-                out.push(ItemObservation { key: o.id, name, location: ObservedItemLocation::Carried, words: o });
+                // SQ-1632 Fix 5: a "nested" sighting the visibility walk reached is not
+                // necessarily a genuinely CONTAINED one — local-global/shared scenery (a
+                // window, a house, visible from many rooms) is never a real child of any of
+                // them (`WorldModel::real_container_in_room`'s own doc). Skip it outright
+                // rather than recording it as nested-with-no-container, which would read as a
+                // portable item that mysteriously follows the player from room to room.
+                let Some(container) = self.world_model().real_container_in_room(&self.machine.mem, room_num, o.id as u16) else {
+                    continue;
+                };
+                out.push(ItemObservation {
+                    key: o.id,
+                    name,
+                    location: ObservedItemLocation::RoomNested { container: Some(container as u32) },
+                    words: o.clone(),
+                });
             }
+        }
+        for o in &carried {
+            let Some(name) = item_tracker_display_name(o, prose, &others_for(o.id)) else {
+                continue;
+            };
+            out.push(ItemObservation { key: o.id, name, location: ObservedItemLocation::Carried, words: o.clone() });
         }
         out
     }
@@ -11664,13 +11706,13 @@ mod item_observation_tests {
     #[test]
     fn item_tracker_display_name_prefers_the_printed_name_when_there_is_one() {
         let ow = grammar_model::ObjectWords::new(1, "brass lantern".to_string(), vec!["lantern".to_string()], None, None);
-        assert_eq!(item_tracker_display_name(&ow, "You are in a dark room."), Some("brass lantern".to_string()));
+        assert_eq!(item_tracker_display_name(&ow, "You are in a dark room.", &[]), Some("brass lantern".to_string()));
     }
 
     #[test]
     fn item_tracker_display_name_none_when_the_story_holds_no_text_at_all() {
         let ow = grammar_model::ObjectWords::new(1, String::new(), Vec::new(), None, None);
-        assert_eq!(item_tracker_display_name(&ow, "anything"), None);
+        assert_eq!(item_tracker_display_name(&ow, "anything", &[]), None);
     }
 
     /// Tier 1's core case: several known words, none a printed name, and the turn's own prose has
@@ -11680,7 +11722,7 @@ mod item_observation_tests {
         let ow = no_name_object(&["old", "portly", "man", "person"], None);
         let prose = "An old, portly man stands behind the counter, eyeing you suspiciously.";
         assert_eq!(
-            item_tracker_display_name(&ow, prose),
+            item_tracker_display_name(&ow, prose, &[]),
             Some("old".to_string()),
             "the first of ow.words with a match, not the whole joined list"
         );
@@ -11693,7 +11735,7 @@ mod item_observation_tests {
     fn item_tracker_display_name_spells_out_a_truncated_word_from_this_turns_prose() {
         let ow = no_name_object(&["proprieto", "men", "old", "portly", "shopkeepe", "man"], Some(9));
         let prose = "The proprietor eyes you with open suspicion.";
-        assert_eq!(item_tracker_display_name(&ow, prose), Some("proprietor".to_string()));
+        assert_eq!(item_tracker_display_name(&ow, prose, &[]), Some("proprietor".to_string()));
     }
 
     /// The FIRST of `ow.words` with a prose match wins, in the object's own stored order, not
@@ -11704,7 +11746,7 @@ mod item_observation_tests {
         // "man" appears in the prose before "shopkeeper" does, but "shopkeeper" is earlier in
         // ow.words, so it wins.
         let prose = "A man stands behind the counter. The shopkeeper glares.";
-        assert_eq!(item_tracker_display_name(&ow, prose), Some("shopkeeper".to_string()));
+        assert_eq!(item_tracker_display_name(&ow, prose, &[]), Some("shopkeeper".to_string()));
     }
 
     /// Tier 2: nothing in this turn's prose matches any known word — falls back to the FIRST of
@@ -11713,7 +11755,7 @@ mod item_observation_tests {
     fn item_tracker_display_name_falls_back_to_the_first_stored_word_with_no_prose_match() {
         let ow = no_name_object(&["universit", "rooftops", "things", "rooftop", "roof"], Some(9));
         assert_eq!(
-            item_tracker_display_name(&ow, "You are standing in a quiet street."),
+            item_tracker_display_name(&ow, "You are standing in a quiet street.", &[]),
             Some("universit".to_string()),
             "no textual evidence this turn: the first stored word, not the whole list"
         );
@@ -11725,7 +11767,7 @@ mod item_observation_tests {
     #[test]
     fn item_tracker_display_name_matches_case_insensitively() {
         let ow = no_name_object(&["trenchcoat", "coat"], None);
-        assert_eq!(item_tracker_display_name(&ow, "Trenchcoat pockets bulge with odds and ends."), Some("trenchcoat".to_string()));
+        assert_eq!(item_tracker_display_name(&ow, "Trenchcoat pockets bulge with odds and ends.", &[]), Some("trenchcoat".to_string()));
     }
 
     // ── printed_name_is_a_non_name / bare-pronoun & internal-identifier filtering (SQ-1649) ────
@@ -11785,7 +11827,7 @@ mod item_observation_tests {
             Some(6),
         );
         assert_eq!(
-            item_tracker_display_name(&ow, "You are in a small bedroom."),
+            item_tracker_display_name(&ow, "You are in a small bedroom.", &[]),
             Some("basin".to_string()),
             "a bare pronoun printed name must fall through to the word-list tiers, not show \"it\""
         );
@@ -11802,7 +11844,7 @@ mod item_observation_tests {
             Some(9),
         );
         assert_eq!(
-            item_tracker_display_name(&ow, "You take the metal whistle."),
+            item_tracker_display_name(&ow, "You take the metal whistle.", &[]),
             Some("whistle".to_string()),
             "an Inform internal identifier must fall through to the word-list tiers, never show the parenthesised form"
         );
@@ -11820,9 +11862,61 @@ mod item_observation_tests {
             Some(9),
         );
         assert_eq!(
-            item_tracker_display_name(&ow, "Nothing here names it."),
+            item_tracker_display_name(&ow, "Nothing here names it.", &[]),
             Some("whole".to_string()),
             "a cloned instance's synthesized name must fall through to the word-list tiers"
+        );
+    }
+
+    // ── item_tracker_display_name cross-item disambiguation (SQ-1652) ──────────
+
+    /// The real repro's shape, reduced: two items whose own vocabularies both include "green"
+    /// (clothes' own DECLARED name "clothes" comes first per Inform's own compile order, "green"
+    /// a later synonym — see tier 2's own doc), and a turn's prose that only ever describes one of
+    /// them (the umbrella). Without the `other_items` check, `clothes` would resolve to `"green"`
+    /// via tier 1, purely because its own word list happens to share that word — even though
+    /// nothing in `prose` is about it.
+    #[test]
+    fn item_tracker_display_name_never_attributes_a_word_shared_with_another_items_own_vocabulary() {
+        let umbrella = no_name_object(&["green", "umbrella"], None);
+        let clothes = no_name_object(&["clothes", "green"], None);
+        let prose = "It's a plain green umbrella, nothing special about it.";
+        assert_eq!(
+            item_tracker_display_name(&clothes, prose, &[&umbrella]),
+            Some("clothes".to_string()),
+            "\"green\" is shared with the umbrella's own vocabulary, so it must not be trusted as \
+             evidence for clothes even though it appears in this turn's prose — falls through to \
+             clothes' own first stored word (its real declared name) instead"
+        );
+    }
+
+    /// The other half of the same fix: the item the shared word's prose actually WAS describing
+    /// still resolves sensibly, by continuing past the ambiguous "green" to its own later,
+    /// unambiguous word ("umbrella") rather than being stuck on a word two items both claim.
+    #[test]
+    fn item_tracker_display_name_still_resolves_the_item_the_shared_prose_is_actually_about() {
+        let umbrella = no_name_object(&["green", "umbrella"], None);
+        let clothes = no_name_object(&["clothes", "green"], None);
+        let prose = "It's a plain green umbrella, nothing special about it.";
+        assert_eq!(
+            item_tracker_display_name(&umbrella, prose, &[&clothes]),
+            Some("umbrella".to_string()),
+            "\"green\" is shared with clothes' own vocabulary too, so it must be skipped for the \
+             umbrella as well — but \"umbrella\" itself is unambiguous and also appears in prose, \
+             so tier 1 still resolves correctly by continuing past the shared word"
+        );
+    }
+
+    /// With no other item this turn claiming the same word, tier 1's original behaviour is
+    /// unchanged: a single item's own prose-matched word still wins.
+    #[test]
+    fn item_tracker_display_name_disambiguation_does_not_affect_a_lone_item() {
+        let ow = no_name_object(&["old", "portly", "man", "person"], None);
+        let prose = "An old, portly man stands behind the counter, eyeing you suspiciously.";
+        assert_eq!(
+            item_tracker_display_name(&ow, prose, &[]),
+            Some("old".to_string()),
+            "no other item this turn claims \"old\", so tier 1 must still win exactly as before"
         );
     }
 }
