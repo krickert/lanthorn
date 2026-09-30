@@ -122,12 +122,17 @@ pub enum ItemDockRow {
     /// `carried` slice [`build_inventory_dock_rows`] was called with — the
     /// SAME index `AppState::inventory_click_words` uses, so a click
     /// resolves to the right word regardless of how filtering has rearranged
-    /// what's actually drawn.
-    Carried { text: String, click_idx: usize },
+    /// what's actually drawn. `meta_start` is the CHAR count (not byte count —
+    /// [`draw_str_clipped`] advances one column per `char`) of the prefix that
+    /// stays at the row's ordinary style; the rest (the "found Room, turn N"
+    /// clause, when there is one) draws dimmed. Equal to `text.chars().count()`
+    /// when there's nothing to dim.
+    Carried { text: String, click_idx: usize, meta_start: usize },
     /// A tracked item the registry has ever seen that is not currently
     /// carried — a `Room` or `Vanished` sighting. Never clickable (see
-    /// [`InventoryDockHits::rows`]'s own doc).
-    Elsewhere { text: String },
+    /// [`InventoryDockHits::rows`]'s own doc). `meta_start` is the same split
+    /// point [`Carried`]'s field is.
+    Elsewhere { text: String, meta_start: usize },
 }
 
 /// Case-insensitive substring match — the filter's whole rule (`filter-items
@@ -150,15 +155,30 @@ fn filter_matches(filter: Option<&str>, name: &str) -> bool {
 /// recognised. Either way this shows the name ALONE, gracefully, rather than
 /// omitting the item or panicking — an unrecorded provenance is not a reason
 /// to hide an item the player is plainly holding right now.
-fn carried_line(name: &str, key: Option<ItemKey>, graph: &MapGraph) -> String {
+///
+/// Returns the line alongside the CHAR count of its name-prefix — the point
+/// where the "found …" clause begins and dimmed drawing should take over
+/// (`draw_inventory_dock`). Splitting on a count computed here, rather than
+/// re-finding `" — "` at draw time, is deliberate: an item's own name could
+/// itself contain that substring, which would misplace a naive re-parse.
+fn carried_line(name: &str, key: Option<ItemKey>, graph: &MapGraph) -> (String, usize) {
     let record = key.and_then(|k| graph.item(k));
     match record {
-        Some(rec) => format!(
-            "  {name} — found {}, turn {}",
-            crate::render::room_info::display_name(graph, rec.origin_room),
-            rec.origin_turn
-        ),
-        None => format!("  {name}"),
+        Some(rec) => {
+            let prefix = format!("  {name}");
+            let meta_start = prefix.chars().count();
+            let line = format!(
+                "{prefix} — found {}, turn {}",
+                crate::render::room_info::display_name(graph, rec.origin_room),
+                rec.origin_turn
+            );
+            (line, meta_start)
+        }
+        None => {
+            let line = format!("  {name}");
+            let meta_start = line.chars().count();
+            (line, meta_start)
+        }
     }
 }
 
@@ -178,21 +198,39 @@ fn carried_line(name: &str, key: Option<ItemKey>, graph: &MapGraph) -> String {
 /// handled rather than left to panic, in case the mapper's carried record
 /// and the engine's live contents list ever disagree for a frame (e.g. the
 /// turn the registry hasn't caught up on a drop yet).
-fn elsewhere_line(rec: &ItemRecord, graph: &MapGraph) -> String {
+///
+/// Returns the line alongside the CHAR count of its name-prefix (the item's
+/// own name, plus `[vanished] ` when present) — where the dimmed metadata
+/// clause begins. See [`carried_line`] for why this is computed here rather
+/// than re-parsed at draw time.
+fn elsewhere_line(rec: &ItemRecord, graph: &MapGraph) -> (String, usize) {
     let fixed = if rec.fixed_in_place { " (fixed in place)" } else { "" };
     match rec.last_seen {
-        ItemLocation::Room { room, .. } => format!(
-            "  {} — last seen {}, turn {}{fixed}",
-            rec.name,
-            crate::render::room_info::display_name(graph, room),
-            rec.last_seen_turn
-        ),
-        ItemLocation::Vanished { room, turn } => format!(
-            "  [vanished] {} — last seen {}, turn {turn}{fixed}",
-            rec.name,
-            crate::render::room_info::display_name(graph, room)
-        ),
-        ItemLocation::Carried => format!("  {} — carried{fixed}", rec.name),
+        ItemLocation::Room { room, .. } => {
+            let prefix = format!("  {}", rec.name);
+            let meta_start = prefix.chars().count();
+            let line = format!(
+                "{prefix} — last seen {}, turn {}{fixed}",
+                crate::render::room_info::display_name(graph, room),
+                rec.last_seen_turn
+            );
+            (line, meta_start)
+        }
+        ItemLocation::Vanished { room, turn } => {
+            let prefix = format!("  [vanished] {}", rec.name);
+            let meta_start = prefix.chars().count();
+            let line = format!(
+                "{prefix} — last seen {}, turn {turn}{fixed}",
+                crate::render::room_info::display_name(graph, room)
+            );
+            (line, meta_start)
+        }
+        ItemLocation::Carried => {
+            let prefix = format!("  {}", rec.name);
+            let meta_start = prefix.chars().count();
+            let line = format!("{prefix} — carried{fixed}");
+            (line, meta_start)
+        }
     }
 }
 
@@ -235,7 +273,8 @@ pub fn build_inventory_dock_rows(
         if !filter_matches(filter, name) {
             continue;
         }
-        carried_rows.push(ItemDockRow::Carried { text: carried_line(name, *key, graph), click_idx: idx });
+        let (text, meta_start) = carried_line(name, *key, graph);
+        carried_rows.push(ItemDockRow::Carried { text, click_idx: idx, meta_start });
     }
 
     let mut elsewhere: Vec<(&ItemKey, &ItemRecord)> =
@@ -246,8 +285,13 @@ pub fn build_inventory_dock_rows(
         let b_vanished = matches!(b.last_seen, ItemLocation::Vanished { .. });
         a_vanished.cmp(&b_vanished).then_with(|| b.last_seen_turn.cmp(&a.last_seen_turn))
     });
-    let elsewhere_rows: Vec<ItemDockRow> =
-        elsewhere.iter().map(|(_, rec)| ItemDockRow::Elsewhere { text: elsewhere_line(rec, graph) }).collect();
+    let elsewhere_rows: Vec<ItemDockRow> = elsewhere
+        .iter()
+        .map(|(_, rec)| {
+            let (text, meta_start) = elsewhere_line(rec, graph);
+            ItemDockRow::Elsewhere { text, meta_start }
+        })
+        .collect();
 
     let mut rows = Vec::new();
     if !carried_rows.is_empty() {
@@ -262,6 +306,29 @@ pub fn build_inventory_dock_rows(
         rows.extend(elsewhere_rows);
     }
     rows
+}
+
+/// Draw one row's `text` in two style runs: the name-prefix (`text`'s first
+/// `meta_start` CHARS) at `style`, and the rest — the "found …"/"last seen …"
+/// metadata clause, when there is one — dimmed at `meta_style`. Both runs
+/// share `clip`, so the existing right-edge clipping still applies to each
+/// independently. `meta_start == text.chars().count()` (nothing to dim) draws
+/// the second call with an empty string, a no-op.
+fn draw_row_with_dimmed_meta(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    text: &str,
+    meta_start: usize,
+    style: ratatui::style::Style,
+    meta_style: ratatui::style::Style,
+    clip: Rect,
+) {
+    let name_part: String = text.chars().take(meta_start).collect();
+    let meta_part: String = text.chars().skip(meta_start).collect();
+    draw_str_clipped(buf, x, y, &name_part, style, clip);
+    let meta_x = x.saturating_add(u16::try_from(meta_start).unwrap_or(u16::MAX));
+    draw_str_clipped(buf, meta_x, y, &meta_part, meta_style, clip);
 }
 
 /// Draw the inventory dock panel into `area`: a bordered box titled
@@ -298,6 +365,7 @@ pub fn draw_inventory_dock(
     hits.area = area;
     let style = colors.theme.get("inventory_panel").style;
     let header_style = colors.theme.get("inventory_panel.header").style;
+    let meta_style = colors.theme.get("inventory_panel.meta").style;
     // Focus drives the border STYLE selector; the resize accent (or the dock's
     // own style) is preserved as the border COLOUR via `border_color`.
     let border_selector = if highlighted { "panel.border:active" } else { "panel.border" };
@@ -358,11 +426,13 @@ pub fn draw_inventory_dock(
         let row_area = Rect::new(content.x, y, content.width, 1);
         match row {
             ItemDockRow::Header(text) => draw_str_clipped(buf, content.x, y, text, header_style, clip),
-            ItemDockRow::Carried { text, click_idx } => {
+            ItemDockRow::Carried { text, click_idx, meta_start } => {
                 hits.rows.push((*click_idx, row_area));
-                draw_str_clipped(buf, content.x, y, text, style, clip);
+                draw_row_with_dimmed_meta(buf, content.x, y, text, *meta_start, style, meta_style, clip);
             }
-            ItemDockRow::Elsewhere { text } => draw_str_clipped(buf, content.x, y, text, style, clip),
+            ItemDockRow::Elsewhere { text, meta_start } => {
+                draw_row_with_dimmed_meta(buf, content.x, y, text, *meta_start, style, meta_style, clip);
+            }
         }
     }
 
@@ -403,7 +473,10 @@ mod tests {
     }
 
     fn rows_for(text: &[&str]) -> Vec<ItemDockRow> {
-        text.iter().enumerate().map(|(i, t)| ItemDockRow::Carried { text: t.to_string(), click_idx: i }).collect()
+        text.iter()
+            .enumerate()
+            .map(|(i, t)| ItemDockRow::Carried { text: t.to_string(), click_idx: i, meta_start: t.chars().count() })
+            .collect()
     }
 
     #[test]
@@ -488,6 +561,38 @@ mod tests {
     }
 
     #[test]
+    fn draw_inventory_dock_dims_the_metadata_clause() {
+        // The "found Room, turn N" clause draws in `inventory_panel.meta`'s
+        // colour, distinct from the name-prefix's ordinary `inventory_panel`
+        // colour — the user-requested dimming (SQ-1630 follow-up).
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        let mut colors = ColorScheme::default();
+        colors.theme = theme_with_overrides(&[
+            ("inventory_panel", Color::Rgb(10, 20, 30)),
+            ("inventory_panel.meta", Color::Rgb(40, 50, 60)),
+        ]);
+        let text = "  lamp — found Living Room, turn 4".to_string();
+        let meta_start = "  lamp".chars().count();
+        let rows = vec![ItemDockRow::Carried { text, click_idx: 0, meta_start }];
+        let mut hits = InventoryDockHits::default();
+        draw_inventory_dock(&rows, area, &colors, false, 0, &mut buf, &mut hits);
+
+        let row_rect = hits.rows[0].1;
+        assert_eq!(
+            buf.cell((row_rect.x, row_rect.y)).unwrap().style().fg,
+            Some(Color::Rgb(10, 20, 30)),
+            "the name-prefix cell keeps the ordinary inventory_panel style"
+        );
+        let meta_x = row_rect.x + meta_start as u16;
+        assert_eq!(
+            buf.cell((meta_x, row_rect.y)).unwrap().style().fg,
+            Some(Color::Rgb(40, 50, 60)),
+            "the metadata clause cell carries the dimmed inventory_panel.meta style"
+        );
+    }
+
+    #[test]
     fn draw_inventory_dock_publishes_a_hit_rect_per_carried_row() {
         // SQ-1244/SQ-1630: the panel's own rect plus one row rect per CARRIED
         // item actually drawn, indexed by `click_idx` — nothing published for a
@@ -497,8 +602,8 @@ mod tests {
         let colors = ColorScheme::default();
         let rows = vec![
             ItemDockRow::Header("Carrying:".to_string()),
-            ItemDockRow::Carried { text: "  lamp".to_string(), click_idx: 0 },
-            ItemDockRow::Carried { text: "  sword".to_string(), click_idx: 1 },
+            ItemDockRow::Carried { text: "  lamp".to_string(), click_idx: 0, meta_start: "  lamp".chars().count() },
+            ItemDockRow::Carried { text: "  sword".to_string(), click_idx: 1, meta_start: "  sword".chars().count() },
         ];
         let mut hits = InventoryDockHits::default();
         draw_inventory_dock(&rows, area, &colors, false, 0, &mut buf, &mut hits);
@@ -520,7 +625,10 @@ mod tests {
         let colors = ColorScheme::default();
         let rows = vec![
             ItemDockRow::Header("Elsewhere:".to_string()),
-            ItemDockRow::Elsewhere { text: "  whistle — last seen Attic, turn 3".to_string() },
+            ItemDockRow::Elsewhere {
+                text: "  whistle — last seen Attic, turn 3".to_string(),
+                meta_start: "  whistle".chars().count(),
+            },
         ];
         let mut hits = InventoryDockHits::default();
         draw_inventory_dock(&rows, area, &colors, false, 0, &mut buf, &mut hits);
@@ -618,7 +726,7 @@ mod tests {
         match row {
             ItemDockRow::Header(t) => t,
             ItemDockRow::Carried { text, .. } => text,
-            ItemDockRow::Elsewhere { text } => text,
+            ItemDockRow::Elsewhere { text, .. } => text,
         }
     }
 
@@ -772,7 +880,11 @@ mod tests {
     #[test]
     fn a_body_taller_than_the_dock_shows_a_scrollbar_and_scrolling_reaches_the_rest() {
         let rows: Vec<ItemDockRow> = (0..8)
-            .map(|i| ItemDockRow::Carried { text: format!("  item-{i:02}"), click_idx: i })
+            .map(|i| {
+                let text = format!("  item-{i:02}");
+                let meta_start = text.chars().count();
+                ItemDockRow::Carried { text, click_idx: i, meta_start }
+            })
             .collect();
         let area = Rect::new(0, 0, 20, 6); // content height 4, 8 rows offered
         let colors = ColorScheme::default();

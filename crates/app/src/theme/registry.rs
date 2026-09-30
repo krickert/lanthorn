@@ -491,6 +491,12 @@ pub static REGISTRY: std::sync::LazyLock<Vec<RegRow>> = std::sync::LazyLock::new
     // same heading role room_panel.header uses, so the two docks' headers read
     // alike.
     row("inventory_panel.header", Section::Elements, Kind::Style, Some("heading"), Delta::EMPTY),
+    // The per-row "found Room, turn N" / "last seen Room, turn N" metadata
+    // clause. Plain host-authored metadata, not quoted game prose, so it takes
+    // `room_panel.aliases`'s treatment (muted, no italic) rather than
+    // `room_panel.description`'s (muted + italic, reserved for the game's own
+    // text) — background information about an item, same reasoning as both.
+    row("inventory_panel.meta", Section::Elements, Kind::Style, Some("muted"), Delta::EMPTY),
     // ── The Room Panel (SQ-0692): the panel describing one room, docked at the
     // bottom of the map pane. `room_panel` is its body text; the header line
     // naming the room, its layer and the follow/pin regime gets its own
@@ -816,6 +822,7 @@ mod tests {
         "meta_marker",
         "inventory_panel",
         "inventory_panel.header",
+        "inventory_panel.meta",
         "room_panel",
         "room_panel.header",
         "room_panel.header:pinned",

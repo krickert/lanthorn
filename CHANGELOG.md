@@ -57,6 +57,8 @@ while any such tag, or this Unreleased section, still exists.*
   followed you into every room, and meant nothing you carried ever showed up
   in the tracked-items list at all (*The Hitchhiker's Guide to the Galaxy* was
   affected this way for its whole length).
+- The inventory panel's "found"/"last seen" details for each item now draw
+  dimmed, so the item's own name stands out from its metadata.
 
 ### Fixed
 

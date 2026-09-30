@@ -85,7 +85,7 @@ fn carrying_and_elsewhere_sections_reflect_a_real_walkthrough() {
         .map(|r| match r {
             app::render::inventory_dock::ItemDockRow::Header(t) => t.clone(),
             app::render::inventory_dock::ItemDockRow::Carried { text, .. } => text.clone(),
-            app::render::inventory_dock::ItemDockRow::Elsewhere { text } => text.clone(),
+            app::render::inventory_dock::ItemDockRow::Elsewhere { text, .. } => text.clone(),
         })
         .collect();
     let joined = texts.join("\n").to_lowercase();
@@ -107,7 +107,7 @@ fn carrying_and_elsewhere_sections_reflect_a_real_walkthrough() {
     // Nothing carried shows up twice in Elsewhere.
     let lantern_elsewhere = rows.iter().any(|r| matches!(
         r,
-        app::render::inventory_dock::ItemDockRow::Elsewhere { text } if text.to_lowercase().contains("lantern")
+        app::render::inventory_dock::ItemDockRow::Elsewhere { text, .. } if text.to_lowercase().contains("lantern")
     ));
     assert!(!lantern_elsewhere, "the carried lantern must not also appear in Elsewhere: {texts:?}");
 }

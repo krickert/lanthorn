@@ -124,6 +124,7 @@ Every themeable `style.toml` selector: which role or selector it derives from, a
 | `meta_marker` | Elements | Style | `muted` |  | |
 | `inventory_panel` | Elements | Style | `accent` |  | |
 | `inventory_panel.header` | Elements | Style | `heading` |  | |
+| `inventory_panel.meta` | Elements | Style | `muted` |  | |
 | `room_panel` | Elements | Style | `text` |  | |
 | `room_panel.header` | Elements | Style | `heading` |  | |
 | `room_panel.header:pinned` | Elements | Style | `accent` | `reversed` | |
