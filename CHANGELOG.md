@@ -29,6 +29,11 @@ while any such tag, or this Unreleased section, still exists.*
 
 ### Added
 
+- `/recall <query>` searches the observed transcript with keyword and local
+  semantic matching, showing original passages in a scrollable results panel.
+  Its small embedding model downloads on first use and is cached for offline
+  searches. Indexing runs in the background; unavailable models produce clearly
+  labelled keyword-only results.
 - lanthorn's Guiding Light can now also suggest a verb for a command with no
   preposition at all — a plain "verb noun", like a one-word "pickup" instead
   of "get" — but only once it has actually confirmed the suggestion works
@@ -117,8 +122,6 @@ while any such tag, or this Unreleased section, still exists.*
   to its neighbors.
 - **Resuming a game now correctly picks up your most recent save** between
   auto-save and quick-save, even right after a normal quit.
-
----
 
 ## v0.7.2 — 2026-09-18
 

@@ -6863,7 +6863,7 @@ pub fn build_main_text(state: &AppState, cols: u16, rows: u16) -> (crate::render
     // Shared with the cell path so an anchor at the very end of the transcript —
     // cleared, nothing printed since — reads as an EMPTY screen on both, rather
     // than as an absent anchor that bottom-sticks the erased scrollback (SQ-0748).
-    let anchor_row = (scroll == 0)
+    let anchor_row = (state.effective_transcript_scroll() == 0)
         .then(|| crate::render::transcript::anchor_row_at(line_starts, total, state.clear_anchor))
         .flatten();
     if let Some(a) = anchor_row.filter(|&a| total - a <= budget) {

@@ -402,6 +402,12 @@ pub fn reset_game(
             state.suggestions.clear();
             state.suggestion_idx = 0;
             state.suggestion_active = false;
+            // Restart begins a new observation timeline even if its opening
+            // text happens to match the old transcript byte for byte. Cancel
+            // any ranked recall and forget the prior query at this shared host
+            // path, which also covers mouse and non-terminal callers.
+            state.clear_search();
+            state.recall_last_query = None;
             state.transcript.clear();
             state.clear_anchor = None;
             state.transcript_kinds.clear();
@@ -469,4 +475,3 @@ pub fn reset_game(
         }
     }
 }
-

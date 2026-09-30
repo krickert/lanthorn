@@ -34,9 +34,7 @@ COPY . .
 # rustup reads rust-toolchain.toml and fetches the repo's pinned toolchain, so
 # the container compiles with the same rustc the repo gates on.
 #
-# CARGO_BUILD_JOBS: `.cargo/config.toml` caps jobs at 8 for the developer's
-# interactive machine; a throwaway build container should use every core it
-# has (the env var wins over the config file — same override CI uses).
+# Keep the repository's build job cap when building on an interactive host.
 #
 # The cache mounts keep the registry, the toolchain download, and incremental
 # build artifacts across image rebuilds; the binaries are copied out because
@@ -53,7 +51,6 @@ ENV CARGO_TARGET_DIR=target
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/rustup \
     --mount=type=cache,target=/src/target \
-    CARGO_BUILD_JOBS="$(nproc)" \
     cargo build --release --locked -p lanthorn -p lanthorn-zvm-cli -p lanthorn-gvm-cli -p lanthorn-scott-cli -p audio-relay \
     && mkdir -p /out \
     && cp target/release/lanthorn target/release/zvm-cli \
@@ -82,6 +79,17 @@ RUN arch="$(dpkg --print-architecture)" \
 # hands it back to ttyd with --index.
 RUN sh -c '/ttyd -p 7999 true & pid=$!; sleep 1; curl -fsS -o /ttyd-index.html http://127.0.0.1:7999/; kill $pid' \
     && grep -q "</head>" /ttyd-index.html
+
+# Recall uses the same pinned manifest as the Rust loader. Downloading and
+# verifying in a separate stage leaves Python and its package cache out of the
+# runtime image. The model and its license are present before any player starts.
+FROM debian:trixie-slim AS recall-model-fetch
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY crates/app/src/recall/model-manifest.json /tmp/model-manifest.json
+COPY docker/fetch-recall-model.py /tmp/fetch-recall-model.py
+RUN python3 /tmp/fetch-recall-model.py /tmp/model-manifest.json /model
 
 # The browser page ships its own font, so a visitor's default monospace stops
 # deciding whether lanthorn's Nerd Font icons and the map's Legacy Computing
@@ -140,6 +148,7 @@ COPY --from=builder /out/ /usr/local/bin/
 COPY --from=ttyd-fetch /ttyd /usr/local/bin/ttyd
 COPY --from=ttyd-fetch /ttyd-index.html /usr/local/share/lanthorn/ttyd-index.html
 COPY --from=font-fetch /fonts/ /usr/local/share/lanthorn/fonts/
+COPY --from=recall-model-fetch /model/ /usr/local/share/lanthorn/recall-model/
 COPY docker/web-session.js /usr/local/share/lanthorn/web-session.js
 COPY docker/web-audio.js /usr/local/share/lanthorn/web-audio.js
 COPY docker/web-touch.js /usr/local/share/lanthorn/web-touch.js
@@ -161,6 +170,7 @@ RUN useradd --uid 1000 --create-home --home-dir /data lanthorn \
 USER lanthorn
 ENV HOME=/data \
     TERM=xterm-256color \
+    LANTHORN_RECALL_MODEL_DIR=/usr/local/share/lanthorn/recall-model \
     LANTHORN_WEB_PORT=7681 \
     LANTHORN_WEB_AUDIO_PORT=7682
 
