@@ -1376,12 +1376,17 @@ impl GlulxSession {
         // command — cragne Manor's content warning (SQ-0733).
         let awaiting_line_input = self.pending == InputKind::Line;
         let heading = self.appglk().take_room_heading(awaiting_line_input);
+        // SQ-1653: must also follow `take_room_heading` on the same drain — see
+        // `AppGlk::heading_is_a_later_distinct_entry`'s own doc.
+        let later_distinct_entry = self.appglk().heading_is_a_later_distinct_entry();
         // SQ-1625: must follow `take_room_heading` immediately (same drain) — see that
         // accessor's own doc. Read regardless of what happens to `heading` below
         // (`refuse_banner_the_status_line_contradicts`, `name_this_room`): those decide whether
         // THIS app trusts the heading as a room change, not whether the story printed a
         // description alongside it.
         let description = self.appglk().take_room_description();
+        let (heading, description) =
+            self.refuse_a_later_distinct_entry_in_a_list(heading, description, later_distinct_entry);
         // SQ-1351: and a banner the story's own status line contradicts is not a
         // heading at all, whatever it is styled as.
         let heading = self.refuse_banner_the_status_line_contradicts(heading);
@@ -1854,6 +1859,36 @@ impl GlulxSession {
             return None;
         }
         self.appglk().status_room_name()
+    }
+
+    /// Refuse a SECOND, differently-named own-line heading this turn as a room
+    /// (SQ-1653) — a listing (a page title over item entries), not an arrival —
+    /// once a room is already known.
+    ///
+    /// `later_distinct_entry` is [`crate::glk_backend::AppGlk::heading_is_a_later_distinct_entry`],
+    /// read on the same drain as `heading`/`description` — see that accessor's own
+    /// doc for the mechanism (*Superluminal Vagrant Twin*'s `map`/`prospects`) and
+    /// why it cannot be decided in `glk_backend` alone: a game's OWN title banner
+    /// joined to its credits block legitimately precedes the opening room on the
+    /// turn a title menu is dismissed (*King of Shreds and Patches*), which is the
+    /// exact same shape on the buffer's own terms. `self.last_room` is the fact
+    /// `glk_backend` cannot see that tells the two apart — `None` on that opening
+    /// turn (nothing to lose refusing there: `heading` is `None` either way, and
+    /// `needs_a_room_name` below asks the story directly), `Some` once
+    /// `map`/`prospects` are ever typed (nothing to lose refusing there either — a
+    /// real mid-turn transition still reaches the player's screen and is picked up
+    /// the next time the story prints, or a `look` reads, its own heading alone).
+    fn refuse_a_later_distinct_entry_in_a_list(
+        &self,
+        heading: Option<String>,
+        description: Option<String>,
+        later_distinct_entry: bool,
+    ) -> (Option<String>, Option<String>) {
+        if later_distinct_entry && self.last_room.is_some() {
+            (None, None)
+        } else {
+            (heading, description)
+        }
     }
 
     /// Drop a bold own-line banner the story's own STATUS LINE contradicts

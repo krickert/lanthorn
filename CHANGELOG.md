@@ -76,6 +76,11 @@ while any such tag, or this Unreleased section, still exists.*
   adjective like "green" describing two different things), examining the
   first could relabel the second to that shared word too, even though
   nothing about the second item was actually printed.
+- Fixed the automap picking up a phantom room whenever a game's own screen —
+  a status display like *Superluminal Vagrant Twin*'s `map` or `prospects` —
+  printed a bolded page title over a bolded list entry, which looked exactly
+  like a real room heading over its description. Checking your own in-game
+  status screens no longer moves your marker on the map.
 
 ## v0.8.1 — 2026-09-29
 

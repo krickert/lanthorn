@@ -431,6 +431,34 @@ struct StoryScan {
     /// following it (SQ-1625). Read once, right after `take_room_heading`, by
     /// [`AppGlk::take_room_description`].
     last_description: Option<String>,
+    /// The name of the FIRST own-line `Subheader` candidate this turn to reach
+    /// [`HeadingTail::LineEnd`] — i.e. the first run that validly owned its own
+    /// line, whatever became of it afterwards. Set once per turn (cleared by the
+    /// next [`Self::take_room_heading`] drain) and never touched by
+    /// [`Self::reject_heading`]/[`Self::confirm_heading`], which only ever move
+    /// `last_heading` (SQ-1653).
+    ///
+    /// A real Inform 7 room-arrival turn prints exactly one own-line heading. A
+    /// story that stacks a page title above a list of joined name+value entries —
+    /// Superluminal Vagrant Twin's `map` prints `"VISITED WORLDS"` then, still in
+    /// the same turn, `"Other Worlds\nBoony (not yet landed)"`, styled and shaped
+    /// identically to a real room heading joined to its description — prints TWO.
+    /// Neither `capture_heading`'s displacement parking (which only engages from
+    /// `LineEnd`, one character from confirmation) nor [`Self::confirm_heading`]
+    /// (which just overwrites `last_heading` — "the last heading in a turn wins"
+    /// by design) notices a SECOND, differently-named entry arriving after the
+    /// first: the first is silently displaced or silently overwritten, either way
+    /// without ever being judged a banner. [`Self::take_room_heading`] is where
+    /// this is caught: a turn's final answer that differs from the first own-line
+    /// candidate it saw is a listing, not an arrival, and is refused wholesale —
+    /// the same refusal shape a banner already gets (SQ-0732).
+    heading_seen_this_turn: Option<String>,
+    /// Whether the heading [`Self::take_room_heading`] just returned differed from
+    /// the FIRST own-line candidate this turn saw (SQ-1653) — set on every drain,
+    /// read once by [`Self::heading_is_a_later_distinct_entry`]. See
+    /// `heading_seen_this_turn`'s doc for what this is evidence of and why the
+    /// verdict is left to the caller.
+    heading_multi_this_turn: bool,
 }
 
 impl Default for StoryScan {
@@ -450,6 +478,8 @@ impl Default for StoryScan {
             body_acc: String::new(),
             capturing_body: false,
             last_description: None,
+            heading_seen_this_turn: None,
+            heading_multi_this_turn: false,
         }
     }
 }
@@ -882,6 +912,26 @@ impl AppGlk {
         self.primary_scan()?.take_room_description()
     }
 
+    /// Return and clear whether the heading [`Self::take_room_heading`] just
+    /// returned was a SECOND, differently-named own-line `Subheader` candidate
+    /// this turn (SQ-1653) — a page title stacked above a list of joined
+    /// name+value entries, styled and shaped identically to a real room heading
+    /// joined to its description (Superluminal Vagrant Twin's `map`:
+    /// `"VISITED WORLDS"` then `"Other Worlds\nBoony (not yet landed)"`).
+    ///
+    /// `false` when this turn printed no heading, printed exactly one, or
+    /// reprinted the same name twice (a maze, or a plain repeated `look`) — a
+    /// game's OWN title banner joined to its credits block, stacked above the
+    /// real opening room on the very turn a title menu is dismissed, is this
+    /// exact shape too (*King of Shreds and Patches*), so the caller must weigh
+    /// this against whatever room is already known before refusing the heading —
+    /// see `GlulxSession::refuse_a_later_distinct_entry_in_a_list`. Must be
+    /// called AFTER `take_room_heading`, on the same drain, exactly like
+    /// [`Self::take_room_description`].
+    pub fn heading_is_a_later_distinct_entry(&mut self) -> bool {
+        self.primary_scan().is_some_and(|s| s.heading_is_a_later_distinct_entry())
+    }
+
     /// The room name painted on the game's STATUS LINE — its first text-grid
     /// window — or `None` if it holds nothing that could be one (SQ-1302).
     ///
@@ -1043,6 +1093,11 @@ impl StoryScan {
                         // above its description (SQ-1295).
                         self.heading_displaced = None;
                         self.heading_tail = HeadingTail::LineEnd;
+                        // SQ-1653: the first own-line candidate a turn settles, whatever
+                        // becomes of it afterwards — see the field's own doc.
+                        if self.heading_seen_this_turn.is_none() {
+                            self.heading_seen_this_turn = self.heading_pending.clone();
+                        }
                     }
                 } else if self.heading_line_rest.chars().count() < HEADING_LINE_REST_CAP {
                     self.heading_line_rest.push(ch);
@@ -1239,7 +1294,18 @@ impl StoryScan {
         // A parked candidate is per-turn evidence; it must never be promoted by a
         // rejection that happens on some later turn (SQ-1295).
         self.heading_displaced = None;
-        self.last_heading.take()
+        let result = self.last_heading.take();
+        // SQ-1653: record whether this turn's answer differs from the FIRST own-line
+        // candidate it saw — see `heading_seen_this_turn`'s own doc — for
+        // `Self::heading_is_a_later_distinct_entry` to read right after this call. Not
+        // acted on here: a game's opening turn legitimately stacks its OWN title banner
+        // (own-line, joined to a credits paragraph) above the real arrival room — *King
+        // of Shreds and Patches* is exactly this shape — so refusing the SECOND heading
+        // outright is only safe once the caller knows whether a room was already known.
+        let seen_first = self.heading_seen_this_turn.take();
+        self.heading_multi_this_turn =
+            matches!((&result, &seen_first), (Some(name), Some(first)) if name != first);
+        result
     }
 
     /// Return and clear the body text [`Self::take_room_heading`] resolved for THIS turn's
@@ -1249,6 +1315,15 @@ impl StoryScan {
     /// the one caller, right after `AppGlk::take_room_heading`.
     fn take_room_description(&mut self) -> Option<String> {
         self.last_description.take()
+    }
+
+    /// Return and clear whether the heading [`Self::take_room_heading`] just
+    /// returned differed from the FIRST own-line `Subheader` candidate this turn
+    /// saw (SQ-1653) — see `heading_multi_this_turn`'s own doc. Must be called
+    /// AFTER `take_room_heading`, on the same drain, exactly like
+    /// [`Self::take_room_description`].
+    fn heading_is_a_later_distinct_entry(&mut self) -> bool {
+        std::mem::take(&mut self.heading_multi_this_turn)
     }
 
     /// Reset what a `glk_window_clear` on this window invalidates: the cursor is
@@ -3275,6 +3350,87 @@ mod heading_tests {
         put(&mut b, GlkStyle::Subheader, "Professor Brown");
         put(&mut b, GlkStyle::Normal, ", the Reification of Abstracts researcher, is hunched over his work table.\n\n>");
         assert_eq!(b.take_room_heading(true).as_deref(), Some("Brown's Lab"));
+    }
+
+    // ── SQ-1653: a second, distinct own-line heading in one turn ─────────────
+
+    #[test]
+    fn a_page_title_over_a_list_entry_flags_a_later_distinct_entry() {
+        // Superluminal Vagrant Twin's `map`: a page title ("VISITED WORLDS", detached
+        // by a blank line) stacked over a list entry ("Other Worlds", joined
+        // immediately to its one-line status) — styled and shaped identically to a
+        // real room heading joined to its description. `capture_heading` has no way
+        // to tell the two apart on its own (that is the whole of this quest); the
+        // heading it returns is unchanged (still "Other Worlds", "the last heading in
+        // a turn wins"), but the flag says a caller with more context (whether a room
+        // is already known) should weigh refusing it.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "VISITED WORLDS\n");
+        put(&mut b, GlkStyle::Normal, "\n");
+        put(&mut b, GlkStyle::Subheader, "Other Worlds\n");
+        put(&mut b, GlkStyle::Normal, "Boony (not yet landed)\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Other Worlds"));
+        assert!(b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn stacked_joined_records_flag_a_later_distinct_entry() {
+        // Superluminal's `prospects`: two records, EACH joined immediately to its own
+        // one-line body ("Known Merchants:\n-None", then "Other Opportunities:\n-None
+        // known") — unlike the case above, the FIRST one here is fully confirmed
+        // (`confirm_heading`) before the second overwrites it; the flag catches this
+        // shape too, not just the detached-then-overwritten one.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Known Merchants:\n");
+        put(&mut b, GlkStyle::Normal, "-None\n");
+        put(&mut b, GlkStyle::Normal, "\n");
+        put(&mut b, GlkStyle::Subheader, "Other Opportunities:\n");
+        put(&mut b, GlkStyle::Normal, "-None known");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Other Opportunities:"));
+        assert!(b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn an_ordinary_single_heading_turn_does_not_flag_a_later_distinct_entry() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Orbiting Boony"));
+        assert!(!b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn the_same_heading_printed_twice_in_one_turn_does_not_flag_a_later_distinct_entry() {
+        // A boot banner and an echoed LOOK can both print the SAME room's heading
+        // within one turn (Superluminal's own opening does this) — repeating a name is
+        // not a second, DISTINCT entry.
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n");
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Orbiting Boony"));
+        assert!(!b.heading_is_a_later_distinct_entry());
+    }
+
+    #[test]
+    fn a_flag_from_one_turn_never_leaks_into_the_next() {
+        let mut b = primary_backend();
+        put(&mut b, GlkStyle::Subheader, "VISITED WORLDS\n");
+        put(&mut b, GlkStyle::Normal, "\n");
+        put(&mut b, GlkStyle::Subheader, "Other Worlds\n");
+        put(&mut b, GlkStyle::Normal, "Boony (not yet landed)\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Other Worlds"));
+        assert!(b.heading_is_a_later_distinct_entry(), "the drain that saw it");
+
+        // The turn ended at a bare ">" with no trailing newline — a real command line
+        // resets `at_line_start` for what the player types next (SQ-1639); without it
+        // the next heading would begin "mid-line" by a stale reckoning.
+        b.begin_command_line();
+        put(&mut b, GlkStyle::Subheader, "Orbiting Boony\n");
+        put(&mut b, GlkStyle::Normal, "A grey, airless world.\n\n>");
+        assert_eq!(b.take_room_heading(true).as_deref(), Some("Orbiting Boony"));
+        assert!(!b.heading_is_a_later_distinct_entry(), "an ordinary turn right after it");
     }
 
     /// A single-leaf `WinTree` for this module (the other test module has its own).
