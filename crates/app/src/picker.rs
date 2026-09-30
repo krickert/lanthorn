@@ -640,6 +640,25 @@ pub fn resolve_aux(
     let mut sidecars = Vec::new();
     if game_dir.join("default.aux").exists() { sidecars.push("default.aux"); }
     if game_dir.join("default.glkvfs").exists() { sidecars.push("default.glkvfs"); }
+    // The MEDIUM names the machine, the same door the launch takes — not the path,
+    // and not a guess (SQ-0876). Resolved here, ahead of the artwork scan below,
+    // so the art candidates can reuse its answer rather than mounting the medium
+    // a second time to ask the same question (SQ-1650): `profile_source ==
+    // Medium` is exactly "the machine came off the disk, not off a guess", and
+    // a resolve with no explicit number/named-art/pre-mounted medium can only
+    // land on `Amiga`/`Macintosh` there when the medium's own `DiskImage::machine`
+    // said so.
+    let (profile, profile_source) =
+        crate::interpreter::InterpreterProfile::resolve_with_source(&entry.path, None, None, None);
+    let known_machine = (profile_source == crate::interpreter::ProfileSource::Medium)
+        .then_some(match profile {
+            crate::interpreter::InterpreterProfile::Amiga => Some(blorb::medium::Machine::Amiga),
+            crate::interpreter::InterpreterProfile::Macintosh => {
+                Some(blorb::medium::Machine::Macintosh)
+            }
+            _ => None,
+        })
+        .flatten();
     // Resolved here rather than in the panel because the panel redraws every
     // frame and this reads and parses whole archives; the aux cache is already
     // the per-story "things that touch the disk" tier.
@@ -648,6 +667,7 @@ pub fn resolve_aux(
     let art_candidates = crate::launch_options::discover_art_candidates(
         &entry.path,
         entry.meta.disk_entry.as_deref(),
+        known_machine,
     );
     let art_in_use = crate::styles::read_per_game_pictures(&game_dir);
     // Same tier as the artwork scan above, and for the same reason: it mounts the
@@ -655,13 +675,6 @@ pub fn resolve_aux(
     let mut disk_sounds: Vec<crate::native_sound::DiskSound> =
         crate::native_sound::from_medium(&entry.path).into_values().collect();
     disk_sounds.sort_by_key(|s| s.effect);
-    // Same tier again, and paired with this story's own entry for the same reason
-    // the artwork scan is (SQ-0876/SQ-1018): a compilation carries one
-    // application per game, and only one of them is this row's.
-    // The MEDIUM names the machine, the same door the launch takes — not the path,
-    // and not a guess (SQ-0876).
-    let (profile, profile_source) =
-        crate::interpreter::InterpreterProfile::resolve_with_source(&entry.path, None, None, None);
     // `disks: None` — this column is about the STORY's own medium, and asking the
     // system rung as well would cost a second mount of every boot disk per row for
     // an answer it cannot change: a release face the cascade admits is drawn either

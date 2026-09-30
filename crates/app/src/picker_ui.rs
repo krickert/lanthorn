@@ -6751,7 +6751,7 @@ mod tests {
         if !z0.is_file() {
             return;
         }
-        let candidates = app::launch_options::discover_art_candidates(&z0, None);
+        let candidates = app::launch_options::discover_art_candidates(&z0, None, None);
         assert!(!candidates.is_empty(), "Zork Zero's archives sit beside it");
         let cs = app::colors::ColorScheme::terminal_default();
         let meta = minimal_story_meta();
@@ -6990,7 +6990,7 @@ mod tests {
         if !arthur.is_file() || !arthur.with_file_name("arthur.eg2").is_file() {
             return; // gitignored fixtures
         }
-        let candidates = app::launch_options::discover_art_candidates(&arthur, None);
+        let candidates = app::launch_options::discover_art_candidates(&arthur, None, None);
         let cs = app::colors::ColorScheme::terminal_default();
         let meta = minimal_story_meta();
         let aux = app::picker::StoryAux {

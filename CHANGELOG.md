@@ -58,6 +58,13 @@ while any such tag, or this Unreleased section, still exists.*
   in the tracked-items list at all (*The Hitchhiker's Guide to the Galaxy* was
   affected this way for its whole length).
 
+### Fixed
+
+- The launch options dialog and story info panel now say which machine a
+  colour Mac/Amiga picture archive is from — "Mac" or "Amiga" — when you
+  opened it from a known Mac or Amiga disk image, instead of always saying
+  "Amiga" even for the Mac's own colour art.
+
 ## v0.8.1 — 2026-09-29
 
 ### Added
