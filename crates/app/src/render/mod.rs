@@ -16,6 +16,7 @@ pub mod filebrowser;
 pub mod graphics;
 pub mod hintbar;
 pub mod hints_panel;
+pub mod recall_panel;
 pub mod history;
 pub mod inline_image;
 pub mod hotkeys;

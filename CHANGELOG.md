@@ -19,6 +19,16 @@ Absolute URLs or no link.
 
 ---
 
+## Unreleased
+
+### Added
+
+- `/recall <query>` searches the observed transcript with keyword and local
+  semantic matching, showing original passages in a scrollable results panel.
+  Its small embedding model downloads on first use and is cached for offline
+  searches. Indexing runs in the background; unavailable models produce clearly
+  labelled keyword-only results.
+
 ## v0.7.2 — 2026-09-18
 
 ### Added

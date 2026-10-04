@@ -150,3 +150,4 @@ pub mod trace;
 pub mod vfs_store;
 pub mod vocab;
 pub mod watch;
+pub mod recall;
