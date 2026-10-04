@@ -1196,7 +1196,6 @@ mod tests {
         // Local recall added `recall`: find passages you have seen by word and
         // meaning search over the observed transcript.
         assert_eq!(COMMANDS.len(), 94, "registry must match the spec's Full command table");
-        assert_eq!(COMMANDS.len(), 93, "registry must match the spec's Full command table");
     }
 
     /// SQ-1237 unified the panel vocabulary — `command band` became `command
